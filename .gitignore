@@ -1,0 +1,48 @@
+# Rust build artifacts; Cargo.lock stays versioned for this application.
+/target/
+/target-linux/
+*.rs.bk
+
+# Local biological inputs and generated runs, not source/test fixtures.
+/gff_test/
+/out/
+/out_*/
+/audit_run/
+/audit_run_*/
+/validation/
+/validation_*/
+/panaroo_out/
+/panaroo_run.log
+/bench_out/
+/benchmark_*/
+/chromosome_compare_*/
+/full44_*/
+
+# Python benchmark caches and local environments.
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+/.venv/
+/venv/
+
+# Local environment settings; sanitized templates remain trackable.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+!.env.*.example
+
+# Editor backups and operating-system metadata.
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
