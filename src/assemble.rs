@@ -359,10 +359,10 @@ fn quality_label(quality: Quality) -> &'static str {
 /// `high` removes a family with no intact copy, and a short family the
 /// collection does not support by frequency or by neighboring genes.
 /// `strict` then removes a second reference of a gene already kept. A nested
-/// piece can match at 80% identity, a deep fragment at 85%, and a copy at
-/// 95%. The same allele in other genomes is folded into the longer gene so
-/// those genomes stay present. A paralogue below 95% identity at nearly the
-/// same length stays.
+/// or deep fragment can match at 80% identity, a shorter piece at 85%, and a
+/// copy at 90%. The same allele in other genomes is folded into the longer
+/// gene so those genomes stay present. A paralogue below 90% identity at
+/// nearly the same length stays.
 fn apply_quality(
     genes: &mut Vec<Gene>,
     quality: Quality,
@@ -408,15 +408,15 @@ struct Locus {
 /// Below this, a nested ORF can be a different gene that only shares a domain.
 const NESTED_PIECE_IDENTITY: f64 = 0.80;
 /// A fragment this close, covering less than 90% of the longer protein, is
-/// the same peptide. Below this, a short gene can be a real paralogue.
-const DEEP_PIECE_IDENTITY: f64 = 0.85;
+/// the same peptide.
+const DEEP_PIECE_IDENTITY: f64 = 0.80;
 /// A piece covering less than 98% of the longer protein.
-const PIECE_IDENTITY: f64 = 0.90;
+const PIECE_IDENTITY: f64 = 0.85;
 /// Minimum fraction of the shorter protein that must align.
 const COVERED: f64 = 0.90;
 /// A second copy this close is the same gene, including at full length.
 /// A paralogue below this, at nearly the same length, stays.
-const NEAR_COPY_IDENTITY: f64 = 0.95;
+const NEAR_COPY_IDENTITY: f64 = 0.90;
 
 /// Indexes of genes that add no presence. The copy present in fewer genomes
 /// is the one removed. Equal support keeps the earlier gene.
@@ -595,7 +595,7 @@ fn covered_duplicate(fit: &crate::align::Fit, long_len: usize, nested: Option<bo
 }
 
 /// Same gene in genomes the longer copy does not already cover. A near-full
-/// paralogue below 95% identity is not an allele split.
+/// paralogue below 90% identity is not an allele split.
 fn exclusive_allele(fit: &crate::align::Fit, long_len: usize) -> bool {
     if fit.coverage + f64::EPSILON < COVERED || fit.internal_gap > 5 {
         return false;
@@ -1190,8 +1190,12 @@ mod tests {
         let near_aa = long_aa[..76].to_vec();
         let copy_aa = long_aa[..79].to_vec();
         let mut paralog_aa = long_aa.clone();
-        for site in [4, 12, 20, 28, 36] {
+        for site in [4, 12, 20, 28, 36, 44, 52, 60, 68] {
             paralog_aa[site] = if paralog_aa[site] == b'A' { b'L' } else { b'A' };
+        }
+        let mut band_aa = long_aa.clone();
+        for site in [4, 12, 20, 28, 36, 44, 52] {
+            band_aa[site] = if band_aa[site] == b'A' { b'L' } else { b'A' };
         }
         let mut close_aa = long_aa.clone();
         for site in [4, 12, 20] {
@@ -1237,10 +1241,14 @@ mod tests {
         deep.reference_dna = back_translate(&deep_aa);
         deep.presence = vec![true, false, false];
         deep.samples_present = 1;
-        let mut genes = vec![long, piece, alone, near, copy, twin, paralog, close, deep];
+        let mut band = labelled("band", true, LENGTH_SUFFICIENT);
+        band.reference_dna = back_translate(&band_aa);
+        band.presence = vec![true, false, false];
+        band.samples_present = 1;
+        let mut genes = vec![long, piece, alone, near, copy, twin, paralog, close, deep, band];
         let loci = std::collections::HashMap::new();
         assert_eq!(super::apply_quality(&mut genes.clone(), Quality::High, &loci), 0);
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 6);
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 7);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["long", "alone", "paralog"]);
     }
@@ -1293,7 +1301,7 @@ mod tests {
         }]);
         let split_aa = long_aa.clone();
         let mut diverged_aa = long_aa.clone();
-        for site in [4, 12, 20, 28, 36, 44, 52, 60] {
+        for site in [4, 12, 20, 28, 36, 44, 52, 60, 68, 76] {
             diverged_aa[site] = if diverged_aa[site] == b'A' { b'L' } else { b'A' };
         }
         let mut split = labelled("split", true, LENGTH_SUFFICIENT);
