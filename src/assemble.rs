@@ -359,10 +359,10 @@ fn quality_label(quality: Quality) -> &'static str {
 /// `high` removes a family with no intact copy, and a short family the
 /// collection does not support by frequency or by neighboring genes.
 /// `strict` then removes a second reference of a gene already kept. A nested
-/// piece can match at 80% identity. A neighboring copy still requires 90%,
-/// and a near-identical allele in other genomes is folded into the longer
-/// gene so those genomes stay present. A paralogue below 98% identity at
-/// nearly the same length stays.
+/// piece can match at 80% identity, a deep fragment at 85%, and a copy at
+/// 95%. The same allele in other genomes is folded into the longer gene so
+/// those genomes stay present. A paralogue below 95% identity at nearly the
+/// same length stays.
 fn apply_quality(
     genes: &mut Vec<Gene>,
     quality: Quality,
@@ -407,11 +407,16 @@ struct Locus {
 
 /// Below this, a nested ORF can be a different gene that only shares a domain.
 const NESTED_PIECE_IDENTITY: f64 = 0.80;
-/// Used when coordinates are absent. A 90% piece is the same peptide.
+/// A fragment this close, covering less than 90% of the longer protein, is
+/// the same peptide. Below this, a short gene can be a real paralogue.
+const DEEP_PIECE_IDENTITY: f64 = 0.85;
+/// A piece covering less than 98% of the longer protein.
 const PIECE_IDENTITY: f64 = 0.90;
-/// A second copy this close, at nearly the same length, is the same gene.
-/// A paralogue below this stays, even when the two always occur together.
-const NEAR_COPY_IDENTITY: f64 = 0.98;
+/// Minimum fraction of the shorter protein that must align.
+const COVERED: f64 = 0.90;
+/// A second copy this close is the same gene, including at full length.
+/// A paralogue below this, at nearly the same length, stays.
+const NEAR_COPY_IDENTITY: f64 = 0.95;
 
 /// Indexes of genes that add no presence. The copy present in fewer genomes
 /// is the one removed. Equal support keeps the earlier gene.
@@ -574,28 +579,34 @@ fn calls_nested(loci: &HashMap<String, Vec<Locus>>, short_id: &str, long_id: &st
 }
 
 fn covered_duplicate(fit: &crate::align::Fit, long_len: usize, nested: Option<bool>) -> bool {
-    if fit.coverage + f64::EPSILON < PIECE_IDENTITY || fit.internal_gap > 5 {
+    if fit.coverage + f64::EPSILON < COVERED || fit.internal_gap > 5 {
         return false;
     }
     let span = fit.long_end.saturating_sub(fit.long_start);
+    let deep = span * 10 < long_len * 9;
     let piece = span * 50 < long_len * 49;
     let identity = fit.identity + f64::EPSILON;
     if nested == Some(true) && piece && identity >= NESTED_PIECE_IDENTITY {
         return true;
     }
-    identity >= PIECE_IDENTITY && (piece || identity >= NEAR_COPY_IDENTITY)
+    (deep && identity >= DEEP_PIECE_IDENTITY)
+        || (piece && identity >= PIECE_IDENTITY)
+        || identity >= NEAR_COPY_IDENTITY
 }
 
 /// Same gene in genomes the longer copy does not already cover. A near-full
-/// paralogue below 98% identity is not an allele split.
+/// paralogue below 95% identity is not an allele split.
 fn exclusive_allele(fit: &crate::align::Fit, long_len: usize) -> bool {
-    if fit.coverage + f64::EPSILON < PIECE_IDENTITY || fit.internal_gap > 5 {
+    if fit.coverage + f64::EPSILON < COVERED || fit.internal_gap > 5 {
         return false;
     }
     let span = fit.long_end.saturating_sub(fit.long_start);
     let deep = span * 10 < long_len * 9;
+    let piece = span * 50 < long_len * 49;
     let identity = fit.identity + f64::EPSILON;
-    identity >= NEAR_COPY_IDENTITY || (deep && identity >= PIECE_IDENTITY)
+    identity >= NEAR_COPY_IDENTITY
+        || (piece && identity >= PIECE_IDENTITY)
+        || (deep && identity >= DEEP_PIECE_IDENTITY)
 }
 
 fn presence_covered(short: &[bool], long: &[bool]) -> bool {
@@ -1179,8 +1190,16 @@ mod tests {
         let near_aa = long_aa[..76].to_vec();
         let copy_aa = long_aa[..79].to_vec();
         let mut paralog_aa = long_aa.clone();
-        for site in [4, 12, 20, 28, 36, 44, 52, 60] {
+        for site in [4, 12, 20, 28, 36] {
             paralog_aa[site] = if paralog_aa[site] == b'A' { b'L' } else { b'A' };
+        }
+        let mut close_aa = long_aa.clone();
+        for site in [4, 12, 20] {
+            close_aa[site] = if close_aa[site] == b'A' { b'L' } else { b'A' };
+        }
+        let mut deep_aa = long_aa[20..50].to_vec();
+        for site in [0, 8, 16, 24] {
+            deep_aa[site] = if deep_aa[site] == b'A' { b'L' } else { b'A' };
         }
         let mut long = labelled("long", true, LENGTH_SUFFICIENT);
         long.reference_dna = back_translate(&long_aa);
@@ -1210,10 +1229,18 @@ mod tests {
         paralog.reference_dna = back_translate(&paralog_aa);
         paralog.presence = vec![true, true, false];
         paralog.samples_present = 2;
-        let mut genes = vec![long, piece, alone, near, copy, twin, paralog];
+        let mut close = labelled("close", true, LENGTH_SUFFICIENT);
+        close.reference_dna = back_translate(&close_aa);
+        close.presence = vec![true, false, false];
+        close.samples_present = 1;
+        let mut deep = labelled("deep", true, LENGTH_SUFFICIENT);
+        deep.reference_dna = back_translate(&deep_aa);
+        deep.presence = vec![true, false, false];
+        deep.samples_present = 1;
+        let mut genes = vec![long, piece, alone, near, copy, twin, paralog, close, deep];
         let loci = std::collections::HashMap::new();
         assert_eq!(super::apply_quality(&mut genes.clone(), Quality::High, &loci), 0);
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 4);
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 6);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["long", "alone", "paralog"]);
     }
