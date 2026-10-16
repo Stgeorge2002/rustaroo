@@ -371,6 +371,10 @@ For library callers, `Params::audit_members` defaults to false,
 cargo build --release
 ```
 
+For a dedicated Linux x86-64 Apptainer image and MACS/Nextflow integration,
+see the [container packaging guide](containers/README.md). Compilation and tests
+run only when building the image, never inside analysis tasks.
+
 Regression tests, including moderate truncations, full-reference/presence
 preservation, competing targets and co-occurring paralogs:
 
@@ -381,20 +385,28 @@ cargo test --lib
 ### Repository hygiene
 
 Keep `Cargo.lock` in version control: Rustroo is an application, and its lockfile
-pins dependencies for reproducible builds. Source, tests, benchmark scripts and
-documentation remain trackable.
+pins dependencies for reproducible builds.
 
-The `.gitignore` excludes Cargo build directories, the local `gff_test/` dataset,
-and the existing root-level pangenome/benchmark run directories. Put new local
-outputs under `out/` or one of the documented ignored run directories; arbitrary
-custom output paths and `CARGO_TARGET_DIR` locations need their own ignore rules.
-Biological file extensions such as `.gff3`, `.fa`, `.tsv`, and `.csv` are not
-globally ignored, so deliberately maintained test fixtures can still be added.
+The `.gitignore` ignores everything by default and explicitly allows the
+application manifests, Rust source and tests, benchmark scripts/documentation,
+container recipes/documentation, and GitHub build/release workflows.
+Local datasets, downloads, run outputs, SIF images and downloaded build tools
+stay excluded regardless of their root-directory names.
 
-Python caches, local virtual environments and `.env` settings are excluded.
-Sanitized `.env.example`, `.env.sample` and `.env.template` files remain
-trackable. Ignore rules do not remove already tracked files or guarantee that
-secrets cannot be committed; inspect staged changes before publishing.
+Keep deliberately maintained small biological test fixtures under
+`tests/fixtures/`, not among local datasets. New product assets or directories
+outside the allowlist need an explicit rule before they can be committed.
+`git status --short` and `git check-ignore -v --no-index PATH` help check this.
+
+Python caches, local virtual environments, editor backups and `.env` settings
+remain excluded even inside allowed directories. Sanitized root-level
+`.env.example`, `.env.sample` and `.env.template` files remain trackable;
+Cargo registry credentials do not. Ignore rules do not remove already tracked
+files or prevent `git add -f`, so inspect staged changes before publishing.
+
+The `.gitattributes` file normalizes text to LF across Windows, WSL and Linux.
+This prevents line-ending-only changes from failing the container build's
+committed-source check.
 
 ## Comparing with Panaroo
 
@@ -403,3 +415,10 @@ nested chromosome subsets at 3, 5, 10, 15, 20, 25, 30, 35, and 40 genomes,
 repeated randomized runs against `staphb/panaroo:1.5.1`, resource measurements,
 and reciprocal reference-sequence comparisons. Preparing the experiment does
 not execute the benchmark; running it is a separate explicit command.
+
+## Standalone nucleotide reconstruction codes
+
+[MutCode](MutCode/README.md) is a separate Rust encoder/decoder for final Snippy
+VCFs and the exact gene-reference FASTA used for calling. It produces one
+lossless edit-code row per sample/reference gene, with reconstruction hashes.
+It does not change Rustroo, call variants, or infer gene absence or coverage.

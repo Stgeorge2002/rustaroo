@@ -1,0 +1,85 @@
+Bootstrap: docker
+From: rust@sha256:3f6e6f8d8725a65a2db964bb828850f888d430c68784d661f753144e5d787207
+Stage: builder
+
+%arguments
+    SOURCE_REVISION=unrecorded
+
+%files
+    Cargo.toml /build/rustroo/Cargo.toml
+    Cargo.lock /build/rustroo/Cargo.lock
+    src /build/rustroo/src
+
+%post
+    set -eu
+    if [ "$(uname -m)" != "x86_64" ]; then
+        echo "rustroo: this recipe requires a Linux x86_64 build host." >&2
+        exit 1
+    fi
+    revision='{{SOURCE_REVISION}}'
+    if ! printf '%s\n' "$revision" | grep -Eq '^[0-9a-f]{40}$'; then
+        echo "rustroo: supply the full committed source revision with --build-arg SOURCE_REVISION=..." >&2
+        exit 1
+    fi
+
+    cd /build/rustroo
+    export CARGO_INCREMENTAL=0
+    export RUSTFLAGS="-C target-cpu=x86-64 -C strip=symbols"
+    target=x86_64-unknown-linux-gnu
+    cargo test --locked --release --target "$target" --lib --bin rustroo
+    cargo build --locked --release --target "$target" --bin rustroo
+
+    install -D -m 0755 "target/$target/release/rustroo" /usr/local/bin/rustroo
+    mkdir -p /opt/rustroo-build
+    printf '%s\n' "$revision" > /opt/rustroo-build/source-revision.txt
+    rustc --version > /opt/rustroo-build/toolchain.txt
+    cargo --version >> /opt/rustroo-build/toolchain.txt
+    printf 'target=%s\nRUSTFLAGS=%s\n' "$target" "$RUSTFLAGS" >> /opt/rustroo-build/toolchain.txt
+    sha256sum Cargo.toml Cargo.lock src/*.rs > /opt/rustroo-build/source.sha256
+    sha256sum /usr/local/bin/rustroo > /opt/rustroo-build/binary.sha256
+
+Bootstrap: docker
+From: debian@sha256:a4672c0cb26fbdde88e38fa2dfb6c681942306680e41e4378b28770b6e79ee91
+Stage: runtime
+
+%files from builder
+    /usr/local/bin/rustroo /usr/local/bin/rustroo
+    /opt/rustroo-build /opt/rustroo-build
+
+%environment
+    export PATH=/usr/local/bin:/usr/bin:/bin
+    export LC_ALL=C
+
+%runscript
+    exec /usr/local/bin/rustroo "$@"
+
+%test
+    set -eu
+    /usr/local/bin/rustroo --version
+    /usr/local/bin/rustroo --help > /dev/null
+    /usr/local/bin/rustroo validate --help > /dev/null
+    sha256sum --check /opt/rustroo-build/binary.sha256
+    if command -v cargo > /dev/null 2>&1; then
+        echo "rustroo: Cargo must not be present in the runtime image." >&2
+        exit 1
+    fi
+
+%labels
+    org.opencontainers.image.title rustroo
+    org.opencontainers.image.description "Standalone Rustroo for Linux x86-64; no runtime compilation"
+    org.opencontainers.image.version 0.1.0
+    org.opencontainers.image.revision {{SOURCE_REVISION}}
+    org.opencontainers.image.source https://github.com/Stgeorge2002/rustaroo
+    org.opencontainers.image.licenses MIT
+    rustroo.target x86_64-unknown-linux-gnu
+    rustroo.rust_version 1.90.0
+
+%help
+    Run: apptainer run rustroo.sif -i INPUT_GFF_DIRECTORY -o OUTPUT_DIRECTORY --threads N
+    Exec: apptainer exec rustroo.sif rustroo --help
+    Validation: apptainer exec rustroo.sif rustroo validate --help
+
+    Set RAYON_NUM_THREADS=N as well as --threads N for pangenome construction.
+    Inputs and outputs must be accessible through container bind mounts.
+    Source revision, toolchain and checksums are under /opt/rustroo-build.
+    This image targets Linux x86-64, not Windows or ARM.

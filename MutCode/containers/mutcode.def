@@ -1,0 +1,80 @@
+Bootstrap: docker
+From: rust@sha256:3f6e6f8d8725a65a2db964bb828850f888d430c68784d661f753144e5d787207
+Stage: builder
+
+%arguments
+    SOURCE_SHA256=unrecorded
+
+%files
+    Cargo.toml /build/mutcode/Cargo.toml
+    Cargo.lock /build/mutcode/Cargo.lock
+    src /build/mutcode/src
+    tests /build/mutcode/tests
+    containers/mutcode.def /build/mutcode/containers/mutcode.def
+    source.sha256 /build/mutcode/source.sha256
+
+%post
+    set -eu
+    test "$(uname -m)" = x86_64
+    fingerprint='{{SOURCE_SHA256}}'
+    if ! printf '%s\n' "$fingerprint" | grep -Eq '^[0-9a-f]{64}$'; then
+        echo "mutcode: build with containers/build.sh to supply a source fingerprint." >&2
+        exit 1
+    fi
+    cd /build/mutcode
+    test "$(sha256sum source.sha256 | cut -d ' ' -f 1)" = "$fingerprint"
+    sha256sum --check source.sha256
+    export CARGO_INCREMENTAL=0
+    export RUSTFLAGS="-C target-cpu=x86-64 -C strip=symbols"
+    target=x86_64-unknown-linux-gnu
+    cargo test --release --locked --target "$target" --all-targets
+    cargo build --release --locked --target "$target" --bin mutcode
+    install -D -m 0755 "target/$target/release/mutcode" /usr/local/bin/mutcode
+    mkdir -p /opt/mutcode-build
+    cp source.sha256 /opt/mutcode-build/source.sha256
+    printf '%s\n' "$fingerprint" > /opt/mutcode-build/source-fingerprint.txt
+    rustc --version > /opt/mutcode-build/toolchain.txt
+    cargo --version >> /opt/mutcode-build/toolchain.txt
+    printf 'target=%s\nRUSTFLAGS=%s\n' "$target" "$RUSTFLAGS" >> /opt/mutcode-build/toolchain.txt
+    sha256sum /usr/local/bin/mutcode > /opt/mutcode-build/binary.sha256
+
+Bootstrap: docker
+From: debian@sha256:a4672c0cb26fbdde88e38fa2dfb6c681942306680e41e4378b28770b6e79ee91
+Stage: runtime
+
+%files from builder
+    /usr/local/bin/mutcode /usr/local/bin/mutcode
+    /opt/mutcode-build /opt/mutcode-build
+
+%environment
+    export PATH=/usr/local/bin:/usr/bin:/bin
+    export LC_ALL=C
+
+%runscript
+    exec /usr/local/bin/mutcode "$@"
+
+%test
+    set -eu
+    /usr/local/bin/mutcode --version
+    /usr/local/bin/mutcode encode --help > /dev/null
+    /usr/local/bin/mutcode decode --help > /dev/null
+    sha256sum --check /opt/mutcode-build/binary.sha256
+    if command -v cargo > /dev/null 2>&1; then
+        echo "mutcode: Cargo must not be present in the runtime image." >&2
+        exit 1
+    fi
+
+%labels
+    org.opencontainers.image.title MutCode
+    org.opencontainers.image.version 0.1.0
+    org.opencontainers.image.source https://github.com/Stgeorge2002/rustaroo
+    org.opencontainers.image.licenses MIT
+    mutcode.source_sha256 {{SOURCE_SHA256}}
+    mutcode.target x86_64-unknown-linux-gnu
+    mutcode.rust_version 1.90.0
+
+%help
+    Run: apptainer run IMAGE.sif encode --reference ref.fa --vcf sample.vcf --output codes.tsv.gz --threads N
+    Exec: apptainer exec IMAGE.sif mutcode decode --reference ref.fa --codes codes.tsv.gz --verify-only --threads N
+    Source fingerprint and checksums are under /opt/mutcode-build.
+    Linux x86-64 only. The runtime performs no compilation or network access.

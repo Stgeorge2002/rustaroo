@@ -1,48 +1,97 @@
-# Rust build artifacts; Cargo.lock stays versioned for this application.
-/target/
-/target-linux/
-*.rs.bk
+# Ignore everything unless it is explicitly part of the product.
+*
 
-# Local biological inputs and generated runs, not source/test fixtures.
-/gff_test/
-/out/
-/out_*/
-/audit_run/
-/audit_run_*/
-/validation/
-/validation_*/
-/panaroo_out/
-/panaroo_run.log
-/bench_out/
-/benchmark_*/
-/chromosome_compare_*/
-/full44_*/
+# Application manifests, project documentation and licensing.
+!/.gitignore
+!/.gitattributes
+!/Cargo.toml
+!/Cargo.lock
+!/README.md
+!/LICENSE
+!/LICENSE.md
+!/LICENSE-MIT
+!/LICENSE-APACHE
+!/rust-toolchain.toml
+!/rustfmt.toml
+!/clippy.toml
+!/bench.sh
+!/.env.example
+!/.env.sample
+!/.env.template
 
-# Python benchmark caches and local environments.
+# Rust source and tests. Other source assets need an explicit rule.
+!/src/
+!/src/**/
+!/src/**/*.rs
+!/tests/
+!/tests/**/
+!/tests/**/*.rs
+
+# Deliberately versioned fixtures; local biological datasets stay excluded.
+!/tests/fixtures/
+!/tests/fixtures/**
+
+# Cargo configuration, never registry credentials.
+!/.cargo/
+!/.cargo/config.toml
+
+# Benchmark scripts, their tests and documentation.
+!/benchmarks/
+!/benchmarks/*.py
+!/benchmarks/*.md
+!/benchmarks/panaroo.Dockerfile
+
+# Container recipes and documentation, not images or downloaded tools.
+!/containers/
+!/containers/*.def
+!/containers/*.md
+!/containers/Dockerfile
+
+# Standalone mutation-code application and deliberately maintained fixtures.
+!/MutCode/
+!/MutCode/Cargo.toml
+!/MutCode/Cargo.lock
+!/MutCode/README.md
+!/MutCode/src/
+!/MutCode/src/**/
+!/MutCode/src/**/*.rs
+!/MutCode/tests/
+!/MutCode/tests/**/
+!/MutCode/tests/**/*.rs
+!/MutCode/tests/fixtures/
+!/MutCode/tests/fixtures/**
+!/MutCode/containers/
+!/MutCode/containers/*.def
+!/MutCode/containers/*.sh
+!/MutCode/containers/*.md
+
+# Release/build workflows.
+!/.github/
+!/.github/workflows/
+!/.github/workflows/*.yml
+!/.github/workflows/*.yaml
+
+# Keep generated artifacts and local settings out of allowed directories too.
+target/
+target-linux/
 __pycache__/
-*.pyc
-*.pyo
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage
-.coverage.*
-htmlcov/
-/.venv/
-/venv/
-
-# Local environment settings; sanitized templates remain trackable.
+.venv/
+venv/
 .env
 .env.*
-!.env.example
-!.env.sample
-!.env.template
-!.env.*.example
-
-# Editor backups and operating-system metadata.
+!/.env.example
+!/.env.sample
+!/.env.template
+*.pyc
+*.pyo
+*.rs.bk
 *.swp
 *.swo
 *~
 .DS_Store
 Thumbs.db
 Desktop.ini
+*:Zone.Identifier

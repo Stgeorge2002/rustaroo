@@ -1,0 +1,2 @@
+# Keep text consistent between Windows, WSL and Linux build snapshots.
+* text=auto eol=lf
