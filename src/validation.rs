@@ -8,6 +8,7 @@ use rayon::prelude::*;
 
 use crate::align::length_ratio;
 use crate::genetic_code::{orf_status, translate, OrfStatus};
+use crate::log::{self, progress};
 use crate::phylogeny::{bootstrap, common_sites, distances, neighbor_joining, variable_sites};
 use crate::validation_align::{align, Profile, Step};
 use crate::{Error, Result};
@@ -124,7 +125,8 @@ fn fasta(path: &Path) -> Result<Vec<Sequence>> {
     }
     if let Some(last) = id { finish(last, dna, &mut records)?; }
     if records.is_empty() { return Err(Error::new(format!("{}: no FASTA records", path.display()))); }
-    Ok(records.into_iter().map(|(id, dna)| Sequence::new(id, dna)).collect())
+    let records: Vec<_> = records.into_iter().collect();
+    Ok(records.into_par_iter().map(|(id, dna)| Sequence::new(id, dna)).collect())
 }
 
 fn number<T: std::str::FromStr>(value: &str, field: &str, line: usize) -> Result<T> {
@@ -140,17 +142,19 @@ fn load(directory: &Path) -> Result<Input> {
     }).collect();
     let mut alleles: Vec<Sequence> = Vec::new();
     let mut aliases = BTreeMap::new();
-    let mut dna_of = HashMap::new();
+    let mut dna_of: HashMap<u64, Vec<usize>> = HashMap::new();
     for sequence in fasta(&directory.join("member_alleles.fa"))? {
-        let index = if let Some(&index) = dna_of.get(&sequence.dna) {
-            index
-        } else {
-            let index = alleles.len();
-            dna_of.insert(sequence.dna.clone(), index);
-            alleles.push(Sequence::new(sequence.id.clone(), sequence.dna.clone()));
-            index
-        };
-        aliases.insert(sequence.id, index);
+        let hash = crate::model::content_hash(sequence.dna.as_bytes());
+        if let Some(bucket) = dna_of.get(&hash) {
+            if let Some(&index) = bucket.iter().find(|&&index| alleles[index].dna == sequence.dna) {
+                aliases.insert(sequence.id, index);
+                continue;
+            }
+        }
+        let index = alleles.len();
+        dna_of.entry(hash).or_default().push(index);
+        aliases.insert(sequence.id.clone(), index);
+        alleles.push(sequence);
     }
     let mut presence_lines = BufReader::new(File::open(directory.join("presence.tsv"))?).lines();
     let header = presence_lines.next().ok_or_else(|| Error::new("presence.tsv is empty"))??;
@@ -278,7 +282,10 @@ fn loci(input: &Input) -> Result<Vec<Locus>> {
 }
 
 fn writer(path: &Path) -> Result<BufWriter<File>> {
-    Ok(BufWriter::new(OpenOptions::new().write(true).create_new(true).open(path)?))
+    Ok(BufWriter::with_capacity(
+        1 << 20,
+        OpenOptions::new().write(true).create_new(true).open(path)?,
+    ))
 }
 
 fn escaped(value: &str) -> String {
@@ -372,17 +379,6 @@ struct Assessment {
     terminal_loss: usize,
     terminal_insert: usize,
     blocks: Vec<String>,
-}
-
-fn cached_assessment<'a>(
-    reference: &Sequence, index: usize, input: &'a Input, cap: usize,
-    cache: &mut HashMap<&'a [u8], Assessment>,
-) -> Assessment {
-    let allele = &input.alleles[index];
-    let mut report = cache.entry(allele.protein.as_slice())
-        .or_insert_with(|| assess(reference, index, allele, cap)).clone();
-    report.allele = index;
-    report
 }
 
 fn assess(reference: &Sequence, allele_index: usize, allele: &Sequence, cap: usize) -> Assessment {
@@ -479,9 +475,32 @@ fn write_alignment(path: &Path, labels: &[String], rows: &[Vec<u8>]) -> Result<(
 }
 
 fn family_assessment(family: &Family, input: &Input, cap: usize) -> FamilyAssessment {
-    let mut cache = HashMap::new();
-    let alleles: Vec<_> = family.alleles.keys().map(|&index| {
-        cached_assessment(&family.reference, index, input, cap, &mut cache)
+    let indexes: Vec<usize> = family.alleles.keys().copied().collect();
+    let mut first_of: HashMap<&[u8], usize> = HashMap::new();
+    let mut unique = Vec::new();
+    let mut slot_of = Vec::with_capacity(indexes.len());
+    for &index in &indexes {
+        let protein = input.alleles[index].protein.as_slice();
+        if let Some(&slot) = first_of.get(protein) {
+            slot_of.push(slot);
+            continue;
+        }
+        let slot = unique.len();
+        first_of.insert(protein, slot);
+        unique.push(index);
+        slot_of.push(slot);
+    }
+    let scored: Vec<Assessment> = if unique.len() >= 2 {
+        unique.par_iter().map(|&index| {
+            assess(&family.reference, index, &input.alleles[index], cap)
+        }).collect()
+    } else {
+        unique.iter().map(|&index| assess(&family.reference, index, &input.alleles[index], cap)).collect()
+    };
+    let alleles: Vec<_> = indexes.into_iter().zip(slot_of).map(|(index, slot)| {
+        let mut report = scored[slot].clone();
+        report.allele = index;
+        report
     }).collect();
     let uncertain = !family.reference.orf.is_intact() || alleles.iter().any(|row| {
         row.status != "aligned" || row.internal_loss > 0 || row.internal_insert > 0
@@ -565,7 +584,7 @@ fn related_sets(input: &Input, loci: &[Locus], directory: &Path, cap: usize) -> 
             for &b in &groups[position + 1..] { candidates.insert((a, b)); }
         }
     }
-    let kmers: Vec<HashSet<[u8; 4]>> = input.families.iter().map(|family| {
+    let kmers: Vec<HashSet<[u8; 4]>> = input.families.par_iter().map(|family| {
         family.reference.protein.windows(4).filter(|word| !word.contains(&b'X') && !word.contains(&b'*'))
             .map(|word| [word[0], word[1], word[2], word[3]]).collect()
     }).collect();
@@ -649,16 +668,47 @@ fn tree_report(
     if !input.families[anchor].reference.orf.in_frame {
         report.status = "reference_out_of_frame".into(); return Ok(report);
     }
-    let mut cache: HashMap<_, _> = assessments[anchor].alleles.iter().map(|row| {
+    let ids: Vec<_> = allele_ids.iter().copied().collect();
+    // An out-of-frame member stops the tree at that allele. Aligning a later
+    // member first would be able to report a different failure.
+    let prefix_end = ids.iter().position(|&index| !input.alleles[index].orf.in_frame).unwrap_or(ids.len());
+    let mut cache: HashMap<&[u8], Assessment> = assessments[anchor].alleles.iter().map(|row| {
         (input.alleles[row.allele].protein.as_slice(), row.clone())
     }).collect();
-    for &index in &allele_ids {
+    let mut missing = Vec::new();
+    let mut seen = HashSet::new();
+    for &index in &ids[..prefix_end] {
+        let protein = input.alleles[index].protein.as_slice();
+        if cache.contains_key(protein) || !seen.insert(protein) {
+            continue;
+        }
+        missing.push(index);
+    }
+    let computed: Vec<Assessment> = if missing.len() >= 2 {
+        missing.par_iter().map(|&index| {
+            assess(&input.families[anchor].reference, index, &input.alleles[index], options.max_alignment_cells)
+        }).collect()
+    } else {
+        missing.iter().map(|&index| {
+            assess(&input.families[anchor].reference, index, &input.alleles[index], options.max_alignment_cells)
+        }).collect()
+    };
+    for (index, row) in missing.into_iter().zip(computed) {
+        cache.insert(input.alleles[index].protein.as_slice(), row);
+    }
+    for &index in &ids[..prefix_end] {
         let allele = &input.alleles[index];
-        if !allele.orf.in_frame { report.status = "member_out_of_frame".into(); return Ok(report); }
-        let row = cached_assessment(&input.families[anchor].reference, index, input, options.max_alignment_cells, &mut cache);
-        let Some(profile) = row.profile else { report.status = format!("tree_{}", row.status); return Ok(report); };
+        let row = &cache[allele.protein.as_slice()];
+        let Some(profile) = &row.profile else {
+            report.status = format!("tree_{}", row.status);
+            return Ok(report);
+        };
         if profile.ambiguous { report.status = "ambiguous_alignment".into(); return Ok(report); }
         report.rows.push(profile.codon_core(allele.dna.as_bytes()));
+    }
+    if prefix_end < ids.len() {
+        report.status = "member_out_of_frame".into();
+        return Ok(report);
     }
     let sites = common_sites(&report.rows)?;
     report.sites = sites.len();
@@ -734,7 +784,7 @@ fn write_trees(
         }
     }
     out.flush()?; branches.flush()?; members.flush()?;
-    eprintln!("rustroo validate: {written}/{requested} candidate sets have diagnostic trees; {} have explicit no-tree reasons in trees.tsv",
+    progress!("rustroo validate: {written}/{requested} candidate sets have diagnostic trees; {} have explicit no-tree reasons in trees.tsv",
         requested - written);
     Ok(written)
 }
@@ -764,35 +814,37 @@ pub fn validate(directory: &Path, output: &Path, options: &ValidationOptions) ->
         if !path.is_file() { return Err(Error::new(format!("missing validation input {}; build with --audit-members", path.display()))); }
         fingerprints.push((name, fingerprint(&path)?));
     }
-    eprintln!("rustroo validate: reading pooled alleles and sample-scoped memberships");
     let input = load(directory)?;
     let loci = loci(&input)?;
     if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) { fs::create_dir_all(parent)?; }
     fs::create_dir(output)?;
     fs::create_dir(output.join("alignments"))?;
     fs::create_dir(output.join("trees"))?;
+    log::open(&output.join("rustroo.log"))?;
+    let _log_guard = LogGuard;
+    progress!("rustroo validate: reading pooled alleles and sample-scoped memberships");
     let uncertain = write_loci(&input, &loci, output)?;
     let pool = rayon::ThreadPoolBuilder::new().num_threads(options.threads).build()?;
-    eprintln!("rustroo validate: aligning every distinct member DNA allele to its family reference on {} threads", pool.current_num_threads());
-    let progress = AtomicUsize::new(0);
+    progress!("rustroo validate: aligning every distinct member DNA allele to its family reference on {} threads", pool.current_num_threads());
+    let done_count = AtomicUsize::new(0);
     let reports: Vec<_> = pool.install(|| input.families.par_iter().map(|family| {
         let report = family_assessment(family, &input, options.max_alignment_cells);
-        let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+        let done = done_count.fetch_add(1, Ordering::Relaxed) + 1;
         if done % 250 == 0 || done == input.families.len() {
-            eprintln!("rustroo validate: aligned {done}/{} families", input.families.len());
+            progress!("rustroo validate: aligned {done}/{} families", input.families.len());
         }
         report
     }).collect());
     let unassessed_alignments = write_assessments(&input, &reports, output)?;
     if unassessed_alignments > 0 {
-        eprintln!("rustroo validate: {unassessed_alignments} allele alignments unassessed; inspect alleles.tsv, no heuristic replacements were used");
+        progress!("rustroo validate: {unassessed_alignments} allele alignments unassessed; inspect alleles.tsv, no heuristic replacements were used");
     }
-    eprintln!("rustroo validate: checking context-indexed candidate homologues");
+    progress!("rustroo validate: checking context-indexed candidate homologues");
     let (groups, unassessed_related_pairs) = pool.install(|| related_sets(&input, &loci, output, options.max_alignment_cells))?;
     if unassessed_related_pairs > 0 {
-        eprintln!("rustroo validate: {unassessed_related_pairs} candidate-family comparisons unassessed; inspect related_families.tsv");
+        progress!("rustroo validate: {unassessed_related_pairs} candidate-family comparisons unassessed; inspect related_families.tsv");
     }
-    eprintln!("rustroo validate: constructing diagnostic gene trees; named domains and species-tree reconciliation remain unassessed");
+    progress!("rustroo validate: constructing diagnostic gene trees; named domains and species-tree reconciliation remain unassessed");
     let trees_written = pool.install(|| write_trees(&groups, &input, &reports, &uncertain, output, options))?;
     let mut provenance = writer(&output.join("input_fingerprints.tsv"))?;
     writeln!(provenance, "file\tfnv1a64_noncryptographic")?;
@@ -829,8 +881,16 @@ pub fn validate(directory: &Path, output: &Path, options: &ValidationOptions) ->
     writeln!(out, "protein_alignment_scoring\tmatch=2;mismatch=-1;gap_open=-5;gap_extend=-1\ntree_distance_model\tJC69\ntree_rooting\tunrooted\ntree_sites\tcomplete_case_reference_codon_columns\nbootstrap_denominator\trequested_replicates\nbootstrap_seed\t72a914bc5e378d01")?;
     writeln!(out, "complete\ttrue")?;
     out.flush()?;
-    eprintln!("rustroo validate: complete; {trees_written} diagnostic trees; original assignments and references unchanged");
+    progress!("rustroo validate: complete; {trees_written} diagnostic trees; original assignments and references unchanged");
     Ok(summary)
+}
+
+struct LogGuard;
+
+impl Drop for LogGuard {
+    fn drop(&mut self) {
+        log::close();
+    }
 }
 
 #[cfg(test)]
@@ -885,7 +945,9 @@ mod tests {
                 id: "gene".into(), product: String::new(), reference_dna: full,
                 intact: true, selection: "intact", presence: vec![true, true],
                 lengths: vec![(sequences[0].len() + sequences[1].len()) as u32, sequences[2].len() as u32],
-                samples_present: 2, samples_with_exact_reference: 1, distinct_alleles: 3, intact_alleles: 3,
+                samples_present: 2, length_evidence: "conserved_short",
+                samples_with_exact_reference: 1, distinct_alleles: 3, intact_alleles: 3,
+                modal_end_bp: sequences[0].len() as u32, modal_end_samples: 2, extension_samples: 0,
             }],
             membership_audit: Some(MembershipAudit {
                 contig_names: vec![vec!["contig:1".into(), "contig;2".into()], vec!["contig:1".into()]],

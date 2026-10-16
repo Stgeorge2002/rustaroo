@@ -7,6 +7,8 @@
 //! two. That test only has to be right for alleles that are already nearly the
 //! same gene.
 
+use std::cell::RefCell;
+
 const MATCH: i32 = 2;
 const MISMATCH: i32 = -1;
 const GAP: i32 = -2;
@@ -111,92 +113,129 @@ fn band_width(short_len: usize, long_len: usize) -> usize {
 /// alongside the score at each cell, so neither a full matrix nor a
 /// traceback pass is needed. When `band` covers the whole matrix this is
 /// exactly the old full computation.
+///
+/// The rows live in a thread-local buffer. A fresh `Vec` per pair dominated
+/// the runtime once the band itself got small, and each worker only ever
+/// aligns one pair at a time.
 fn banded_matches(short: &[u8], long: &[u8], band: usize) -> Option<usize> {
-    let n = short.len();
-    let m = long.len();
-    const NEG: i32 = i32::MIN / 4;
-    let width = band.saturating_mul(2) + 1;
+    BAND.with(|cell| cell.borrow_mut().matches(short, long, band))
+}
 
-    // `cell` reads a (score, matches) pair from a row given that row's own
-    // [lo, hi] column bounds; columns outside that range were never computed
-    // and are treated as unreachable.
-    let cell = |lo: usize, hi: usize, score: &[i32], matches: &[u32], j: usize| -> (i32, u32) {
-        if j < lo || j > hi {
-            (NEG, 0)
+const NEG: i32 = i32::MIN / 4;
+
+struct BandScratch {
+    prev_score: Vec<i32>,
+    prev_matches: Vec<u32>,
+    curr_score: Vec<i32>,
+    curr_matches: Vec<u32>,
+}
+
+impl BandScratch {
+    fn matches(&mut self, short: &[u8], long: &[u8], band: usize) -> Option<usize> {
+        let n = short.len();
+        let m = long.len();
+        let width = band.saturating_mul(2) + 1;
+        self.ensure(width);
+        // The buffer outlives this pair. A gap row must start from zero
+        // matches; leftover counts from the previous pair are not a diagonal.
+        self.prev_score[..width].fill(NEG);
+        self.prev_matches[..width].fill(0);
+        self.curr_score[..width].fill(NEG);
+        self.curr_matches[..width].fill(0);
+
+        let mut prev_lo = 0usize;
+        let mut prev_hi = band.min(m);
+        for j in prev_lo..=prev_hi {
+            self.prev_score[j - prev_lo] = j as i32 * GAP;
+        }
+
+        for i in 1..=n {
+            let center = (i * m) / n;
+            let lo = center.saturating_sub(band);
+            let hi = (center + band).min(m);
+            for j in lo..=hi {
+                let diag = if j == 0 {
+                    (NEG, 0)
+                } else {
+                    let (ps, pm) = band_cell(prev_lo, prev_hi, &self.prev_score, &self.prev_matches, j - 1);
+                    if ps <= NEG {
+                        (NEG, 0)
+                    } else {
+                        let is_match = short[i - 1] == long[j - 1];
+                        (
+                            ps + if is_match { MATCH } else { MISMATCH },
+                            pm + u32::from(is_match),
+                        )
+                    }
+                };
+                let up = {
+                    let (ps, pm) = band_cell(prev_lo, prev_hi, &self.prev_score, &self.prev_matches, j);
+                    if ps <= NEG {
+                        (NEG, 0)
+                    } else {
+                        (ps + GAP, pm)
+                    }
+                };
+                let left = if j == lo {
+                    (NEG, 0)
+                } else {
+                    let (cs, cm) = (self.curr_score[j - 1 - lo], self.curr_matches[j - 1 - lo]);
+                    if cs <= NEG {
+                        (NEG, 0)
+                    } else {
+                        (cs + GAP, cm)
+                    }
+                };
+                let (score, matches) = if diag.0 >= up.0 && diag.0 >= left.0 {
+                    diag
+                } else if up.0 >= left.0 {
+                    up
+                } else {
+                    left
+                };
+                self.curr_score[j - lo] = score;
+                self.curr_matches[j - lo] = matches;
+            }
+            std::mem::swap(&mut self.prev_score, &mut self.curr_score);
+            std::mem::swap(&mut self.prev_matches, &mut self.curr_matches);
+            prev_lo = lo;
+            prev_hi = hi;
+        }
+        let (final_score, final_matches) =
+            band_cell(prev_lo, prev_hi, &self.prev_score, &self.prev_matches, m);
+        if final_score <= NEG {
+            None
         } else {
-            (score[j - lo], matches[j - lo])
+            Some(final_matches as usize)
         }
-    };
-
-    let mut prev_score = vec![NEG; width];
-    let mut prev_matches = vec![0u32; width];
-    let mut curr_score = vec![NEG; width];
-    let mut curr_matches = vec![0u32; width];
-
-    let mut prev_lo = 0usize;
-    let mut prev_hi = band.min(m);
-    for j in prev_lo..=prev_hi {
-        prev_score[j - prev_lo] = j as i32 * GAP;
     }
 
-    for i in 1..=n {
-        let center = (i * m) / n;
-        let lo = center.saturating_sub(band);
-        let hi = (center + band).min(m);
-        for j in lo..=hi {
-            let diag = if j == 0 {
-                (NEG, 0)
-            } else {
-                let (ps, pm) = cell(prev_lo, prev_hi, &prev_score, &prev_matches, j - 1);
-                if ps <= NEG {
-                    (NEG, 0)
-                } else {
-                    let is_match = short[i - 1] == long[j - 1];
-                    (
-                        ps + if is_match { MATCH } else { MISMATCH },
-                        pm + is_match as u32,
-                    )
-                }
-            };
-            let up = {
-                let (ps, pm) = cell(prev_lo, prev_hi, &prev_score, &prev_matches, j);
-                if ps <= NEG {
-                    (NEG, 0)
-                } else {
-                    (ps + GAP, pm)
-                }
-            };
-            let left = if j == lo {
-                (NEG, 0)
-            } else {
-                let (cs, cm) = (curr_score[j - 1 - lo], curr_matches[j - 1 - lo]);
-                if cs <= NEG {
-                    (NEG, 0)
-                } else {
-                    (cs + GAP, cm)
-                }
-            };
-            let (score, matches) = if diag.0 >= up.0 && diag.0 >= left.0 {
-                diag
-            } else if up.0 >= left.0 {
-                up
-            } else {
-                left
-            };
-            curr_score[j - lo] = score;
-            curr_matches[j - lo] = matches;
+    fn ensure(&mut self, width: usize) {
+        if self.prev_score.len() >= width {
+            return;
         }
-        std::mem::swap(&mut prev_score, &mut curr_score);
-        std::mem::swap(&mut prev_matches, &mut curr_matches);
-        prev_lo = lo;
-        prev_hi = hi;
+        self.prev_score.resize(width, NEG);
+        self.prev_matches.resize(width, 0);
+        self.curr_score.resize(width, NEG);
+        self.curr_matches.resize(width, 0);
     }
-    let (final_score, final_matches) = cell(prev_lo, prev_hi, &prev_score, &prev_matches, m);
-    if final_score <= NEG {
-        None
+}
+
+fn band_cell(lo: usize, hi: usize, score: &[i32], matches: &[u32], j: usize) -> (i32, u32) {
+    if j < lo || j > hi {
+        (NEG, 0)
     } else {
-        Some(final_matches as usize)
+        (score[j - lo], matches[j - lo])
     }
+}
+
+thread_local! {
+    static BAND: RefCell<BandScratch> = RefCell::new(BandScratch {
+        prev_score: Vec::new(),
+        prev_matches: Vec::new(),
+        curr_score: Vec::new(),
+        curr_matches: Vec::new(),
+    });
 }
 
 /// Place `short` inside `long`. The diagonal that actually matches the most

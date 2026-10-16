@@ -11,8 +11,9 @@ pub struct Params {
     pub length_ratio: f64,
     pub min_cds_bp: usize,
     pub refind: bool,
-    /// `0` uses the default Rayon pool for GFF parsing. Clustering stays
-    /// single-threaded so the greedy representative order does not move.
+    /// `0` uses the default Rayon pool. Homology decisions stay in
+    /// longest-first order; scoring of proteins that share one representative
+    /// index runs concurrently.
     pub threads: usize,
     /// Emit original annotation memberships for an external concordance audit.
     pub audit_members: bool,
@@ -100,9 +101,20 @@ pub struct Gene {
     /// Nucleotides covered by this gene in the sample. Zero means absent.
     pub lengths: Vec<u32>,
     pub samples_present: u32,
+    /// `length_sufficient`, `conserved_short`, or `unconfirmed_short`.
+    /// Below 250 bp one genome cannot vouch for a gene; the other two labels
+    /// record whether the collection did.
+    pub length_evidence: &'static str,
     pub samples_with_exact_reference: u32,
     pub distinct_alleles: u32,
     pub intact_alleles: u32,
+    /// DNA length of the finished modal end, or the reference length when no
+    /// shorter end qualified.
+    pub modal_end_bp: u32,
+    /// Samples whose intact, unclipped copies land on that end.
+    pub modal_end_samples: u32,
+    /// Samples carrying an intact allele longer than the finished end.
+    pub extension_samples: u32,
 }
 
 #[derive(Debug, Clone)]

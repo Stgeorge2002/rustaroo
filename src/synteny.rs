@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use crate::align::{fit_short_in_long, global_identity, terminal_identity_parts};
-use crate::genetic_code::{is_intact, is_start, is_stop, translate};
+use crate::genetic_code::{is_intact, is_start, is_stop, orf_status, translate, translate_bytes};
+use crate::log::{self, progress};
 use crate::model::{Call, Pools};
 
 const CONTAIN_IDENTITY: f64 = 0.90;
@@ -20,13 +21,15 @@ const MAX_COOCCUR: f64 = 0.25;
 const NEIGHBOR_GAP: i32 = 15_000;
 const ABUT_GAP: i32 = 3;
 const TERMINAL_IDENTITY: f64 = 0.98;
-const ALLELE_EDGE_BP: usize = 90;
+pub(crate) const ALLELE_EDGE_BP: usize = 90;
 const ALLELE_MIN_AA: usize = 30;
 
 /// Split fusion CDS into the two genes they contain. Returns the number split.
 pub fn split_fusions(calls: &mut Vec<Call>, pools: &mut Pools) -> usize {
-    let reps = representatives(calls, pools);
-    let counts = sample_counts(calls);
+    let (reps, counts) = rayon::join(
+        || representatives(calls, pools),
+        || sample_counts(calls),
+    );
     let kmers = kmer_sets(&reps);
     let mut cluster_ids: Vec<u32> = reps.keys().copied().collect();
     // Sorted so the `best` tie-breaks below (strict `>` on a support score)
@@ -64,8 +67,8 @@ pub fn split_fusions(calls: &mut Vec<Call>, pools: &mut Pools) -> usize {
             twin.cluster = *right_id;
             twin.symbol.clear();
             twin.product.clear();
-            twin.dna = pools.intern_dna(suffix.clone());
             twin.protein = pools.intern_protein(translate(&suffix));
+            twin.dna = pools.intern_dna(suffix);
             if twin.strand >= 0 {
                 twin.start = twin.end.saturating_sub(suffix_bp).max(twin.start);
             } else {
@@ -74,9 +77,9 @@ pub fn split_fusions(calls: &mut Vec<Call>, pools: &mut Pools) -> usize {
             twins.push(twin);
         }
         if let Some(prefix) = slice_coding(&dna, 0, cut) {
-            call.dna = pools.intern_dna(prefix.clone());
-            call.protein = pools.intern_protein(translate(&prefix));
             let prefix_bp = prefix.len() as u32;
+            call.protein = pools.intern_protein(translate(&prefix));
+            call.dna = pools.intern_dna(prefix);
             if call.strand >= 0 {
                 call.end = call.start.saturating_add(prefix_bp).saturating_sub(1);
             } else {
@@ -171,6 +174,9 @@ pub fn split_paralogs(calls: &mut [Call], pools: &Pools) -> usize {
     sort_calls(calls);
     let loci = physical_loci(calls, pools);
     let contexts = locus_contexts(calls, &loci, |call| call.context);
+    // A neighbor seen once must not split a copy away from the flank the rest
+    // of the collection supports.
+    let contexts = stabilize_contexts(calls, &loci, &contexts, |call| call.context);
     let mut by_cluster: HashMap<u32, Vec<usize>> = HashMap::new();
     for (index, locus) in loci.iter().enumerate() {
         by_cluster.entry(calls[locus.first].cluster).or_default().push(index);
@@ -198,12 +204,12 @@ pub fn split_paralogs(calls: &mut [Call], pools: &Pools) -> usize {
         }
     }
     if unresolved > 0 {
-        eprintln!(
+        progress!(
             "rustroo: {unresolved} loci have unresolved paralog placement; no arbitrary flank assignment"
         );
     }
     if allele_unions > 0 {
-        eprintln!("rustroo: reconciled {allele_unions} exact-allele context groups");
+        progress!("rustroo: reconciled {allele_unions} exact-allele context groups");
     }
     added
 }
@@ -401,14 +407,21 @@ fn reconcile_disjoint_pairs(
 
 pub fn merge_fragments(calls: &mut [Call], pools: &Pools, contig_lengths: &[Vec<usize>]) -> bool {
     sort_calls(calls);
-    let reps = representatives(calls, pools);
-    let members = sample_sets(calls);
-    let loci = physical_loci(calls, pools);
+    // Representatives, sample sets, loci, and adjacency only read the calls.
+    // Building them one after another kept every core but one idle.
+    let ((reps, members), (loci, adjacency)) = rayon::join(
+        || rayon::join(|| representatives(calls, pools), || sample_sets(calls)),
+        || rayon::join(|| physical_loci(calls, pools), || adjacency_pairs(calls)),
+    );
     let contexts = locus_contexts(calls, &loci, |call| call.cluster);
-    let flanks = modal_flanks_of(calls, &loci, &contexts);
-    let alleles = AlleleIndex::new(calls, pools, &loci, &contexts, contig_lengths);
-    let kmers = kmer_sets(&reps);
-    let adjacency = adjacency_pairs(calls);
+    let contexts = stabilize_contexts(calls, &loci, &contexts, |call| call.cluster);
+    let ((flanks, kmers), alleles) = rayon::join(
+        || rayon::join(
+            || modal_flanks_of(calls, &loci, &contexts),
+            || kmer_sets(&reps),
+        ),
+        || AlleleIndex::new(calls, pools, &loci, &contexts, contig_lengths),
+    );
     let index = MergeIndex::new(&flanks, &adjacency);
     let mut ids: Vec<u32> = reps.keys().copied().collect();
     ids.sort_unstable();
@@ -442,20 +455,20 @@ pub fn merge_fragments(calls: &mut [Call], pools: &Pools, contig_lengths: &[Vec<
         }
     }
     if ambiguous > 0 {
-        eprintln!("rustroo: {ambiguous} families have ambiguous shortened-allele targets; no arbitrary adoption");
+        progress!("rustroo: {ambiguous} families have ambiguous shortened-allele targets; no arbitrary adoption");
     }
     if rescues > 0 {
-        eprintln!("rustroo: proposed {rescues} strand-aware shortened-allele adoptions; unions remain sample-guarded");
+        progress!("rustroo: proposed {rescues} strand-aware shortened-allele adoptions; unions remain sample-guarded");
     }
     legacy.extend(abutting_pieces(calls, &reps, &members));
     let (merged, terminal_merged, blocked) = apply_adoptions(calls, pools, members, &legacy, &terminal);
     if merged > 0 {
-        eprintln!(
+        progress!(
             "rustroo: merged {merged} groups, including {terminal_merged} guarded shortened-allele groups"
         );
     }
     if blocked > 0 {
-        eprintln!("rustroo: blocked {blocked} merges that would combine distinct co-occurring loci");
+        progress!("rustroo: blocked {blocked} merges that would combine distinct co-occurring loci");
     }
     merged > 0
 }
@@ -1083,7 +1096,9 @@ struct FoundOrf {
 
 fn best_orf(gap: &str, target: &[u8]) -> Option<FoundOrf> {
     let reverse = crate::genetic_code::reverse_complement(gap);
-    let mut best: Option<(f64, FoundOrf)> = None;
+    // Bounds only. The DNA string is built for an ORF that clears 0.80
+    // identity, and equal scores keep the earlier strand, frame, and codon.
+    let mut spans: Vec<(i8, usize, usize, u32)> = Vec::new();
     for (sequence, strand) in [(gap, 1i8), (reverse.as_str(), -1)] {
         for frame in 0..3 {
             if sequence.len() <= frame {
@@ -1113,40 +1128,54 @@ fn best_orf(gap: &str, target: &[u8]) -> Option<FoundOrf> {
                     continue;
                 };
                 let end = (stop_at + 1) * 3;
-                let dna = frame_seq[start..end].to_string();
-                let protein = translate(&dna);
-                let identity = if protein.len().abs_diff(target.len()) * 5 <= target.len() {
-                    global_identity(&protein, target).unwrap_or(0.0)
-                } else if protein.len() <= target.len() {
-                    fit_short_in_long(&protein, target)
-                        .map(|fit| fit.identity)
-                        .unwrap_or(0.0)
+                let offset = if strand > 0 {
+                    (frame + start) as u32
                 } else {
-                    fit_short_in_long(target, &protein)
-                        .map(|fit| fit.identity)
-                        .unwrap_or(0.0)
+                    // Reverse-complement coordinate: the ORF ends `frame+end`
+                    // bases before the end of the forward gap.
+                    let span = frame + end;
+                    gap.len().saturating_sub(span) as u32
                 };
-                if identity >= 0.8 && best.as_ref().map(|(score, _)| identity > *score).unwrap_or(true)
-                {
-                    let offset = if strand > 0 {
-                        (frame + start) as u32
-                    } else {
-                        // Reverse-complement coordinate: the ORF ends `frame+end`
-                        // bases before the end of the forward gap.
-                        let span = frame + end;
-                        gap.len().saturating_sub(span) as u32
-                    };
-                    best = Some((
-                        identity,
-                        FoundOrf {
-                            dna,
-                            offset,
-                            strand,
-                        },
-                    ));
-                }
+                spans.push((strand, frame + start, frame + end, offset));
                 codon = stop_at + 1;
             }
+        }
+    }
+    let score = |&(strand, start, end, offset): &(i8, usize, usize, u32)| -> Option<(f64, FoundOrf)> {
+        let sequence = if strand > 0 { gap } else { reverse.as_str() };
+        let protein = translate_bytes(&sequence.as_bytes()[start..end]);
+        let identity = if protein.len().abs_diff(target.len()) * 5 <= target.len() {
+            global_identity(&protein, target).unwrap_or(0.0)
+        } else if protein.len() <= target.len() {
+            fit_short_in_long(&protein, target)
+                .map(|fit| fit.identity)
+                .unwrap_or(0.0)
+        } else {
+            fit_short_in_long(target, &protein)
+                .map(|fit| fit.identity)
+                .unwrap_or(0.0)
+        };
+        if identity < 0.8 {
+            return None;
+        }
+        Some((
+            identity,
+            FoundOrf {
+                dna: sequence[start..end].to_string(),
+                offset,
+                strand,
+            },
+        ))
+    };
+    let scored: Vec<Option<(f64, FoundOrf)>> = if spans.len() >= 4 {
+        spans.par_iter().map(score).collect()
+    } else {
+        spans.iter().map(score).collect()
+    };
+    let mut best: Option<(f64, FoundOrf)> = None;
+    for found in scored.into_iter().flatten() {
+        if best.as_ref().map(|(identity, _)| found.0 > *identity).unwrap_or(true) {
+            best = Some(found);
         }
     }
     best.map(|(_, orf)| orf)
@@ -1180,10 +1209,19 @@ fn slice_coding(dna: &str, aa_start: usize, aa_end: usize) -> Option<String> {
 /// redoing the same O(length) work up to once per pair, which dominates the
 /// whole pass once a pangenome has more than a few hundred families.
 fn kmer_sets(reps: &HashMap<u32, Vec<u8>>) -> HashMap<u32, HashSet<&[u8]>> {
-    reps.iter()
+    let ids: Vec<u32> = reps
+        .iter()
         .filter(|(_, protein)| protein.len() >= 4)
-        .map(|(&id, protein)| (id, protein.windows(4).collect()))
-        .collect()
+        .map(|(&id, _)| id)
+        .collect();
+    let built: Vec<(u32, HashSet<&[u8]>)> = ids
+        .par_iter()
+        .map(|&id| {
+            let protein = &reps[&id];
+            (id, protein.windows(4).collect())
+        })
+        .collect();
+    built.into_iter().collect()
 }
 
 fn shares_kmer_cached(
@@ -1541,6 +1579,368 @@ pub fn compress_clusters(calls: &mut [Call]) {
     }
 }
 
+/// Drop families that are not usable genes.
+///
+/// A call with a broken frame, an internal stop, or fewer than 90 bp may sit
+/// inside a family that also has an intact allele. A family whose every call
+/// is one of those is an annotation artifact and is removed.
+///
+/// Separately, walk inward from both ends of every contig. A family present
+/// in fewer than `max(2, ceil(0.05 * samples))` genomes is removed while every
+/// one of its copies is still on that walk: it is not between two neighboring
+/// genes, and it does not itself clear the sample threshold. The walk repeats,
+/// because deleting the outer gene exposes the next one. A private contig of
+/// such families disappears with them. A rare gene that sits between two
+/// neighbors is left in place. When no family in the collection clears the
+/// threshold, nothing is judged a tail: there is no conserved backbone to
+/// walk toward.
+pub fn screen_unsupported_families(calls: &mut Vec<Call>, pools: &Pools, n_samples: usize) {
+    let invalid = families_without_intact_allele(calls, pools);
+    if !invalid.is_empty() {
+        record_removed(calls, pools, &invalid, "no_intact_allele");
+        calls.retain(|call| !invalid.contains(&call.cluster));
+        progress!(
+            "rustroo: removed {} families with no intact allele",
+            invalid.len()
+        );
+    }
+    let mut removed = 0usize;
+    loop {
+        if calls.is_empty() {
+            break;
+        }
+        sort_calls(calls);
+        let loci = physical_loci(calls, pools);
+        let tails = contig_end_tail_families(calls, &loci, n_samples);
+        if tails.is_empty() {
+            break;
+        }
+        record_removed(calls, pools, &tails, "contig_end");
+        removed += tails.len();
+        calls.retain(|call| !tails.contains(&call.cluster));
+    }
+    if removed > 0 {
+        progress!("rustroo: removed {removed} unsupported contig-end families");
+    }
+}
+
+fn record_removed(calls: &[Call], pools: &Pools, clusters: &HashSet<u32>, reason: &str) {
+    if !log::enabled() || clusters.is_empty() {
+        return;
+    }
+    struct Row {
+        symbol: String,
+        product: String,
+        samples: HashSet<u32>,
+        copies: u32,
+        longest: usize,
+    }
+    let mut rows: HashMap<u32, Row> = HashMap::new();
+    for call in calls.iter().filter(|call| clusters.contains(&call.cluster)) {
+        let row = rows.entry(call.cluster).or_insert_with(|| Row {
+            symbol: String::new(),
+            product: String::new(),
+            samples: HashSet::new(),
+            copies: 0,
+            longest: 0,
+        });
+        if row.symbol.is_empty() {
+            row.symbol.clone_from(&call.symbol);
+        }
+        if row.product.is_empty() {
+            row.product.clone_from(&call.product);
+        }
+        row.samples.insert(call.sample);
+        row.copies += 1;
+        row.longest = row.longest.max(pools.dna[call.dna as usize].len());
+    }
+    log::record("removed\treason\tcluster\tsymbol\tproduct\tsamples\tcopies\tlongest_bp");
+    let mut ordered: Vec<_> = rows.into_iter().collect();
+    ordered.sort_by(|left, right| left.1.symbol.cmp(&right.1.symbol).then(left.0.cmp(&right.0)));
+    for (cluster, row) in ordered {
+        log::record(&format!(
+            "removed\t{reason}\t{cluster}\t{}\t{}\t{}\t{}\t{}",
+            log_field(&row.symbol),
+            log_field(&row.product),
+            row.samples.len(),
+            row.copies,
+            row.longest,
+        ));
+    }
+}
+
+fn log_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\t' | '\n' | '\r' => ' ',
+            _ => character,
+        })
+        .collect()
+}
+
+fn families_without_intact_allele(calls: &[Call], pools: &Pools) -> HashSet<u32> {
+    let mut intact = HashSet::new();
+    let mut seen = HashSet::new();
+    for call in calls {
+        seen.insert(call.cluster);
+        if !sequence_cannot_found_a_family(&pools.dna[call.dna as usize]) {
+            intact.insert(call.cluster);
+        }
+    }
+    seen.difference(&intact).copied().collect()
+}
+
+/// Out of frame, an internal stop, or shorter than 90 bp. A truncation that
+/// stays in frame and has no internal stop can still found a family when
+/// synteny did not adopt it.
+fn sequence_cannot_found_a_family(dna: &str) -> bool {
+    let status = orf_status(dna);
+    !status.in_frame || status.internal_stops > 0 || dna.len() < 90
+}
+
+fn support_threshold(n_samples: usize) -> u32 {
+    let fraction = (n_samples as f64 * 0.05).ceil() as u32;
+    fraction.max(2)
+}
+
+/// Prodigal's empirical balance point. Below this length a positive coding
+/// score in a single genome is about as likely to be false as real, so length
+/// itself is not evidence. The constant is a label boundary, not a filter.
+const LENGTH_PRIOR_BP: usize = 250;
+
+pub const LENGTH_SUFFICIENT: &str = "length_sufficient";
+pub const CONSERVED_SHORT: &str = "conserved_short";
+pub const UNCONFIRMED_SHORT: &str = "unconfirmed_short";
+
+/// Classify the length uncertainty of one finished family.
+///
+/// A reference of at least 250 bp needs nothing else from the collection.
+/// A shorter gene is conserved when enough genomes carry it, or when any copy
+/// sits between two neighboring genes. Otherwise the call is the short,
+/// single-sample case the length prior cannot settle.
+pub fn length_evidence(
+    reference_bp: usize,
+    samples_present: u32,
+    n_samples: usize,
+    between_neighbors: bool,
+) -> &'static str {
+    if reference_bp >= LENGTH_PRIOR_BP {
+        return LENGTH_SUFFICIENT;
+    }
+    if samples_present >= support_threshold(n_samples) || between_neighbors {
+        CONSERVED_SHORT
+    } else {
+        UNCONFIRMED_SHORT
+    }
+}
+
+pub fn families_bounded_by_neighbors(calls: &mut [Call], pools: &Pools) -> HashSet<u32> {
+    sort_calls(calls);
+    let loci = physical_loci(calls, pools);
+    families_between_neighbors(calls, &loci)
+}
+
+fn weak_flank_threshold(n_samples: usize) -> usize {
+    let fraction = (n_samples as f64 * 0.01).ceil() as usize;
+    fraction.max(2)
+}
+
+fn contig_end_tail_families(calls: &[Call], loci: &[Locus], n_samples: usize) -> HashSet<u32> {
+    let support = sample_counts(calls);
+    let threshold = support_threshold(n_samples);
+    if !support.values().any(|count| *count >= threshold) {
+        return HashSet::new();
+    }
+    let internal = families_between_neighbors(calls, loci);
+    let mut consumed = HashSet::new();
+    let mut index = 0;
+    while index < loci.len() {
+        let mut end = index + 1;
+        let sample = calls[loci[index].first].sample;
+        let contig = calls[loci[index].first].contig;
+        while end < loci.len()
+            && calls[loci[end].first].sample == sample
+            && calls[loci[end].first].contig == contig
+        {
+            end += 1;
+        }
+        consume_tail(&mut consumed, calls, loci, index..end, true, &support, &internal, threshold);
+        consume_tail(&mut consumed, calls, loci, index..end, false, &support, &internal, threshold);
+        index = end;
+    }
+    // A family stays if any copy was not on a tail walk. Dropping the family
+    // would also delete that internal or gap-isolated copy.
+    let mut total: HashMap<u32, usize> = HashMap::new();
+    let mut hit: HashMap<u32, usize> = HashMap::new();
+    for (locus_index, locus) in loci.iter().enumerate() {
+        let family = calls[locus.first].cluster;
+        *total.entry(family).or_default() += 1;
+        if consumed.contains(&locus_index) {
+            *hit.entry(family).or_default() += 1;
+        }
+    }
+    total
+        .into_iter()
+        .filter(|(family, count)| hit.get(family).copied().unwrap_or(0) == *count)
+        .map(|(family, _)| family)
+        .collect()
+}
+
+fn consume_tail(
+    consumed: &mut HashSet<usize>,
+    calls: &[Call],
+    loci: &[Locus],
+    range: std::ops::Range<usize>,
+    forward: bool,
+    support: &HashMap<u32, u32>,
+    internal: &HashSet<u32>,
+    threshold: u32,
+) {
+    let cursors: Vec<usize> = if forward {
+        range.collect()
+    } else {
+        range.rev().collect()
+    };
+    let mut previous: Option<usize> = None;
+    for cursor in cursors {
+        if let Some(previous) = previous {
+            let adjacent = if forward {
+                neighbor_gap(calls, loci, previous, cursor)
+            } else {
+                neighbor_gap(calls, loci, cursor, previous)
+            };
+            if !adjacent {
+                break;
+            }
+        }
+        let family = calls[loci[cursor].first].cluster;
+        if support.get(&family).copied().unwrap_or(0) >= threshold || internal.contains(&family) {
+            break;
+        }
+        consumed.insert(cursor);
+        previous = Some(cursor);
+    }
+}
+
+/// A family is between two genes when any copy has a neighbor on both sides
+/// within the same gap used for flank evidence. One such copy protects every
+/// terminal copy of that family.
+fn families_between_neighbors(calls: &[Call], loci: &[Locus]) -> HashSet<u32> {
+    let mut internal = HashSet::new();
+    let mut index = 0;
+    while index < loci.len() {
+        let mut end = index + 1;
+        let sample = calls[loci[index].first].sample;
+        let contig = calls[loci[index].first].contig;
+        while end < loci.len()
+            && calls[loci[end].first].sample == sample
+            && calls[loci[end].first].contig == contig
+        {
+            end += 1;
+        }
+        for cursor in index..end {
+            let prev = cursor > index && neighbor_gap(calls, loci, cursor - 1, cursor);
+            let next = cursor + 1 < end && neighbor_gap(calls, loci, cursor, cursor + 1);
+            if prev && next {
+                internal.insert(calls[loci[cursor].first].cluster);
+            }
+        }
+        index = end;
+    }
+    internal
+}
+
+fn neighbor_gap(calls: &[Call], loci: &[Locus], left: usize, right: usize) -> bool {
+    let gap = i64::from(calls[loci[right].first].start) - i64::from(loci[left].end) - 1;
+    (-15..=i64::from(NEIGHBOR_GAP)).contains(&gap)
+}
+
+/// A neighbor seen in fewer than `max(2, 1% of samples)` genomes is not a
+/// different context when the other flank already identifies a single
+/// better-supported neighbor. The rare edge then cannot split a paralog or
+/// veto adoption of a fragment. Two equally supported alternatives are left
+/// alone: there is no basis for choosing one.
+fn stabilize_contexts(
+    calls: &[Call],
+    loci: &[Locus],
+    contexts: &[(Option<u32>, Option<u32>)],
+    family_of: impl Fn(&Call) -> u32,
+) -> Vec<(Option<u32>, Option<u32>)> {
+    let n_samples = calls.iter().map(|call| call.sample as usize + 1).max().unwrap_or(0);
+    let threshold = weak_flank_threshold(n_samples);
+    let mut support: HashMap<(u32, Option<u32>, Option<u32>), HashSet<u32>> = HashMap::new();
+    for (locus, context) in loci.iter().zip(contexts.iter()) {
+        let family = family_of(&calls[locus.first]);
+        support
+            .entry((family, context.0, context.1))
+            .or_default()
+            .insert(calls[locus.first].sample);
+    }
+    let count = |family, prev, next| {
+        support
+            .get(&(family, prev, next))
+            .map(|samples| samples.len())
+            .unwrap_or(0)
+    };
+    contexts
+        .iter()
+        .enumerate()
+        .map(|(index, context)| {
+            let family = family_of(&calls[loci[index].first]);
+            if count(family, context.0, context.1) >= threshold {
+                return *context;
+            }
+            let next = supported_alternative(family, context.0, context.1, true, threshold, &support);
+            let prev = supported_alternative(family, context.0, context.1, false, threshold, &support);
+            // Replacing both sides at once builds a neighborhood this gene was
+            // never in. A missing side is also left missing: an absent flank
+            // at a contig break is evidence, not a value to invent.
+            if prev != context.0 && next != context.1 {
+                return *context;
+            }
+            (prev, next)
+        })
+        .collect()
+}
+
+/// `fix_next` searches for one strong replacement of the downstream flank
+/// among contexts that keep the upstream flank. The opposite search keeps the
+/// downstream flank. The observed pair is allowed to compete; a lone strong
+/// alternative replaces a weak one.
+fn supported_alternative(
+    family: u32,
+    prev: Option<u32>,
+    next: Option<u32>,
+    fix_next: bool,
+    threshold: usize,
+    support: &HashMap<(u32, Option<u32>, Option<u32>), HashSet<u32>>,
+) -> Option<u32> {
+    let observed = if fix_next { next } else { prev };
+    if observed.is_none() {
+        return None;
+    }
+    let mut alternatives: Vec<(usize, u32)> = support
+        .iter()
+        .filter(|((id, pair_prev, pair_next), _)| {
+            *id == family && if fix_next { *pair_prev == prev } else { *pair_next == next }
+        })
+        .filter_map(|((_, pair_prev, pair_next), samples)| {
+            let neighbor = if fix_next { *pair_next } else { *pair_prev };
+            let neighbor = neighbor?;
+            let count = samples.len();
+            (count >= threshold).then_some((count, neighbor))
+        })
+        .collect();
+    alternatives.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    alternatives.dedup_by(|a, b| a.1 == b.1);
+    let observed = if fix_next { next } else { prev };
+    match alternatives.as_slice() {
+        [(count, neighbor)] if observed != Some(*neighbor) && *count >= threshold => Some(*neighbor),
+        _ => observed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1842,6 +2242,48 @@ mod tests {
         assert!(decision.ambiguous);
         assert!(!merge_fragments(&mut calls, &pools, &lengths),
             "a nonintact host must not bypass rescue rejection through the legacy route");
+    }
+
+    #[test]
+    fn a_one_off_flank_does_not_veto_adoption_when_the_other_flank_is_supported() {
+        let full = intact_protein(120, 42);
+        let short = &full[..90];
+        let mut pools = Pools::default();
+        let mut calls = Vec::new();
+        let mut lengths = Vec::new();
+        for sample in 0..2 {
+            lengths.push(vec![4000]);
+            bracketed(&mut calls, &mut pools, sample, 1, (10, 11), &[(0, short)]);
+        }
+        for sample in 2..4 {
+            lengths.push(vec![4000]);
+            bracketed(&mut calls, &mut pools, sample, 1, (10, 11), &[(1, full.as_slice())]);
+        }
+        lengths.push(vec![4000]);
+        bracketed(&mut calls, &mut pools, 4, 1, (10, 12), &[(0, short)]);
+        assert!(allele_target(&mut calls, &pools, &lengths).target.is_none());
+        sort_calls(&mut calls);
+        let loci = physical_loci(&calls, &pools);
+        let raw = locus_contexts(&calls, &loci, |call| call.cluster);
+        let stabilized = stabilize_contexts(&calls, &loci, &raw, |call| call.cluster);
+        let decision = AlleleIndex::new(&calls, &pools, &loci, &stabilized, &lengths).target(0, &pools);
+        assert_eq!(decision.target, Some(1));
+        assert!(merge_fragments(&mut calls, &pools, &lengths));
+        let short_protein = pools.protein.iter().position(|sequence| sequence == short).unwrap() as u32;
+        let full_protein = pools.protein.iter().position(|sequence| sequence == &full).unwrap() as u32;
+        let short_cluster = calls.iter().find(|call| call.protein == short_protein).unwrap().cluster;
+        let full_cluster = calls.iter().find(|call| call.protein == full_protein).unwrap().cluster;
+        assert_eq!(short_cluster, full_cluster);
+    }
+
+    #[test]
+    fn length_evidence_uses_250_bp_and_the_collection() {
+        use super::{length_evidence, CONSERVED_SHORT, LENGTH_SUFFICIENT, UNCONFIRMED_SHORT};
+        assert_eq!(length_evidence(250, 1, 10, false), LENGTH_SUFFICIENT);
+        assert_eq!(length_evidence(249, 1, 10, false), UNCONFIRMED_SHORT);
+        assert_eq!(length_evidence(249, 1, 10, true), CONSERVED_SHORT);
+        assert_eq!(length_evidence(249, 2, 10, false), CONSERVED_SHORT);
+        assert_eq!(length_evidence(90, 1, 1, false), UNCONFIRMED_SHORT);
     }
 
     #[test]

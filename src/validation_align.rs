@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
     Both,
@@ -39,50 +41,92 @@ pub(crate) fn align(reference: &[u8], allele: &[u8], cap: usize) -> Result<Align
     if cap != 0 && cells > cap {
         return Err("alignment_work_limit");
     }
-    let mut trace = vec![0u16; cells];
-    let mut previous: [Vec<i32>; 3] = std::array::from_fn(|_| vec![NEG; m + 1]);
-    let mut current: [Vec<i32>; 3] = std::array::from_fn(|_| vec![NEG; m + 1]);
-    previous[0][0] = 0;
-    for j in 1..=m {
-        previous[2][j] = OPEN + (j - 1) as i32 * EXTEND;
-        trace[j] = if j == 1 { 0 } else { 2 << 4 };
-    }
-    for i in 1..=n {
-        for row in &mut current { row.fill(NEG); }
-        current[1][0] = OPEN + (i - 1) as i32 * EXTEND;
-        trace[i * (m + 1)] = if i == 1 { 0 } else { 1 << 2 };
+    // Score rows and the traceback are reused on this worker. The recurrence,
+    // tie bits, and predecessor codes are unchanged; only the allocation is.
+    AFFINE.with(|cell| cell.borrow_mut().align(reference, allele, n, m, cells))
+}
+
+struct AffineScratch {
+    trace: Vec<u16>,
+    previous: [Vec<i32>; 3],
+    current: [Vec<i32>; 3],
+}
+
+impl AffineScratch {
+    fn align(
+        &mut self, reference: &[u8], allele: &[u8], n: usize, m: usize, cells: usize,
+    ) -> Result<Alignment, &'static str> {
+        let width = m + 1;
+        for row in &mut self.previous {
+            if row.len() < width {
+                row.resize(width, NEG);
+            }
+            row[..width].fill(NEG);
+        }
+        for row in &mut self.current {
+            if row.len() < width {
+                row.resize(width, NEG);
+            }
+        }
+        if self.trace.len() < cells {
+            self.trace.resize(cells, 0);
+        }
+        self.previous[0][0] = 0;
         for j in 1..=m {
-            let (score, state, tied) = best(&[previous[0][j - 1], previous[1][j - 1], previous[2][j - 1]]);
-            let canonical = reference[i - 1] != b'X' && reference[i - 1] != b'*';
-            current[0][j] = score + if reference[i - 1] == allele[j - 1] && canonical { 2 } else { -1 };
-            let mut code = state as u16 | (u16::from(tied) << 6);
-            let (score, state, tied) = best(&[previous[0][j] + OPEN, previous[1][j] + EXTEND]);
-            current[1][j] = score;
-            code |= (state as u16) << 2 | (u16::from(tied) << 7);
-            let (score, state, tied) = best(&[current[0][j - 1] + OPEN, current[2][j - 1] + EXTEND]);
-            current[2][j] = score;
-            code |= (if state == 0 { 0 } else { 2 }) << 4 | (u16::from(tied) << 8);
-            trace[i * (m + 1) + j] = code;
+            self.previous[2][j] = OPEN + (j - 1) as i32 * EXTEND;
+            self.trace[j] = if j == 1 { 0 } else { 2 << 4 };
         }
-        std::mem::swap(&mut previous, &mut current);
-    }
-    let (_, mut state, mut ambiguous) = best(&[previous[0][m], previous[1][m], previous[2][m]]);
-    let (mut i, mut j) = (n, m);
-    let mut steps = Vec::with_capacity(n.max(m));
-    while i > 0 || j > 0 {
-        let code = trace[i * (m + 1) + j];
-        ambiguous |= code & (1 << (6 + state)) != 0;
-        let predecessor = ((code >> (state * 2)) & 3) as usize;
-        match state {
-            0 => { i -= 1; j -= 1; steps.push(Step::Both); }
-            1 => { i -= 1; steps.push(Step::ReferenceOnly); }
-            2 => { j -= 1; steps.push(Step::AlleleOnly); }
-            _ => unreachable!("alignment state"),
+        for i in 1..=n {
+            for row in &mut self.current {
+                row[..width].fill(NEG);
+            }
+            self.current[1][0] = OPEN + (i - 1) as i32 * EXTEND;
+            self.trace[i * (m + 1)] = if i == 1 { 0 } else { 1 << 2 };
+            for j in 1..=m {
+                let (score, state, tied) = best(&[
+                    self.previous[0][j - 1],
+                    self.previous[1][j - 1],
+                    self.previous[2][j - 1],
+                ]);
+                let canonical = reference[i - 1] != b'X' && reference[i - 1] != b'*';
+                self.current[0][j] = score + if reference[i - 1] == allele[j - 1] && canonical { 2 } else { -1 };
+                let mut code = state as u16 | (u16::from(tied) << 6);
+                let (score, state, tied) = best(&[self.previous[0][j] + OPEN, self.previous[1][j] + EXTEND]);
+                self.current[1][j] = score;
+                code |= (state as u16) << 2 | (u16::from(tied) << 7);
+                let (score, state, tied) = best(&[self.current[0][j - 1] + OPEN, self.current[2][j - 1] + EXTEND]);
+                self.current[2][j] = score;
+                code |= (if state == 0 { 0 } else { 2 }) << 4 | (u16::from(tied) << 8);
+                self.trace[i * (m + 1) + j] = code;
+            }
+            std::mem::swap(&mut self.previous, &mut self.current);
         }
-        state = predecessor;
+        let (_, mut state, mut ambiguous) = best(&[self.previous[0][m], self.previous[1][m], self.previous[2][m]]);
+        let (mut i, mut j) = (n, m);
+        let mut steps = Vec::with_capacity(n.max(m));
+        while i > 0 || j > 0 {
+            let code = self.trace[i * (m + 1) + j];
+            ambiguous |= code & (1 << (6 + state)) != 0;
+            let predecessor = ((code >> (state * 2)) & 3) as usize;
+            match state {
+                0 => { i -= 1; j -= 1; steps.push(Step::Both); }
+                1 => { i -= 1; steps.push(Step::ReferenceOnly); }
+                2 => { j -= 1; steps.push(Step::AlleleOnly); }
+                _ => unreachable!("alignment state"),
+            }
+            state = predecessor;
+        }
+        steps.reverse();
+        Ok(Alignment { steps, ambiguous })
     }
-    steps.reverse();
-    Ok(Alignment { steps, ambiguous })
+}
+
+thread_local! {
+    static AFFINE: RefCell<AffineScratch> = RefCell::new(AffineScratch {
+        trace: Vec::new(),
+        previous: std::array::from_fn(|_| Vec::new()),
+        current: std::array::from_fn(|_| Vec::new()),
+    });
 }
 
 #[derive(Clone)]

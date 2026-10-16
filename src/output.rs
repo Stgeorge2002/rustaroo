@@ -5,6 +5,8 @@ use std::path::Path;
 use crate::error::Result;
 use crate::types::Pangenome;
 
+const OUTPUT_BUFFER: usize = 1 << 20;
+
 pub fn write_pangenome(pangenome: &Pangenome, directory: &Path) -> Result<()> {
     fs::create_dir_all(directory)?;
     if pangenome.membership_audit.is_none()
@@ -14,18 +16,36 @@ pub fn write_pangenome(pangenome: &Pangenome, directory: &Path) -> Result<()> {
             "membership audit files already exist; use a fresh output directory or --audit-members to avoid a stale audit",
         ));
     }
-    write_fasta(&directory.join("genes.fa"), pangenome)?;
-    write_presence(&directory.join("presence.tsv"), pangenome)?;
-    write_lengths(&directory.join("lengths.tsv"), pangenome)?;
-    write_report(&directory.join("reference_report.tsv"), pangenome)?;
+    let fasta_path = directory.join("genes.fa");
+    let presence_path = directory.join("presence.tsv");
+    let lengths_path = directory.join("lengths.tsv");
+    let report_path = directory.join("reference_report.tsv");
+    let ((fasta, presence), (lengths, report)) = rayon::join(
+        || rayon::join(
+            || write_fasta(&fasta_path, pangenome),
+            || write_presence(&presence_path, pangenome),
+        ),
+        || rayon::join(
+            || write_lengths(&lengths_path, pangenome),
+            || write_report(&report_path, pangenome),
+        ),
+    );
+    fasta?;
+    presence?;
+    lengths?;
+    report?;
     if pangenome.membership_audit.is_some() {
         write_members(&directory.join("members.tsv"), pangenome)?;
     }
     Ok(())
 }
 
+fn buffered(path: &Path) -> Result<BufWriter<File>> {
+    Ok(BufWriter::with_capacity(OUTPUT_BUFFER, File::create(path)?))
+}
+
 fn write_fasta(path: &Path, pangenome: &Pangenome) -> Result<()> {
-    let mut out = BufWriter::new(File::create(path)?);
+    let mut out = buffered(path)?;
     for gene in &pangenome.genes {
         // The header is only the id. SnpEff anchors on the whole header line,
         // so a product after a space would become part of the contig name.
@@ -38,7 +58,7 @@ fn write_fasta(path: &Path, pangenome: &Pangenome) -> Result<()> {
 }
 
 fn write_presence(path: &Path, pangenome: &Pangenome) -> Result<()> {
-    let mut out = BufWriter::new(File::create(path)?);
+    let mut out = buffered(path)?;
     write!(out, "gene")?;
     for sample in &pangenome.sample_names {
         write!(out, "\t{sample}")?;
@@ -55,7 +75,7 @@ fn write_presence(path: &Path, pangenome: &Pangenome) -> Result<()> {
 }
 
 fn write_lengths(path: &Path, pangenome: &Pangenome) -> Result<()> {
-    let mut out = BufWriter::new(File::create(path)?);
+    let mut out = buffered(path)?;
     writeln!(out, "gene\tsample\tbases")?;
     for gene in &pangenome.genes {
         for (sample, &length) in pangenome.sample_names.iter().zip(&gene.lengths) {
@@ -68,21 +88,25 @@ fn write_lengths(path: &Path, pangenome: &Pangenome) -> Result<()> {
 }
 
 fn write_report(path: &Path, pangenome: &Pangenome) -> Result<()> {
-    let mut out = BufWriter::new(File::create(path)?);
+    let mut out = buffered(path)?;
     writeln!(
         out,
-        "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles"
+        "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles"
     )?;
     for gene in &pangenome.genes {
         writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             gene.id,
             sanitize_field(&gene.product),
             gene.reference_dna.len(),
             if gene.intact { "yes" } else { "no" },
             gene.selection,
             gene.samples_present,
+            gene.length_evidence,
+            gene.modal_end_bp,
+            gene.modal_end_samples,
+            gene.extension_samples,
             gene.samples_with_exact_reference,
             gene.distinct_alleles,
             gene.intact_alleles,
@@ -103,7 +127,7 @@ fn sanitize_field(value: &str) -> String {
 
 fn write_members(path: &Path, pangenome: &Pangenome) -> Result<()> {
     let audit = pangenome.membership_audit.as_ref().expect("membership audit requested");
-    let mut out = BufWriter::new(File::create(path)?);
+    let mut out = buffered(path)?;
     writeln!(out, "gene\tsample\tcontig\tannotation_id\tstart\tend\tstrand\tlocus\torigin\tallele")?;
     for member in &audit.members {
         let gene = &pangenome.genes[member.gene].id;
@@ -122,7 +146,7 @@ fn write_members(path: &Path, pangenome: &Pangenome) -> Result<()> {
     }
     out.flush()?;
     let used: std::collections::BTreeSet<_> = audit.members.iter().map(|member| member.dna).collect();
-    let mut alleles = BufWriter::new(File::create(path.with_file_name("member_alleles.fa"))?);
+    let mut alleles = buffered(&path.with_file_name("member_alleles.fa"))?;
     for id in used {
         writeln!(alleles, ">dna_{id}")?;
         for chunk in audit.sequences[id as usize].as_bytes().chunks(60) {
@@ -167,8 +191,9 @@ mod tests {
             genes: vec![Gene {
                 id: "gene".to_string(), product: String::new(), reference_dna: "ATGAAATAA".to_string(),
                 intact: true, selection: "intact", presence: vec![true], lengths: vec![9],
-                samples_present: 1, samples_with_exact_reference: 1, distinct_alleles: 1,
-                intact_alleles: 1,
+                samples_present: 1, length_evidence: "unconfirmed_short",
+                samples_with_exact_reference: 1, distinct_alleles: 1,
+                intact_alleles: 1, modal_end_bp: 9, modal_end_samples: 1, extension_samples: 0,
             }],
             membership_audit: Some(MembershipAudit {
                 contig_names: vec![vec!["contig".to_string()]],
@@ -185,6 +210,9 @@ mod tests {
     fn writes_members_and_only_used_alleles() {
         let directory = TemporaryOutput::new();
         write_pangenome(&example(), &directory.0).unwrap();
+        assert_eq!(fs::read_to_string(directory.0.join("reference_report.tsv")).unwrap(),
+            "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles\n\
+gene\t\t9\tyes\tintact\t1\tunconfirmed_short\t9\t1\t0\t1\t1\t1\n");
         assert_eq!(fs::read_to_string(directory.0.join("members.tsv")).unwrap(),
             "gene\tsample\tcontig\tannotation_id\tstart\tend\tstrand\tlocus\torigin\tallele\n\
 gene\tsample\tcontig\tcds1\t100\t108\t-1\t7\tannotated\tdna_0\n");

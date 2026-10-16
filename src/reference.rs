@@ -7,10 +7,16 @@
 //!
 //! A longer sequence is rejected when it is not a clean extension of the
 //! usual allele (an internal insertion) or when the extra tail is some other
-//! gene in the pangenome (a fusion). Frequency only breaks ties between
-//! intact sequences of that same length. The sequence that is written is one
-//! that was observed, or a head-to-tail join of observed fragments when no
-//! sample still carries the gene in one piece.
+//! gene in the pangenome (a fusion). It is also rejected when the shorter
+//! copies already share one finished stop and the extra sequence is private.
+//! A finished stop is a terminal stop on intact copies that are not cut off
+//! by a contig boundary, shared by at least `max(2, 5% of samples)`. The
+//! longer length is private below `max(2, 1% of samples)`. When both lengths
+//! clear that finished-end bar, the longer one stays and the family is a
+//! length polymorphism. Frequency only breaks ties between intact sequences
+//! of one length. The sequence that is written is one that was observed, or
+//! a head-to-tail join of observed fragments when no sample still carries
+//! the gene in one piece. A join cannot outvote a finished end.
 
 use std::collections::HashMap;
 
@@ -33,6 +39,10 @@ pub struct Allele {
     pub dna: String,
     pub count: u32,
     pub synthetic: bool,
+    /// Samples whose copy is a closed ORF away from both contig ends.
+    /// Those copies can define a finished gene end. A clipped copy still
+    /// counts in `count` and still stays in the family.
+    pub finished: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +51,13 @@ pub struct Choice {
     pub intact: bool,
     pub selection: &'static str,
     pub exact_copies: u32,
+    /// DNA length of the finished modal end, or of the chosen reference when
+    /// no shorter end qualified.
+    pub modal_end_bp: u32,
+    /// Samples at that finished end. Zero when no intact copy cleared the bar.
+    pub modal_end_samples: u32,
+    /// Samples carrying an intact allele that extends past the finished end.
+    pub extension_samples: u32,
 }
 
 /// `reps` is every family's representative protein, keyed by cluster id;
@@ -50,10 +67,15 @@ pub struct Choice {
 /// means the common case - a candidate allele that is not notably longer
 /// than the baseline - never touches `reps` at all: `allele_is_clean` only
 /// reaches `matches_other_gene` when it needs to.
+///
+/// `n_samples` is the collection size, used only when intact alleles disagree
+/// on length. A family whose intact copies already share one length returns
+/// on the same path as before: no end census and no extra alignment.
 pub fn choose_reference(
     alleles: &[Allele],
     reps: &HashMap<u32, Vec<u8>>,
     own_cluster: u32,
+    n_samples: usize,
 ) -> Option<Choice> {
     let observed: Vec<&Allele> = alleles.iter().filter(|allele| !allele.synthetic).collect();
     if observed.is_empty() && alleles.is_empty() {
@@ -70,21 +92,70 @@ pub fn choose_reference(
     }
 
     let baseline = most_frequent(&intact);
-    let baseline_protein = translate(&baseline.dna);
+    // One length is the hot path. The census below translates and fits, so it
+    // runs only when some intact copy, or a joined model, is actually longer.
+    let uniform = {
+        let length = intact[0].dna.len();
+        intact.iter().all(|allele| allele.dna.len() == length)
+            && !alleles.iter().any(|allele| {
+                allele.synthetic && is_intact(&allele.dna) && allele.dna.len() != length
+            })
+    };
+
     let mut kept: Vec<&Allele> = Vec::new();
-    for allele in &intact {
-        if allele_is_clean(allele, &baseline_protein, reps, own_cluster) {
-            kept.push(*allele);
+    let mut proteins: Vec<Vec<u8>> = Vec::new();
+    let mut joined: Vec<(&Allele, Vec<u8>)> = Vec::new();
+    if uniform {
+        let baseline_protein = translate(&baseline.dna);
+        for allele in &intact {
+            if allele_is_clean(allele, &baseline_protein, reps, own_cluster) {
+                kept.push(*allele);
+            }
+        }
+        if kept.is_empty() {
+            kept = intact.clone();
+        }
+        for allele in alleles.iter().filter(|allele| allele.synthetic && is_intact(&allele.dna)) {
+            if allele_is_clean(allele, &baseline_protein, reps, own_cluster) {
+                kept.push(allele);
+            }
+        }
+    } else {
+        proteins = intact.iter().map(|allele| translate(&allele.dna)).collect();
+        let baseline_at = intact
+            .iter()
+            .position(|allele| std::ptr::eq(*allele, baseline))
+            .expect("baseline is one of the intact alleles");
+        for (allele, protein) in intact.iter().copied().zip(&proteins) {
+            if protein_is_clean(protein, &proteins[baseline_at], reps, own_cluster) {
+                kept.push(allele);
+            }
+        }
+        if kept.is_empty() {
+            kept = intact.clone();
+        }
+        for allele in alleles.iter().filter(|allele| allele.synthetic && is_intact(&allele.dna)) {
+            let protein = translate(&allele.dna);
+            if protein_is_clean(&protein, &proteins[baseline_at], reps, own_cluster) {
+                kept.push(allele);
+                joined.push((allele, protein));
+            }
         }
     }
-    if kept.is_empty() {
-        kept = intact.clone();
-    }
-    // A joined fragment model is only allowed to win when it is a longer
-    // intact version of the same gene. It is not an observed CDS.
-    for allele in alleles.iter().filter(|allele| allele.synthetic && is_intact(&allele.dna)) {
-        if allele_is_clean(allele, &baseline_protein, reps, own_cluster) {
-            kept.push(allele);
+
+    let mut census = Census::inactive();
+    if !uniform {
+        if let Some(end) = finished_end(&intact, &proteins, n_samples) {
+            census = refuse_private_extensions(&mut kept, &intact, &proteins, &joined, end, n_samples);
+            if kept.is_empty() {
+                // The clean-check fallback must not put a refused private
+                // extension back. The finished end itself is still intact.
+                kept = intact
+                    .iter()
+                    .copied()
+                    .filter(|allele| allele.dna.len() == census.modal_bp as usize)
+                    .collect();
+            }
         }
     }
 
@@ -109,7 +180,7 @@ pub fn choose_reference(
         .collect();
     tied.sort_by(|a, b| a.dna.cmp(&b.dna));
 
-    let (chosen, selection) = if tied.len() == 1 {
+    let (chosen, mut selection) = if tied.len() == 1 {
         let label = if tied[0].synthetic {
             "joined_fragments"
         } else if class.len() == 1 {
@@ -130,17 +201,43 @@ pub fn choose_reference(
             .expect("tie set is non-empty");
         (chosen, "intact_ancestral_tiebreak")
     };
+    if census.active && !chosen.synthetic {
+        let chosen_aa = protein_of(chosen, &intact, &proteins, &joined).len();
+        let support = end_support(n_samples);
+        let chosen_finished = census.finished_by_aa.get(&chosen_aa).copied().unwrap_or(0);
+        let other_finished = census
+            .finished_by_aa
+            .iter()
+            .any(|(&length, &samples)| length != chosen_aa && samples >= support);
+        if census.refused && chosen_aa == census.anchor_aa {
+            selection = "intact_conserved_end";
+        } else if chosen_finished >= support && other_finished {
+            selection = "intact_length_polymorphism";
+        }
+    }
 
     let exact_copies = pool
         .iter()
         .filter(|allele| allele.dna == chosen.dna)
         .map(|allele| allele.count)
         .sum();
+    let (modal_end_bp, modal_end_samples, extension_samples) = if census.active {
+        (census.modal_bp, census.modal_samples, census.extension_samples)
+    } else {
+        (
+            chosen.dna.len() as u32,
+            finished_at_dna_length(&pool, chosen.dna.len()),
+            0,
+        )
+    };
     Some(Choice {
         dna: chosen.dna.clone(),
         intact: true,
         selection,
         exact_copies,
+        modal_end_bp,
+        modal_end_samples,
+        extension_samples,
     })
 }
 
@@ -151,10 +248,19 @@ fn allele_is_clean(
     own_cluster: u32,
 ) -> bool {
     let protein = translate(&allele.dna);
+    protein_is_clean(&protein, baseline, reps, own_cluster)
+}
+
+fn protein_is_clean(
+    protein: &[u8],
+    baseline: &[u8],
+    reps: &HashMap<u32, Vec<u8>>,
+    own_cluster: u32,
+) -> bool {
     if protein.len() <= baseline.len().saturating_add(SMALL_EXTENSION_AA) {
         return true;
     }
-    let Some(fit) = fit_short_in_long(baseline, &protein) else {
+    let Some(fit) = fit_short_in_long(baseline, protein) else {
         return false;
     };
     if fit.identity < EXTENSION_IDENTITY
@@ -165,8 +271,212 @@ fn allele_is_clean(
     }
     let prefix = &protein[..fit.extra_prefix(protein.len())];
     let suffix = &protein[protein.len() - fit.extra_suffix(protein.len())..];
-    !matches_other_gene(prefix, &protein, reps, own_cluster)
-        && !matches_other_gene(suffix, &protein, reps, own_cluster)
+    !matches_other_gene(prefix, protein, reps, own_cluster)
+        && !matches_other_gene(suffix, protein, reps, own_cluster)
+}
+
+/// Samples that can vouch for one DNA length. Clipped copies are absent here
+/// even when they contribute to the allele count.
+fn finished_at_dna_length(alleles: &[&Allele], dna_len: usize) -> u32 {
+    alleles
+        .iter()
+        .filter(|allele| !allele.synthetic && allele.dna.len() == dna_len)
+        .map(|allele| allele.finished)
+        .sum()
+}
+
+fn end_support(n_samples: usize) -> u32 {
+    let fraction = (n_samples as f64 * 0.05).ceil() as u32;
+    fraction.max(2)
+}
+
+fn extension_support(n_samples: usize) -> u32 {
+    let fraction = (n_samples as f64 * 0.01).ceil() as u32;
+    fraction.max(2)
+}
+
+struct Census {
+    active: bool,
+    refused: bool,
+    anchor_aa: usize,
+    modal_bp: u32,
+    modal_samples: u32,
+    extension_samples: u32,
+    finished_by_aa: HashMap<usize, u32>,
+}
+
+impl Census {
+    fn inactive() -> Self {
+        Self {
+            active: false,
+            refused: false,
+            anchor_aa: 0,
+            modal_bp: 0,
+            modal_samples: 0,
+            extension_samples: 0,
+            finished_by_aa: HashMap::new(),
+        }
+    }
+}
+
+struct FinishedEnd {
+    anchor: Vec<u8>,
+    dna_bp: u32,
+    samples: u32,
+    finished_by_aa: HashMap<usize, u32>,
+}
+
+/// The best-supported finished stop, when intact copies actually share one.
+///
+/// The end with the most unclipped samples wins. An equal count keeps the
+/// shorter protein, so a tied longer allele stays an extension rather than
+/// the end the collection is measured against.
+///
+/// Copies are already collapsed to distinct sequences, so this aligns those
+/// sequences once. It does not walk samples. A length class counts only the
+/// sequences that land on the same termini as its most common member: ragged
+/// ends stay in their own classes and fail the support bar on their own.
+fn finished_end(intact: &[&Allele], proteins: &[Vec<u8>], n_samples: usize) -> Option<FinishedEnd> {
+    let threshold = end_support(n_samples);
+    let mut classes: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut finished_by_aa: HashMap<usize, u32> = HashMap::new();
+    for (index, allele) in intact.iter().enumerate() {
+        if allele.finished == 0 || !orf_status(&allele.dna).terminal_stop {
+            continue;
+        }
+        let length = proteins[index].len();
+        classes.entry(length).or_default().push(index);
+    }
+    let mut best: Option<FinishedEnd> = None;
+    for (length, members) in classes {
+        let anchor_at = members
+            .iter()
+            .copied()
+            .max_by(|&a, &b| {
+                intact[a]
+                    .finished
+                    .cmp(&intact[b].finished)
+                    .then(intact[b].dna.len().cmp(&intact[a].dna.len()))
+                    .then(intact[b].dna.cmp(&intact[a].dna))
+            })
+            .expect("length class has a member");
+        let anchor = &proteins[anchor_at];
+        let samples = members
+            .iter()
+            .copied()
+            .filter(|&index| same_end(anchor, &proteins[index]))
+            .map(|index| intact[index].finished)
+            .sum();
+        finished_by_aa.insert(length, samples);
+        if samples < threshold {
+            continue;
+        }
+        let replace = match &best {
+            None => true,
+            Some(current) => {
+                samples > current.samples
+                    || (samples == current.samples && length < current.anchor.len())
+            }
+        };
+        if replace {
+            best = Some(FinishedEnd {
+                anchor: anchor.clone(),
+                dna_bp: intact[anchor_at].dna.len() as u32,
+                samples,
+                finished_by_aa: HashMap::new(),
+            });
+        }
+    }
+    let mut best = best?;
+    best.finished_by_aa = finished_by_aa;
+    Some(best)
+}
+
+fn same_end(anchor: &[u8], other: &[u8]) -> bool {
+    if anchor.len() != other.len() {
+        return false;
+    }
+    if anchor == other {
+        return true;
+    }
+    let Some(fit) = fit_short_in_long(anchor, other) else {
+        return false;
+    };
+    fit.identity + f64::EPSILON >= EXTENSION_IDENTITY
+        && fit.internal_gap <= SMALL_EXTENSION_AA
+        && fit.extra_prefix(other.len()) == 0
+        && fit.extra_suffix(other.len()) == 0
+}
+
+/// A longer protein is a terminal extension when the finished protein sits
+/// inside it, the extra residues are at the ends, and the match is the same
+/// bar used for a clean extension. An internal insertion fails this and is
+/// left to the existing rejection.
+fn extends_past(anchor: &[u8], longer: &[u8]) -> bool {
+    if longer.len() <= anchor.len() {
+        return false;
+    }
+    let Some(fit) = fit_short_in_long(anchor, longer) else {
+        return false;
+    };
+    fit.identity + f64::EPSILON >= EXTENSION_IDENTITY
+        && fit.coverage + f64::EPSILON >= EXTENSION_COVERAGE
+        && fit.internal_gap <= SMALL_EXTENSION_AA
+        && (fit.extra_prefix(longer.len()) > 0 || fit.extra_suffix(longer.len()) > 0)
+}
+
+fn protein_of<'a>(
+    allele: &Allele,
+    intact: &[&Allele],
+    proteins: &'a [Vec<u8>],
+    joined: &'a [(&Allele, Vec<u8>)],
+) -> &'a [u8] {
+    if let Some(index) = intact.iter().position(|item| std::ptr::eq(*item, allele)) {
+        return &proteins[index];
+    }
+    joined
+        .iter()
+        .find(|(item, _)| std::ptr::eq(*item, allele))
+        .map(|(_, protein)| protein.as_slice())
+        .expect("allele protein was translated with the length census")
+}
+
+fn refuse_private_extensions<'a>(
+    kept: &mut Vec<&'a Allele>,
+    intact: &[&'a Allele],
+    proteins: &[Vec<u8>],
+    joined: &[(&Allele, Vec<u8>)],
+    end: FinishedEnd,
+    n_samples: usize,
+) -> Census {
+    let private_below = extension_support(n_samples);
+    let mut extending_copies: HashMap<usize, u32> = HashMap::new();
+    let mut judged: Vec<(&Allele, bool, usize)> = Vec::with_capacity(kept.len());
+    for allele in kept.iter().copied() {
+        let protein = protein_of(allele, intact, proteins, joined);
+        let extends = extends_past(&end.anchor, protein);
+        if extends {
+            *extending_copies.entry(protein.len()).or_default() += allele.count;
+        }
+        judged.push((allele, extends, protein.len()));
+    }
+    let extension_samples = extending_copies.values().sum();
+    let before = kept.len();
+    kept.retain(|allele| {
+        judged.iter().any(|(item, extends, length)| {
+            std::ptr::eq(*item, *allele)
+                && !(*extends && extending_copies.get(length).copied().unwrap_or(0) < private_below)
+        })
+    });
+    Census {
+        active: true,
+        refused: kept.len() != before,
+        anchor_aa: end.anchor.len(),
+        modal_bp: end.dna_bp,
+        modal_samples: end.samples,
+        extension_samples,
+        finished_by_aa: end.finished_by_aa,
+    }
 }
 
 fn matches_other_gene(
@@ -238,6 +548,9 @@ fn broken_fallback(alleles: Vec<&Allele>) -> Choice {
         intact: false,
         selection: "no_intact_copy",
         exact_copies,
+        modal_end_bp: chosen.dna.len() as u32,
+        modal_end_samples: 0,
+        extension_samples: 0,
     }
 }
 
@@ -304,7 +617,24 @@ mod tests {
             dna: dna.to_string(),
             count,
             synthetic: false,
+            finished: count,
         }
+    }
+
+    /// An intact sequence whose copies are clipped by a contig end, so they
+    /// cannot vote for a finished stop.
+    fn clipped(dna: &str, count: u32) -> Allele {
+        Allele {
+            dna: dna.to_string(),
+            count,
+            synthetic: false,
+            finished: 0,
+        }
+    }
+
+    fn choose(alleles: &[Allele], reps: &HashMap<u32, Vec<u8>>) -> Choice {
+        let samples = alleles.iter().map(|allele| allele.count as usize).sum::<usize>().max(1);
+        choose_reference(alleles, reps, 0, samples).unwrap()
     }
 
     /// Builds the "other families" map `choose_reference` now takes directly,
@@ -332,17 +662,130 @@ mod tests {
     }
 
     #[test]
-    fn rare_intact_gene_beats_the_common_truncation() {
-        let full = protein(60, 1);
-        let short = full[..30].to_vec();
+    fn a_private_extension_loses_to_a_shared_stop_and_a_clipped_truncation_does_not() {
+        let full = protein(99, 1);
+        let short = full[..89].to_vec();
         let full_dna = back_translate(&full);
         let short_dna = back_translate(&short);
-        let alleles = vec![allele(&full_dna, 1), allele(&short_dna, 9)];
-        let choice = choose_reference(&alleles, &no_others(), 0).unwrap();
-        assert_eq!(choice.dna, full_dna);
+        assert_eq!(short_dna.len(), 270);
+        assert_eq!(full_dna.len(), 300);
+        let finished = vec![allele(&full_dna, 1), allele(&short_dna, 399)];
+        let choice = choose_reference(&finished, &no_others(), 0, 400).unwrap();
+        assert_eq!(choice.dna, short_dna);
         assert!(choice.intact);
+        assert_eq!(choice.selection, "intact_conserved_end");
+        assert_eq!(choice.exact_copies, 399);
+        assert_eq!(choice.modal_end_bp, 270);
+        assert_eq!(choice.modal_end_samples, 399);
+        assert_eq!(choice.extension_samples, 1);
+
+        let clipped_copies = vec![allele(&full_dna, 1), clipped(&short_dna, 399)];
+        let kept = choose_reference(&clipped_copies, &no_others(), 0, 400).unwrap();
+        assert_eq!(kept.dna, full_dna, "{}", kept.selection);
+        assert_eq!(kept.selection, "intact_longest");
+        assert_eq!(kept.extension_samples, 0);
+    }
+
+    #[test]
+    fn a_short_private_tail_past_a_shared_stop_is_refused() {
+        let common = protein(89, 2);
+        let mut longer = common.clone();
+        longer.extend_from_slice(b"ACD");
+        let choice = choose_reference(
+            &[allele(&back_translate(&longer), 1), allele(&back_translate(&common), 399)],
+            &no_others(),
+            0,
+            400,
+        )
+        .unwrap();
+        assert_eq!(choice.dna, back_translate(&common));
+        assert_eq!(choice.selection, "intact_conserved_end");
+        assert_eq!(choice.extension_samples, 1);
+    }
+
+    #[test]
+    fn both_finished_lengths_keep_the_longer_allele() {
+        let short = protein(89, 3);
+        let mut long = short.clone();
+        long.extend_from_slice(&protein(11, 8)[1..]);
+        let choice = choose_reference(
+            &[allele(&back_translate(&long), 200), allele(&back_translate(&short), 200)],
+            &no_others(),
+            0,
+            400,
+        )
+        .unwrap();
+        assert_eq!(choice.dna, back_translate(&long));
+        assert_eq!(choice.selection, "intact_length_polymorphism");
+        assert_eq!(choice.modal_end_bp, back_translate(&short).len() as u32);
+        assert_eq!(choice.modal_end_samples, 200);
+        assert_eq!(choice.extension_samples, 200);
+    }
+
+    #[test]
+    fn ragged_ends_do_not_demote_the_long_allele() {
+        let long = protein(99, 1);
+        let left = long[..89].to_vec();
+        let right = long[..80].to_vec();
+        let choice = choose_reference(
+            &[
+                allele(&back_translate(&long), 1),
+                allele(&back_translate(&left), 10),
+                allele(&back_translate(&right), 10),
+            ],
+            &no_others(),
+            0,
+            400,
+        )
+        .unwrap();
+        assert_eq!(choice.dna, back_translate(&long), "{}", choice.selection);
         assert_eq!(choice.selection, "intact_longest");
-        assert_eq!(choice.exact_copies, 1);
+    }
+
+    #[test]
+    fn synonymous_haplotypes_add_up_to_one_finished_end() {
+        let mut short = protein(89, 1);
+        short[2] = b'L';
+        let mut long = short.clone();
+        long.extend_from_slice(&protein(11, 5)[1..]);
+        let dna = back_translate(&short);
+        let mut synonym = dna.clone();
+        synonym.replace_range(6..9, "TTG");
+        assert_ne!(dna, synonym);
+        let choice = choose_reference(
+            &[
+                allele(&back_translate(&long), 1),
+                allele(&dna, 10),
+                allele(&synonym, 10),
+            ],
+            &no_others(),
+            0,
+            400,
+        )
+        .unwrap();
+        assert_eq!(choice.selection, "intact_conserved_end");
+        assert_eq!(choice.modal_end_samples, 20);
+        assert_eq!(choice.extension_samples, 1);
+        assert_ne!(choice.dna, back_translate(&long));
+    }
+
+    #[test]
+    fn a_joined_fragment_cannot_outvote_a_finished_end() {
+        let short = protein(89, 4);
+        let mut long = short.clone();
+        long.extend_from_slice(&protein(11, 6)[1..]);
+        let mut joined = allele(&back_translate(&long), 0);
+        joined.synthetic = true;
+        joined.finished = 0;
+        let choice = choose_reference(
+            &[allele(&back_translate(&short), 50), joined],
+            &no_others(),
+            0,
+            100,
+        )
+        .unwrap();
+        assert_eq!(choice.dna, back_translate(&short));
+        assert_eq!(choice.selection, "intact_conserved_end");
     }
 
     #[test]
@@ -354,7 +797,7 @@ mod tests {
         let common_dna = back_translate(&common);
         let inserted_dna = back_translate(&inserted);
         let alleles = vec![allele(&inserted_dna, 1), allele(&common_dna, 8)];
-        let choice = choose_reference(&alleles, &no_others(), 0).unwrap();
+        let choice = choose(&alleles, &no_others());
         assert_eq!(choice.dna, common_dna, "{}", choice.selection);
     }
 
@@ -368,7 +811,7 @@ mod tests {
         let gene_dna = back_translate(&gene);
         let fusion_dna = back_translate(&fusion);
         let alleles = vec![allele(&gene_dna, 6), allele(&fusion_dna, 1)];
-        let choice = choose_reference(&alleles, &other_reps(&[other]), 0).unwrap();
+        let choice = choose(&alleles, &other_reps(&[other]));
         assert_eq!(choice.dna, gene_dna, "{}", choice.selection);
     }
 
@@ -377,13 +820,13 @@ mod tests {
         let full = protein(80, 3);
         let short = full[..40].to_vec();
         let full_dna = back_translate(&full);
-        let alleles = vec![allele(&back_translate(&short), 9), allele(&full_dna, 1)];
+        let alleles = vec![clipped(&back_translate(&short), 9), allele(&full_dna, 1)];
         for changes in 0..=1 {
             let mut paralog = full.clone();
             if changes == 1 {
                 paralog[60] = if paralog[60] == b'A' { b'C' } else { b'A' };
             }
-            let choice = choose_reference(&alleles, &other_reps(&[paralog]), 0).unwrap();
+            let choice = choose(&alleles, &other_reps(&[paralog]));
             assert_eq!(choice.dna, full_dna);
             assert!(choice.intact);
         }
@@ -404,7 +847,7 @@ mod tests {
         // follows A only on a tie-break of equal codon counts. Force A to be
         // the lex-smaller codon at the changed site by constructing codons.
         let alleles = vec![allele(&dna_a, 2), allele(&dna_b, 2)];
-        let choice = choose_reference(&alleles, &no_others(), 0).unwrap();
+        let choice = choose(&alleles, &no_others());
         assert_eq!(choice.selection, "intact_ancestral_tiebreak");
         assert!(choice.dna == dna_a || choice.dna == dna_b);
         assert_eq!(choice.dna.len(), dna_a.len());
@@ -417,7 +860,7 @@ mod tests {
         // Internal stop. The sequence is still full length.
         dna.replace_range(12..15, "TAA");
         assert!(!is_intact(&dna));
-        let choice = choose_reference(&[allele(&dna, 4)], &no_others(), 0).unwrap();
+        let choice = choose(&[allele(&dna, 4)], &no_others());
         assert!(!choice.intact);
         assert_eq!(choice.selection, "no_intact_copy");
     }

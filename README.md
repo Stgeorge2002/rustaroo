@@ -9,7 +9,7 @@ Build one ortholog group per gene across a set of genomes, then emit:
 1. **A single nucleotide reference** for each gene — the sequence that downstream SNP and loss-of-function calling should map against.
 2. **Which samples carry that gene** — presence of the gene family, not of one allele.
 
-The reference is the longest intact coding sequence that is still that gene: in frame, a bacterial start, no internal stop. It is not the most common allele. A rare full-length copy beats a truncation that is present in every other sample, so a loss is called as a variant instead of being baked into the reference. Internal insertions and fusion tails that match another pangenome gene are rejected.
+The reference is the longest intact coding sequence that is still that gene: in frame, a bacterial start, no internal stop. It is not the most common allele. A rare full-length copy beats truncations that are ragged or cut off by a contig end, so a loss is called as a variant instead of being baked into the reference. A private extension past one shared stop does not: that stop is the reference, and the longer copy stays in the family. When both lengths are shared, the longer one is the reference. Internal insertions and fusion tails that match another pangenome gene are rejected.
 
 ## Why
 
@@ -163,8 +163,9 @@ this original terminal rule. Shorter fragments at or below 80% retain the
 existing containment and neighborhood rules, except that multiple qualifying
 containment hosts are now rejected instead of choosing the host present in
 the most samples. Ambiguous terminal hosts also cannot fall through to a
-containment choice. This is conservative allele reconciliation, not a target
-gene count or an attempt to reproduce Panaroo's strict filtering.
+containment choice. This is conservative allele reconciliation. It does not
+chase a target gene count. A separate screen, below, removes families that
+are not biologically usable.
 
 Flank and adjacency indices restrict merge searches to the same context-eligible
 families as the previous exhaustive scan. New terminal comparisons inspect at
@@ -313,6 +314,17 @@ split families; it does not spend further rounds on relabeling-induced splits.
 The four-round budget for merge-driven repair remains a safety limit, with an
 explicit notice if accepted merges are still occurring at that limit.
 
+## Families that are not genes
+
+After repair and refinding, two screens run. Neither deletes a rare gene that sits between two neighbors.
+
+- A family whose every allele is out of frame, has an internal stop, or is shorter than 90 bp is removed. Those calls may still belong to a family that has an intact allele.
+- From each contig end, a family present in fewer than max(2, 5% of samples) is removed while it remains a tail: it is not between two neighboring genes on any contig, and it does not itself meet that sample count. The walk repeats, so a run of unsupported genes at a break is removed, including a private contig made only of such genes. A collection in which no family reaches the threshold is left unchanged.
+
+A flank seen in fewer than max(2, 1% of samples) is replaced when the other flank identifies one better-supported neighbor. That rare edge then does not split a paralog or block a fragment from joining its gene. A missing flank is left missing.
+
+`reference_report.tsv` records `length_evidence` for every gene that remains. A reference of at least 250 bp is `length_sufficient`: length is no longer the weak point. A shorter gene is `conserved_short` when it is present in at least max(2, 5% of samples) or any copy sits between two neighboring genes, and `unconfirmed_short` when neither is true. The same file records the finished modal end (`modal_end_bp`, `modal_end_samples`) and how many samples carry a longer extension (`extension_samples`). Selection `intact_conserved_end` means a private extension was refused and the shared stop is the reference. `intact_length_polymorphism` means both lengths are shared and the longer one was kept.
+
 ## Usage
 
 ```bash
@@ -326,7 +338,8 @@ Inputs are GFF3 files (or a directory of them), with contig sequence in a `##FAS
 | `genes.fa` | One reference CDS per gene (header is the gene id only) |
 | `presence.tsv` | Gene × sample presence (0/1) |
 | `lengths.tsv` | Allele length in each sample that has the gene |
-| `reference_report.tsv` | Why each reference was chosen |
+| `reference_report.tsv` | Why each reference was chosen, its `length_evidence` label, and the finished-end census |
+| `rustroo.log` | Full run record, separate from the terminal: parameters, inputs, stage lines, removed families, and every reference decision |
 | `members.tsv` | Optional original CDS membership, coordinates, origin, locus and allele ID |
 | `member_alleles.fa` | Optional deduplicated coding sequences referenced by memberships |
 

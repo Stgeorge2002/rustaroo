@@ -111,7 +111,11 @@ pub fn is_start(codon: &[u8]) -> bool {
 /// is kept as `*`, so a pseudogene that still spans the locus can cluster
 /// with the intact gene instead of looking like a short fragment.
 pub fn translate(dna: &str) -> Vec<u8> {
-    let bytes = dna.as_bytes();
+    translate_bytes(dna.as_bytes())
+}
+
+/// Same translation as `translate`, reading bytes that are not yet a `String`.
+pub fn translate_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut protein = Vec::with_capacity(bytes.len() / 3);
     let mut index = 0;
     let mut first = true;

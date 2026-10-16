@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use rayon::prelude::*;
+
 use crate::{Error, Result};
 
 #[derive(Clone)]
@@ -173,29 +175,54 @@ pub(crate) fn bootstrap(
     rows: &[Vec<u8>], sites: &[usize], replicates: usize,
 ) -> Result<(BTreeMap<Vec<usize>, usize>, usize, usize)> {
     let mut support = BTreeMap::new();
-    let (mut usable, mut rejected) = (0, 0);
+    if replicates == 0 {
+        return Ok((support, 0, 0));
+    }
+    // The xorshift is a chain. Draw every replicate's columns first so the
+    // stream matches a serial pass, then build the trees together.
     let mut state = 0x72a9_14bc_5e37_8d01u64;
+    let mut sampled_sets = Vec::with_capacity(replicates);
     for _ in 0..replicates {
         let sampled: Vec<_> = (0..sites.len()).map(|_| {
             state ^= state << 13; state ^= state >> 7; state ^= state << 17;
             sites[(state % sites.len() as u64) as usize]
         }).collect();
-        if variable_sites(rows, &sampled) == 0 {
-            rejected += 1;
-            continue;
-        }
-        let matrix = match distances(rows, &sampled) {
-            Ok(matrix) => matrix,
-            Err(DistanceError::Saturated) => {
-                rejected += 1; continue;
+        sampled_sets.push(sampled);
+    }
+    let outcomes: Vec<Result<Option<Vec<Vec<usize>>>>> = sampled_sets
+        .par_iter()
+        .map(|sampled| {
+            if variable_sites(rows, sampled) == 0 {
+                return Ok(None);
             }
-            Err(DistanceError::NoSites) => return Err(Error::new("bootstrap has no common nucleotide sites")),
-        };
-        let tree = neighbor_joining(&matrix)?;
-        for (split, length) in tree.splits() {
-            if length > 1e-10 { *support.entry(split).or_default() += 1; }
+            let matrix = match distances(rows, sampled) {
+                Ok(matrix) => matrix,
+                Err(DistanceError::Saturated) => return Ok(None),
+                Err(DistanceError::NoSites) => {
+                    return Err(Error::new("bootstrap has no common nucleotide sites"));
+                }
+            };
+            let tree = neighbor_joining(&matrix)?;
+            Ok(Some(
+                tree.splits()
+                    .into_iter()
+                    .filter(|(_, length)| *length > 1e-10)
+                    .map(|(split, _)| split)
+                    .collect(),
+            ))
+        })
+        .collect();
+    let (mut usable, mut rejected) = (0, 0);
+    for outcome in outcomes {
+        match outcome? {
+            None => rejected += 1,
+            Some(splits) => {
+                for split in splits {
+                    *support.entry(split).or_default() += 1;
+                }
+                usable += 1;
+            }
         }
-        usable += 1;
     }
     Ok((support, usable, rejected))
 }
