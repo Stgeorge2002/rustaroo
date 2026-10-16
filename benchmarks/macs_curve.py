@@ -13,6 +13,7 @@ syntax and does not import the newer benchmark module.
 
 import argparse
 import csv
+import fcntl
 import json
 import math
 import os
@@ -100,6 +101,23 @@ def split_cohorts(names, sizes=PARTIAL_SIZES, seed=1729):
         cohorts.append({"n": size, "disjoint": True, "files": group})
     cohorts.append({"n": len(ordered), "disjoint": False, "files": ordered})
     return cohorts
+
+
+def choose_cohorts(cohorts, only):
+    """`only` is a sample count or ``full``. ``None`` keeps every cohort."""
+    if only is None:
+        return cohorts
+    if only == "full":
+        chosen = [cohort for cohort in cohorts if not cohort["disjoint"]]
+    else:
+        try:
+            size = int(only)
+        except (TypeError, ValueError):
+            raise SystemExit("--n must be a sample count or full")
+        chosen = [cohort for cohort in cohorts if cohort["n"] == size]
+    if len(chosen) != 1:
+        raise SystemExit("No single cohort matches --n {0}".format(only))
+    return chosen
 
 
 def capture_fields(metrics):
@@ -488,6 +506,13 @@ def _xml(text):
 
 
 def publish(root):
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".publish.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return _publish(root)
+
+
+def _publish(root):
     rows = []
     for result_path in sorted(root.glob("n[0-9][0-9][0-9][0-9]/result.json")):
         row = load_json(result_path)
@@ -518,6 +543,7 @@ def parse_args(argv):
     parser.add_argument("--threads", type=int, required=True)
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--quality", default="standard", choices=("standard", "high"))
+    parser.add_argument("--n", default=None, help="one sample count, or full, on this node")
     return parser.parse_args(argv)
 
 
@@ -533,9 +559,10 @@ def main(argv):
     if not args.rustroo.is_file() or not args.panaroo_sif.is_file():
         raise SystemExit("rustroo binary or Panaroo image is missing")
     names = [path.name for path in gff_paths(args.input)]
-    cohorts = split_cohorts(names, PARTIAL_SIZES, args.seed)
+    cohorts = choose_cohorts(split_cohorts(names, PARTIAL_SIZES, args.seed), args.n)
     args.output.mkdir(parents=True, exist_ok=True)
-    save_json(args.output / "run.json", {
+    manifest = "run.json" if args.n is None else "run.{0}.json".format(args.n)
+    save_json(args.output / manifest, {
         "seed": args.seed,
         "threads": args.threads,
         "quality": args.quality,
@@ -545,6 +572,7 @@ def main(argv):
         "full_n": len(names),
         "identity_pct": MIN_IDENTITY,
         "coverage_pct": MIN_COVERAGE,
+        "n": args.n,
         "sequential": True,
         "cohorts": [
             {"n": cohort["n"], "disjoint": cohort["disjoint"], "files": list(cohort["files"])}

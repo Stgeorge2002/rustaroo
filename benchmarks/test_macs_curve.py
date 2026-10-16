@@ -26,6 +26,17 @@ class SplitTests(unittest.TestCase):
             [cohort["files"] for cohort in again],
         )
 
+    def test_one_node_keeps_the_same_cohort_as_the_full_split(self) -> None:
+        names = [f"s{i:04d}.gff3" for i in range(1400)]
+        cohorts = macs_curve.split_cohorts(names, seed=1729)
+        one = macs_curve.choose_cohorts(cohorts, "300")
+        self.assertEqual([cohort["n"] for cohort in one], [300])
+        self.assertEqual(one[0]["files"], next(cohort["files"] for cohort in cohorts if cohort["n"] == 300))
+        full = macs_curve.choose_cohorts(cohorts, "full")
+        self.assertEqual(full[0]["n"], 1400)
+        self.assertFalse(full[0]["disjoint"])
+        self.assertEqual(macs_curve.choose_cohorts(cohorts, None), cohorts)
+
     def test_too_few_assemblies_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             macs_curve.split_cohorts(["a.gff3"] * 100)
