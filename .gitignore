@@ -47,24 +47,6 @@
 !/containers/*.md
 !/containers/Dockerfile
 
-# Standalone mutation-code application and deliberately maintained fixtures.
-!/MutCode/
-!/MutCode/Cargo.toml
-!/MutCode/Cargo.lock
-!/MutCode/README.md
-!/MutCode/src/
-!/MutCode/src/**/
-!/MutCode/src/**/*.rs
-!/MutCode/tests/
-!/MutCode/tests/**/
-!/MutCode/tests/**/*.rs
-!/MutCode/tests/fixtures/
-!/MutCode/tests/fixtures/**
-!/MutCode/containers/
-!/MutCode/containers/*.def
-!/MutCode/containers/*.sh
-!/MutCode/containers/*.md
-
 # Release/build workflows.
 !/.github/
 !/.github/workflows/
