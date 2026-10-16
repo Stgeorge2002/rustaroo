@@ -233,9 +233,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     for (&cluster, partial) in ids.iter().zip(partials) {
         let Some(partial) = partial else { continue };
         let id = unique_name(&partial.symbol, &mut anonymous, &mut used_names);
-        if params.audit_members {
-            name_of_cluster.insert(cluster, id.clone());
-        }
+        name_of_cluster.insert(cluster, id.clone());
         genes.push(Gene {
             id,
             product: partial.product,
@@ -259,7 +257,18 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             .cmp(&a.samples_present)
             .then(a.id.cmp(&b.id))
     });
-    let removed = apply_quality(&mut genes, params.quality);
+    let mut loci: HashMap<String, Vec<Locus>> = HashMap::new();
+    for call in &calls {
+        let Some(name) = name_of_cluster.get(&call.cluster) else { continue };
+        loci.entry(name.clone()).or_default().push(Locus {
+            sample: call.sample,
+            contig: call.contig,
+            start: call.start,
+            end: call.end,
+            strand: call.strand,
+        });
+    }
+    let removed = apply_quality(&mut genes, params.quality, &loci);
     if params.quality != Quality::Standard {
         progress!("rustroo: quality {label} removed {removed} genes", label = quality_label(params.quality));
         if genes.is_empty() {
@@ -349,11 +358,16 @@ fn quality_label(quality: Quality) -> &'static str {
 
 /// `high` removes a family with no intact copy, and a short family the
 /// collection does not support by frequency or by neighboring genes.
-/// `strict` then removes a family that adds no presence: its protein is a
-/// piece of a longer gene, or a near-identical second copy, and every sample
-/// that has it already has that other gene. A diverged paralogue stays. A
-/// short allele that is the only copy in some genome stays.
-fn apply_quality(genes: &mut Vec<Gene>, quality: Quality) -> usize {
+/// `strict` then removes a family that adds no presence. A nested piece can
+/// match at 80% identity. Without coordinates the piece threshold stays 90%,
+/// and a near-identical second copy still requires 98%. A call sitting beside
+/// the other gene is a second locus and stays. So does a short allele that is
+/// the only copy in some genome.
+fn apply_quality(
+    genes: &mut Vec<Gene>,
+    quality: Quality,
+    loci: &HashMap<String, Vec<Locus>>,
+) -> usize {
     if quality == Quality::Standard {
         return 0;
     }
@@ -372,7 +386,7 @@ fn apply_quality(genes: &mut Vec<Gene>, quality: Quality) -> usize {
         !reject
     });
     if quality == Quality::Strict {
-        let redundant = redundant_fragments(genes);
+        let redundant = redundant_fragments(genes, loci);
         let mut index = 0;
         genes.retain(|_| {
             let reject = redundant.contains(&index);
@@ -383,11 +397,25 @@ fn apply_quality(genes: &mut Vec<Gene>, quality: Quality) -> usize {
     before - genes.len()
 }
 
-/// Indexes of genes that add no presence. A piece is at least 90% identical
-/// over at least 90% of itself and covers less than 98% of a longer protein.
-/// A second copy is at least 98% identical at any length, and the copy present
-/// in fewer genomes is the one removed. Equal support keeps the earlier gene.
-fn redundant_fragments(genes: &[Gene]) -> HashSet<usize> {
+struct Locus {
+    sample: u32,
+    contig: u32,
+    start: u32,
+    end: u32,
+    strand: i8,
+}
+
+/// Below this, a nested ORF can be a different gene that only shares a domain.
+const NESTED_PIECE_IDENTITY: f64 = 0.80;
+/// Used when coordinates are absent. A 90% piece is the same peptide.
+const PIECE_IDENTITY: f64 = 0.90;
+/// A second copy this close, at nearly the same length, is the same gene.
+/// A paralogue below this stays, even when the two always occur together.
+const NEAR_COPY_IDENTITY: f64 = 0.98;
+
+/// Indexes of genes that add no presence. The copy present in fewer genomes
+/// is the one removed. Equal support keeps the earlier gene.
+fn redundant_fragments(genes: &[Gene], loci: &HashMap<String, Vec<Locus>>) -> HashSet<usize> {
     let proteins: Vec<Vec<u8>> = genes.iter().map(|gene| translate(&gene.reference_dna)).collect();
     let mut postings: HashMap<[u8; 4], Vec<usize>> = HashMap::new();
     let mut kmer_counts = vec![0u32; genes.len()];
@@ -443,13 +471,7 @@ fn redundant_fragments(genes: &[Gene]) -> HashSet<usize> {
             let Some(fit) = fit_short_in_long(protein, &proteins[long]) else {
                 continue;
             };
-            let span = fit.long_end.saturating_sub(fit.long_start);
-            let piece = span * 50 < proteins[long].len() * 49;
-            let near_copy = fit.identity + f64::EPSILON >= 0.98;
-            if fit.identity + f64::EPSILON < 0.90
-                || fit.coverage + f64::EPSILON < 0.90
-                || fit.internal_gap > 5
-                || !(piece || near_copy)
+            if !covered_duplicate(&fit, proteins[long].len(), calls_nested(loci, &genes[short].id, &genes[long].id))
             {
                 continue;
             }
@@ -478,6 +500,54 @@ fn is_covered_by(short: usize, long: usize, proteins: &[Vec<u8>], genes: &[Gene]
                 || (genes[long].samples_present == genes[short].samples_present && long < short)
         }
     }
+}
+
+/// `Some(true)` when every short call in a shared genome lies inside a long
+/// call. `Some(false)` when a short call sits beside the long gene, or the
+/// coordinates are missing from a map that otherwise has them. `None` when
+/// the map is empty, which keeps the sequence-only rule for tests.
+fn calls_nested(loci: &HashMap<String, Vec<Locus>>, short_id: &str, long_id: &str) -> Option<bool> {
+    if loci.is_empty() {
+        return None;
+    }
+    let (Some(short), Some(long)) = (loci.get(short_id), loci.get(long_id)) else {
+        return Some(false);
+    };
+    let mut shared = false;
+    for short_call in short {
+        let same_sample: Vec<&Locus> = long.iter().filter(|call| call.sample == short_call.sample).collect();
+        if same_sample.is_empty() {
+            continue;
+        }
+        shared = true;
+        let inside = same_sample.iter().any(|call| {
+            call.contig == short_call.contig
+                && call.strand == short_call.strand
+                && short_call.start >= call.start
+                && short_call.end <= call.end
+        });
+        if !inside {
+            return Some(false);
+        }
+    }
+    Some(shared)
+}
+
+fn covered_duplicate(fit: &crate::align::Fit, long_len: usize, nested: Option<bool>) -> bool {
+    if fit.coverage + f64::EPSILON < PIECE_IDENTITY || fit.internal_gap > 5 {
+        return false;
+    }
+    // A neighboring copy is its own gene, however similar the proteins are.
+    if nested == Some(false) {
+        return false;
+    }
+    let span = fit.long_end.saturating_sub(fit.long_start);
+    let piece = span * 50 < long_len * 49;
+    let identity = fit.identity + f64::EPSILON;
+    if nested == Some(true) && piece && identity >= NESTED_PIECE_IDENTITY {
+        return true;
+    }
+    identity >= PIECE_IDENTITY && (piece || identity >= NEAR_COPY_IDENTITY)
 }
 
 fn presence_covered(short: &[bool], long: &[bool]) -> bool {
@@ -1045,8 +1115,9 @@ mod tests {
             labelled("short_no", true, UNCONFIRMED_SHORT),
             labelled("broken", false, LENGTH_SUFFICIENT),
         ];
-        assert_eq!(super::apply_quality(&mut genes.clone(), Quality::Standard), 0);
-        assert_eq!(super::apply_quality(&mut genes, Quality::High), 2);
+        let loci = std::collections::HashMap::new();
+        assert_eq!(super::apply_quality(&mut genes.clone(), Quality::Standard, &loci), 0);
+        assert_eq!(super::apply_quality(&mut genes, Quality::High, &loci), 2);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["core", "short_ok"]);
     }
@@ -1092,10 +1163,63 @@ mod tests {
         paralog.presence = vec![true, true, false];
         paralog.samples_present = 2;
         let mut genes = vec![long, piece, alone, near, copy, twin, paralog];
-        assert_eq!(super::apply_quality(&mut genes.clone(), Quality::High), 0);
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict), 4);
+        let loci = std::collections::HashMap::new();
+        assert_eq!(super::apply_quality(&mut genes.clone(), Quality::High, &loci), 0);
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 4);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["long", "alone", "paralog"]);
+    }
+
+    #[test]
+    fn strict_drops_a_diverged_nested_piece_and_keeps_a_neighboring_copy() {
+        use crate::genetic_code::back_translate;
+        use crate::synteny::LENGTH_SUFFICIENT;
+        use std::collections::HashMap;
+        let long_aa = random_protein(80, 11);
+        let mut nested_aa = long_aa[10..40].to_vec();
+        for site in [0, 1, 28, 29] {
+            nested_aa[site] = if nested_aa[site] == b'A' { b'L' } else { b'A' };
+        }
+        let mut weak_aa = long_aa[10..40].to_vec();
+        for site in [0, 3, 6, 9, 12, 15, 18, 21] {
+            weak_aa[site] = if weak_aa[site] == b'A' { b'L' } else { b'A' };
+        }
+        let beside_aa = long_aa[10..40].to_vec();
+        let mut long = labelled("long", true, LENGTH_SUFFICIENT);
+        long.reference_dna = back_translate(&long_aa);
+        long.presence = vec![true, true];
+        long.samples_present = 2;
+        let mut nested = labelled("nested", true, LENGTH_SUFFICIENT);
+        nested.reference_dna = back_translate(&nested_aa);
+        nested.presence = vec![true, false];
+        nested.samples_present = 1;
+        let mut weak = labelled("weak", true, LENGTH_SUFFICIENT);
+        weak.reference_dna = back_translate(&weak_aa);
+        weak.presence = vec![true, false];
+        weak.samples_present = 1;
+        let mut beside = labelled("beside", true, LENGTH_SUFFICIENT);
+        beside.reference_dna = back_translate(&beside_aa);
+        beside.presence = vec![true, false];
+        beside.samples_present = 1;
+        let mut loci: HashMap<String, Vec<super::Locus>> = HashMap::new();
+        loci.insert("long".to_string(), vec![super::Locus {
+            sample: 0, contig: 0, start: 100, end: 900, strand: 1,
+        }, super::Locus {
+            sample: 1, contig: 0, start: 100, end: 900, strand: 1,
+        }]);
+        loci.insert("nested".to_string(), vec![super::Locus {
+            sample: 0, contig: 0, start: 200, end: 400, strand: 1,
+        }]);
+        loci.insert("weak".to_string(), vec![super::Locus {
+            sample: 0, contig: 0, start: 200, end: 400, strand: 1,
+        }]);
+        loci.insert("beside".to_string(), vec![super::Locus {
+            sample: 0, contig: 0, start: 1_000, end: 1_200, strand: 1,
+        }]);
+        let mut genes = vec![long, nested, weak, beside];
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 1);
+        let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
+        assert_eq!(ids, vec!["long", "weak", "beside"]);
     }
 
     #[test]
