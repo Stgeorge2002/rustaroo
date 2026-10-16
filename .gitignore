@@ -45,6 +45,7 @@
 !/containers/
 !/containers/*.def
 !/containers/*.md
+!/containers/*.sbatch
 !/containers/Dockerfile
 
 # Release/build workflows.

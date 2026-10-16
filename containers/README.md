@@ -45,7 +45,7 @@ The following commands are for you to run; they have not been executed.
 ```bash
 (
   set -euo pipefail
-  cd ~/rustaroo
+  cd ~/newdev/rustaroo
 
   test "$(uname -m)" = x86_64
   apptainer --version
@@ -240,3 +240,56 @@ Important staging and sample rules:
 
 No output-equivalence, image-size, performance or MACS compatibility result is
 claimed until those checks are executed.
+
+## Monocle GFF benchmark on MACS
+
+One Slurm job runs the flat `monocle_gff` directory: 1,514 GFF3 files, the
+same cohort as the local `monocle_run`. Refind stays on and `--audit-members`
+stays on, matching that run. The job prints `cpu_min` and `actual_min`.
+Default allocation is 16 CPUs, 64 GB, and 4 hours on `genoa` for account
+`brics.b36ad`. That memory and time are headroom, not a measured requirement.
+Change `--cpus-per-task` at submission; the script sets both Rayon and
+`--threads` from `SLURM_CPUS_PER_TASK`.
+
+Build the image with the block above, then run this from local WSL. It uploads
+the SIF, its checksum, the job script, and the GFFs. Filenames containing `#`
+are passed through `rsync` as files, not as a shell list.
+
+```bash
+cd ~/newdev/rustaroo
+REV=$(git rev-parse --verify HEAD)
+SHORT=${REV:0:12}
+SIF="$PWD/out/containers/rustroo-${SHORT}-linux-amd64.sif"
+test -s "$SIF"
+test -s "$SIF.sha256"
+
+ssh -F ~/.ssh/config_clifton b36ad.macs3.isambard 'mkdir -p "$SCRATCHDIR/rustaroo-macs/sif" "$SCRATCHDIR/rustaroo-macs/monocle_gff" "$SCRATCHDIR/rustaroo-macs/logs" "$SCRATCHDIR/rustaroo-macs/tmp" "$SCRATCHDIR/rustaroo-macs/apptainer-cache"'
+REMOTE=$(ssh -F ~/.ssh/config_clifton b36ad.macs3.isambard 'printf %s "$SCRATCHDIR"')
+
+scp -F ~/.ssh/config_clifton \
+  "$SIF" "$SIF.sha256" \
+  "b36ad.macs3.isambard:$REMOTE/rustaroo-macs/sif/"
+scp -F ~/.ssh/config_clifton \
+  containers/macs_monocle.sbatch \
+  "b36ad.macs3.isambard:$REMOTE/rustaroo-macs/macs_monocle.sbatch"
+
+rsync -a --info=progress2 \
+  -e "ssh -F $HOME/.ssh/config_clifton" \
+  "$PWD/monocle_gff/" \
+  "b36ad.macs3.isambard:$REMOTE/rustaroo-macs/monocle_gff/"
+```
+
+On MACS, after `ssh -F ~/.ssh/config_clifton b36ad.macs3.isambard`:
+
+```bash
+cd "$SCRATCHDIR/rustaroo-macs"
+( cd sif && sha256sum --check rustroo-*-linux-amd64.sif.sha256 )
+find monocle_gff -maxdepth 1 -type f -name '*.gff3' | wc -l
+sbatch --job-name=rustroo_monocle macs_monocle.sbatch
+```
+
+Expect `1514` from the file count. The Slurm log is `logs/rustroo_monocle_<jobid>.out`.
+Results are `runs/monocle_<jobid>/`, including `rustroo.log`. After the job leaves
+the queue, `sacct -j JOBID --format=JobID,State,ExitCode,Elapsed,TotalCPU,MaxRSS,ReqMem --units=G`
+is the scheduler's elapsed time and CPU total. `cpu_min` and `actual_min` in the
+log are the process measurement.
