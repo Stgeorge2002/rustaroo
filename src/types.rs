@@ -4,11 +4,11 @@ use crate::error::{Error, Result};
 ///
 /// `standard` is the repaired pangenome. `high` drops the two weak labels:
 /// a family with no intact copy, and a short family that is rare and not
-/// between neighboring genes. `strict` also drops a nested piece of a longer
-/// gene, down to 80% identity, and a near-identical second copy, when every
-/// sample that has it already has that other gene. A copy sitting beside the
-/// other gene, a paralogue below 98% identity at nearly the same length, and
-/// a short allele that is the only copy in some genome stay.
+/// between neighboring genes. `strict` also drops a second reference that is
+/// already the same gene: a nested piece down to 80% identity, a neighboring
+/// copy at 90%, or a near-identical allele in other genomes, which is folded
+/// into the longer gene. A paralogue below 98% identity at nearly the same
+/// length stays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Quality {
     Standard,

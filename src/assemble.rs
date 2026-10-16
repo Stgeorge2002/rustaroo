@@ -358,11 +358,11 @@ fn quality_label(quality: Quality) -> &'static str {
 
 /// `high` removes a family with no intact copy, and a short family the
 /// collection does not support by frequency or by neighboring genes.
-/// `strict` then removes a family that adds no presence. A nested piece can
-/// match at 80% identity. Without coordinates the piece threshold stays 90%,
-/// and a near-identical second copy still requires 98%. A call sitting beside
-/// the other gene is a second locus and stays. So does a short allele that is
-/// the only copy in some genome.
+/// `strict` then removes a second reference of a gene already kept. A nested
+/// piece can match at 80% identity. A neighboring copy still requires 90%,
+/// and a near-identical allele in other genomes is folded into the longer
+/// gene so those genomes stay present. A paralogue below 98% identity at
+/// nearly the same length stays.
 fn apply_quality(
     genes: &mut Vec<Gene>,
     quality: Quality,
@@ -415,7 +415,7 @@ const NEAR_COPY_IDENTITY: f64 = 0.98;
 
 /// Indexes of genes that add no presence. The copy present in fewer genomes
 /// is the one removed. Equal support keeps the earlier gene.
-fn redundant_fragments(genes: &[Gene], loci: &HashMap<String, Vec<Locus>>) -> HashSet<usize> {
+fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -> HashSet<usize> {
     let proteins: Vec<Vec<u8>> = genes.iter().map(|gene| translate(&gene.reference_dna)).collect();
     let mut postings: HashMap<[u8; 4], Vec<usize>> = HashMap::new();
     let mut kmer_counts = vec![0u32; genes.len()];
@@ -464,28 +464,68 @@ fn redundant_fragments(genes: &[Gene], loci: &HashMap<String, Vec<Locus>>) -> Ha
             .collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         ranked.truncate(8);
+        let mut subset_parent: Option<usize> = None;
+        let mut exclusive_parents: Vec<usize> = Vec::new();
         for (long, _) in ranked {
-            if !presence_covered(&genes[short].presence, &genes[long].presence) {
-                continue;
-            }
             let Some(fit) = fit_short_in_long(protein, &proteins[long]) else {
                 continue;
             };
-            if !covered_duplicate(&fit, proteins[long].len(), calls_nested(loci, &genes[short].id, &genes[long].id))
-            {
-                continue;
+            let nested = calls_nested(loci, &genes[short].id, &genes[long].id);
+            if presence_covered(&genes[short].presence, &genes[long].presence) {
+                if subset_parent.is_none() && covered_duplicate(&fit, proteins[long].len(), nested) {
+                    subset_parent = Some(long);
+                }
+            } else if exclusive_allele(&fit, proteins[long].len()) {
+                exclusive_parents.push(long);
             }
+        }
+        let parent = if let Some(long) = subset_parent {
+            Some(long)
+        } else if exclusive_parents.len() == 1 {
+            Some(exclusive_parents[0])
+        } else {
+            None
+        };
+        if let Some(long) = parent {
             if log::enabled() {
                 log::record(&format!(
                     "quality\tstrict\tdrop\t{}\tcovered_by\t{}",
                     genes[short].id, genes[long].id,
                 ));
             }
+            absorb_at(genes, long, short);
             redundant.insert(short);
-            break;
         }
     }
     redundant
+}
+
+fn absorb_at(genes: &mut [Gene], long: usize, short: usize) {
+    if long == short {
+        return;
+    }
+    if long < short {
+        let (head, tail) = genes.split_at_mut(short);
+        absorb(&mut head[long], &tail[0]);
+    } else {
+        let (head, tail) = genes.split_at_mut(long);
+        absorb(&mut tail[0], &head[short]);
+    }
+}
+
+fn absorb(keeper: &mut Gene, extra: &Gene) {
+    if keeper.presence.len() != extra.presence.len() {
+        return;
+    }
+    for index in 0..keeper.presence.len() {
+        if extra.presence[index] && !keeper.presence[index] {
+            keeper.presence[index] = true;
+            if keeper.lengths.len() == extra.lengths.len() {
+                keeper.lengths[index] = extra.lengths[index];
+            }
+        }
+    }
+    keeper.samples_present = keeper.presence.iter().filter(|&&present| present).count() as u32;
 }
 
 /// `long` already explains `short`: it is a longer protein, or the same length
@@ -537,10 +577,6 @@ fn covered_duplicate(fit: &crate::align::Fit, long_len: usize, nested: Option<bo
     if fit.coverage + f64::EPSILON < PIECE_IDENTITY || fit.internal_gap > 5 {
         return false;
     }
-    // A neighboring copy is its own gene, however similar the proteins are.
-    if nested == Some(false) {
-        return false;
-    }
     let span = fit.long_end.saturating_sub(fit.long_start);
     let piece = span * 50 < long_len * 49;
     let identity = fit.identity + f64::EPSILON;
@@ -548,6 +584,18 @@ fn covered_duplicate(fit: &crate::align::Fit, long_len: usize, nested: Option<bo
         return true;
     }
     identity >= PIECE_IDENTITY && (piece || identity >= NEAR_COPY_IDENTITY)
+}
+
+/// Same gene in genomes the longer copy does not already cover. A near-full
+/// paralogue below 98% identity is not an allele split.
+fn exclusive_allele(fit: &crate::align::Fit, long_len: usize) -> bool {
+    if fit.coverage + f64::EPSILON < PIECE_IDENTITY || fit.internal_gap > 5 {
+        return false;
+    }
+    let span = fit.long_end.saturating_sub(fit.long_start);
+    let deep = span * 10 < long_len * 9;
+    let identity = fit.identity + f64::EPSILON;
+    identity >= NEAR_COPY_IDENTITY || (deep && identity >= PIECE_IDENTITY)
 }
 
 fn presence_covered(short: &[bool], long: &[bool]) -> bool {
@@ -1171,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_drops_a_diverged_nested_piece_and_keeps_a_neighboring_copy() {
+    fn strict_drops_a_nested_piece_a_neighboring_copy_and_folds_an_exclusive_allele() {
         use crate::genetic_code::back_translate;
         use crate::synteny::LENGTH_SUFFICIENT;
         use std::collections::HashMap;
@@ -1187,8 +1235,8 @@ mod tests {
         let beside_aa = long_aa[10..40].to_vec();
         let mut long = labelled("long", true, LENGTH_SUFFICIENT);
         long.reference_dna = back_translate(&long_aa);
-        long.presence = vec![true, true];
-        long.samples_present = 2;
+        long.presence = vec![true, false];
+        long.samples_present = 1;
         let mut nested = labelled("nested", true, LENGTH_SUFFICIENT);
         nested.reference_dna = back_translate(&nested_aa);
         nested.presence = vec![true, false];
@@ -1216,10 +1264,27 @@ mod tests {
         loci.insert("beside".to_string(), vec![super::Locus {
             sample: 0, contig: 0, start: 1_000, end: 1_200, strand: 1,
         }]);
-        let mut genes = vec![long, nested, weak, beside];
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 1);
+        let split_aa = long_aa.clone();
+        let mut diverged_aa = long_aa.clone();
+        for site in [4, 12, 20, 28, 36, 44, 52, 60] {
+            diverged_aa[site] = if diverged_aa[site] == b'A' { b'L' } else { b'A' };
+        }
+        let mut split = labelled("split", true, LENGTH_SUFFICIENT);
+        split.reference_dna = back_translate(&split_aa);
+        split.presence = vec![false, true];
+        split.lengths = vec![0, 240];
+        split.samples_present = 1;
+        long.lengths = vec![240, 0];
+        let mut diverged = labelled("diverged", true, LENGTH_SUFFICIENT);
+        diverged.reference_dna = back_translate(&diverged_aa);
+        diverged.presence = vec![false, true];
+        diverged.samples_present = 1;
+        let mut genes = vec![long, nested, weak, beside, split, diverged];
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 3);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
-        assert_eq!(ids, vec!["long", "weak", "beside"]);
+        assert_eq!(ids, vec!["long", "weak", "diverged"]);
+        assert_eq!(genes[0].presence, vec![true, true]);
+        assert_eq!(genes[0].samples_present, 2);
     }
 
     #[test]

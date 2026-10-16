@@ -57,7 +57,7 @@ struct Cli {
     audit_members: bool,
 
     /// `high` drops a gene with no intact copy and an unconfirmed short gene.
-    /// `strict` also drops a nested or near-identical gene already covered by another.
+    /// `strict` drops a duplicate reference already represented by another gene.
     #[arg(long, value_enum, default_value = "standard")]
     quality: Quality,
 }
