@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use rayon::prelude::*;
 
 use rustroo::log;
-use rustroo::{build, is_gff, parse_gff_file, validate, write_pangenome, Error, Params, Result, TreeMode, ValidationOptions};
+use rustroo::{build, is_gff, parse_gff_file, validate, write_pangenome, Error, Params, Quality, Result, TreeMode, ValidationOptions};
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +55,10 @@ struct Cli {
     /// Also write members.tsv with original CDS IDs, coordinates and physical loci
     #[arg(long)]
     audit_members: bool,
+
+    /// `high` drops a gene with no intact copy and an unconfirmed short gene
+    #[arg(long, value_enum, default_value = "standard")]
+    quality: Quality,
 }
 
 #[derive(Subcommand)]
@@ -209,6 +213,7 @@ fn run() -> Result<()> {
         refind: !cli.no_refind,
         threads: cli.threads,
         audit_members: cli.audit_members,
+        quality: cli.quality,
     };
     let paths = collect_inputs(&cli.input)?;
     log::open(&output_dir.join("rustroo.log"))?;
@@ -219,6 +224,7 @@ fn run() -> Result<()> {
     log::record(&format!("param\trefind\t{}", params.refind));
     log::record(&format!("param\tthreads\t{}", params.threads));
     log::record(&format!("param\taudit_members\t{}", params.audit_members));
+    log::record(&format!("param\tquality\t{}", quality_name(params.quality)));
     for path in &paths {
         log::record(&format!("input\t{}", path.display()));
     }
@@ -279,6 +285,13 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn quality_name(quality: Quality) -> &'static str {
+    match quality {
+        Quality::Standard => "standard",
+        Quality::High => "high",
+    }
+}
+
 fn collect_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for input in inputs {
@@ -330,6 +343,11 @@ mod tests {
         assert_eq!(cli.output_dir, Some(PathBuf::from("out")));
         assert_eq!(cli.family_identity, 0.70);
         assert!(cli.audit_members);
+        assert_eq!(cli.quality, Quality::Standard);
+        assert_eq!(
+            Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--quality", "high"]).unwrap().quality,
+            Quality::High
+        );
         assert!(Cli::try_parse_from(["rustroo", "-i", "gff"]).is_err());
     }
 

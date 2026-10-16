@@ -47,9 +47,10 @@ class CaptureTests(unittest.TestCase):
 
     def test_both_tools_receive_the_same_thread_count(self) -> None:
         gffs = [Path("a.gff3"), Path("b.gff3")]
-        rust = macs_curve.rustroo_argv(Path("rustroo"), gffs, Path("out"), 32)
+        rust = macs_curve.rustroo_argv(Path("rustroo"), gffs, Path("out"), 32, "high")
         pan = macs_curve.panaroo_argv(Path("pan.sif"), gffs, Path("cohort"), 32, Path("gffs"))
         self.assertEqual(rust[rust.index("--threads") + 1], "32")
+        self.assertEqual(rust[rust.index("--quality") + 1], "high")
         self.assertEqual(pan[pan.index("-t") + 1], "32")
         self.assertIn("OMP_NUM_THREADS=32", pan)
 

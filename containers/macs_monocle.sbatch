@@ -22,6 +22,7 @@ INPUT="${RUSTROO_INPUT:-$MACS/monocle_gff}"
 OUTPUT="${RUSTROO_OUTPUT:-$MACS/runs/curve_${SLURM_JOB_ID}}"
 SCRIPT="${RUSTROO_CURVE:-$MACS/rustaroo/benchmarks/macs_curve.py}"
 THREADS="${SLURM_CPUS_PER_TASK:?Submit with --cpus-per-task}"
+QUALITY="${RUSTROO_QUALITY:-standard}"
 
 test "$(uname -m)" = x86_64
 test -x "$BIN"
@@ -41,4 +42,5 @@ python3 "$SCRIPT" \
     --rustroo "$BIN" \
     --panaroo-sif "$SIF" \
     --threads "$THREADS" \
+    --quality "$QUALITY" \
     --seed 1729

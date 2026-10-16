@@ -270,9 +270,9 @@ def reported_rustroo_minutes(log_path):
     }
 
 
-def rustroo_argv(binary, gffs, output, threads):
+def rustroo_argv(binary, gffs, output, threads, quality="standard"):
     return [str(binary), "-i"] + [str(path) for path in gffs] + [
-        "-o", str(output), "--threads", str(threads),
+        "-o", str(output), "--threads", str(threads), "--quality", quality,
     ]
 
 
@@ -316,7 +316,7 @@ def cohort_folder(n):
     return "n{0:04d}".format(n)
 
 
-def run_cohort(root, cohort, input_root, binary, sif, threads, env):
+def run_cohort(root, cohort, input_root, binary, sif, threads, env, quality):
     folder = root / cohort_folder(cohort["n"])
     result_path = folder / "result.json"
     if result_path.is_file() and load_json(result_path).get("status") == "ok":
@@ -338,6 +338,7 @@ def run_cohort(root, cohort, input_root, binary, sif, threads, env):
         "disjoint": cohort["disjoint"],
         "gff_count": len(names),
         "threads": threads,
+        "quality": quality,
         "status": "failed",
         "error": "",
     }
@@ -346,7 +347,7 @@ def run_cohort(root, cohort, input_root, binary, sif, threads, env):
 
     rust_dir = folder / "rustroo"
     code, wall, cpu = run_timed(
-        rustroo_argv(binary, gffs, rust_dir, threads), folder / "rustroo.stdout", env,
+        rustroo_argv(binary, gffs, rust_dir, threads, quality), folder / "rustroo.stdout", env,
     )
     row.update({
         "rustroo_exit": code,
@@ -516,6 +517,7 @@ def parse_args(argv):
     parser.add_argument("--panaroo-sif", type=Path, required=True)
     parser.add_argument("--threads", type=int, required=True)
     parser.add_argument("--seed", type=int, default=1729)
+    parser.add_argument("--quality", default="standard", choices=("standard", "high"))
     return parser.parse_args(argv)
 
 
@@ -536,6 +538,7 @@ def main(argv):
     save_json(args.output / "run.json", {
         "seed": args.seed,
         "threads": args.threads,
+        "quality": args.quality,
         "slurm_cpus": slurm_cpus,
         "slurm_mem_mb": os.environ.get("SLURM_MEM_PER_NODE"),
         "partial_sizes": list(PARTIAL_SIZES),
@@ -555,7 +558,8 @@ def main(argv):
     try:
         for cohort in cohorts:
             row = run_cohort(
-                args.output, cohort, args.input, args.rustroo, args.panaroo_sif, args.threads, env,
+                args.output, cohort, args.input, args.rustroo, args.panaroo_sif,
+                args.threads, env, args.quality,
             )
             failed += row.get("status") != "ok"
             publish(args.output)

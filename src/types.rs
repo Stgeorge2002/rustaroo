@@ -1,5 +1,16 @@
 use crate::error::{Error, Result};
 
+/// What a finished family must show before it is written.
+///
+/// `standard` is the repaired pangenome. `high` drops the two weak labels:
+/// a family with no intact copy, and a short family that is rare and not
+/// between neighboring genes. Intact genes and conserved short genes stay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Quality {
+    Standard,
+    High,
+}
+
 /// Knobs for homology: near-identical preclusters, then 70% families, with
 /// fragments left for synteny rather than forced together by a loose length
 /// cutoff. These defaults are not an equivalent of a Panaroo cleaning mode.
@@ -17,6 +28,7 @@ pub struct Params {
     pub threads: usize,
     /// Emit original annotation memberships for an external concordance audit.
     pub audit_members: bool,
+    pub quality: Quality,
 }
 
 impl Default for Params {
@@ -29,6 +41,7 @@ impl Default for Params {
             refind: true,
             threads: 0,
             audit_members: false,
+            quality: Quality::Standard,
         }
     }
 }

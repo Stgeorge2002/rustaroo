@@ -19,8 +19,9 @@ use crate::reference::{join_fragments, Allele, choose_reference};
 use crate::synteny::{
     compress_clusters, families_bounded_by_neighbors, freeze_contexts, length_evidence, membership_loci,
     merge_fragments, refind, screen_unsupported_families, split_fusions, split_paralogs, ALLELE_EDGE_BP,
+    UNCONFIRMED_SHORT,
 };
-use crate::types::{Gene, GeneMember, MembershipAudit, Pangenome, Params, ParsedSample};
+use crate::types::{Gene, GeneMember, MembershipAudit, Pangenome, Params, ParsedSample, Quality};
 
 pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenome> {
     params.validate()?;
@@ -257,14 +258,24 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             .cmp(&a.samples_present)
             .then(a.id.cmp(&b.id))
     });
+    let removed = apply_quality(&mut genes, params.quality);
+    if params.quality == Quality::High {
+        progress!("rustroo: quality high removed {removed} genes");
+        if genes.is_empty() {
+            return Err(Error::new(
+                "no gene remained after the high quality filter",
+            ));
+        }
+    }
     let membership_audit = if params.audit_members {
         let gene_indexes: HashMap<&str, usize> = genes.iter().enumerate()
             .map(|(index, gene)| (gene.id.as_str(), index)).collect();
         let mut members = Vec::with_capacity(calls.len());
         for (call, &locus) in calls.iter().zip(&locus_ids) {
             let Some(name) = name_of_cluster.get(&call.cluster) else { continue };
+            let Some(&gene_index) = gene_indexes.get(name.as_str()) else { continue };
             members.push(GeneMember {
-                gene: gene_indexes[name.as_str()],
+                gene: gene_index,
                 sample: call.sample,
                 contig: call.contig,
                 annotation_id: call.source.map(|id| annotation_ids[id as usize].clone())
@@ -325,6 +336,28 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
         genes,
         membership_audit,
     })
+}
+
+/// `high` removes a family with no intact copy, and a short family the
+/// collection does not support by frequency or by neighboring genes.
+fn apply_quality(genes: &mut Vec<Gene>, quality: Quality) -> usize {
+    if quality == Quality::Standard {
+        return 0;
+    }
+    let before = genes.len();
+    genes.retain(|gene| {
+        let reject = !gene.intact || gene.length_evidence == UNCONFIRMED_SHORT;
+        if reject && log::enabled() {
+            log::record(&format!(
+                "quality\thigh\tdrop\t{}\tintact\t{}\tlength_evidence\t{}",
+                gene.id,
+                if gene.intact { "yes" } else { "no" },
+                gene.length_evidence,
+            ));
+        }
+        !reject
+    });
+    before - genes.len()
 }
 
 fn log_field(value: &str) -> String {
@@ -666,7 +699,7 @@ fn covered_bases(intervals: &[(u32, u32)]) -> u32 {
 mod tests {
     use super::*;
     use crate::genetic_code::{back_translate, translate};
-    use crate::types::{Contig, ParsedGene, ParsedSample};
+    use crate::types::{Contig, Gene, ParsedGene, ParsedSample};
 
     fn diverse(length: usize, salt: usize) -> Vec<u8> {
         let alphabet = b"ACDEFGHIKLMNPQRSTVWY";
@@ -723,6 +756,26 @@ mod tests {
                 sequence: "N".repeat(end as usize + 10),
             }],
             genes,
+        }
+    }
+
+    fn labelled(id: &str, intact: bool, length_evidence: &'static str) -> Gene {
+        Gene {
+            id: id.to_string(),
+            product: String::new(),
+            reference_dna: "ATGAAATAA".to_string(),
+            intact,
+            selection: if intact { "intact_longest" } else { "no_intact_copy" },
+            presence: vec![true],
+            lengths: vec![9],
+            samples_present: 1,
+            length_evidence,
+            samples_with_exact_reference: 1,
+            distinct_alleles: 1,
+            intact_alleles: u32::from(intact),
+            modal_end_bp: 9,
+            modal_end_samples: 1,
+            extension_samples: 0,
         }
     }
 
@@ -844,10 +897,33 @@ mod tests {
             coding(&isolated, 0, 20_000, "island"),
             coding(&right, 0, 40_000, "flkR"),
         ]));
-        let built = build(samples, &params()).unwrap();
+        let built = build(samples.clone(), &params()).unwrap();
         let gene = built.genes.iter().find(|gene| gene.id == "island").expect("gap-isolated gene");
         assert_eq!(gene.samples_present, 1);
         assert_eq!(gene.length_evidence, crate::synteny::UNCONFIRMED_SHORT);
+        let mut high = params();
+        high.quality = Quality::High;
+        let filtered = build(samples, &high).unwrap();
+        assert!(filtered.genes.iter().all(|gene| gene.id != "island"));
+        assert!(filtered.genes.iter().any(|gene| gene.id == "core"));
+        assert!(filtered.genes.iter().all(|gene| {
+            gene.intact && gene.length_evidence != crate::synteny::UNCONFIRMED_SHORT
+        }));
+    }
+
+    #[test]
+    fn high_quality_keeps_an_intact_conserved_gene_and_drops_a_broken_one() {
+        use crate::synteny::{CONSERVED_SHORT, LENGTH_SUFFICIENT, UNCONFIRMED_SHORT};
+        let mut genes = vec![
+            labelled("core", true, LENGTH_SUFFICIENT),
+            labelled("short_ok", true, CONSERVED_SHORT),
+            labelled("short_no", true, UNCONFIRMED_SHORT),
+            labelled("broken", false, LENGTH_SUFFICIENT),
+        ];
+        assert_eq!(super::apply_quality(&mut genes.clone(), Quality::Standard), 0);
+        assert_eq!(super::apply_quality(&mut genes, Quality::High), 2);
+        let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
+        assert_eq!(ids, vec!["core", "short_ok"]);
     }
 
     #[test]
