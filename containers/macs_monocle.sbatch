@@ -11,13 +11,13 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/%x_%j.out
+#SBATCH --output=logs/%x_%A_%a.out
 
 set -euo pipefail
 
 : "${SCRATCHDIR:?SCRATCHDIR is unset}"
 MACS="${RUSTROO_MACS:-$SCRATCHDIR/rustaroo-macs}"
-BIN="${RUSTROO_BIN:-$MACS/rustroo}"
+BIN="${RUSTROO_BIN:-$MACS/rustaroo/target/release/rustroo}"
 SIF="${PANAROO_SIF:-$MACS/sif/panaroo-1.5.1.sif}"
 INPUT="${RUSTROO_INPUT:-$MACS/monocle_gff}"
 OUTPUT="${RUSTROO_OUTPUT:-$MACS/runs/curve_${SLURM_JOB_ID}}"
@@ -43,7 +43,15 @@ if [[ -n "$N" ]]; then
 fi
 
 test "$(uname -m)" = x86_64
-test -x "$BIN"
+if [[ ! -x "$BIN" ]]; then
+    echo "No rustroo binary at $BIN" >&2
+    echo "From the rustaroo checkout: cargo build --release --locked" >&2
+    exit 1
+fi
+if [[ "$QUALITY" == "high" ]] && ! "$BIN" --help 2>&1 | grep -q -- '--quality'; then
+    echo "$BIN has no --quality flag. Rebuild the checkout: cargo build --release --locked" >&2
+    exit 1
+fi
 test -s "$SIF"
 test -d "$INPUT"
 test -f "$SCRIPT"
