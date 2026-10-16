@@ -542,7 +542,7 @@ def parse_args(argv):
     parser.add_argument("--panaroo-sif", type=Path, required=True)
     parser.add_argument("--threads", type=int, required=True)
     parser.add_argument("--seed", type=int, default=1729)
-    parser.add_argument("--quality", default="standard", choices=("standard", "high"))
+    parser.add_argument("--quality", default="standard", choices=("standard", "high", "strict"))
     parser.add_argument("--n", default=None, help="one sample count, or full, on this node")
     return parser.parse_args(argv)
 

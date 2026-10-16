@@ -4,11 +4,15 @@ use crate::error::{Error, Result};
 ///
 /// `standard` is the repaired pangenome. `high` drops the two weak labels:
 /// a family with no intact copy, and a short family that is rare and not
-/// between neighboring genes. Intact genes and conserved short genes stay.
+/// between neighboring genes. `strict` also drops a shorter gene that is
+/// already covered, in every sample where it occurs, by a longer gene.
+/// Intact genes, conserved short genes, and a short allele that is the only
+/// copy in some genome stay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Quality {
     Standard,
     High,
+    Strict,
 }
 
 /// Knobs for homology: near-identical preclusters, then 70% families, with

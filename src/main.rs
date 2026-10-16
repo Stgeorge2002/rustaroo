@@ -56,7 +56,8 @@ struct Cli {
     #[arg(long)]
     audit_members: bool,
 
-    /// `high` drops a gene with no intact copy and an unconfirmed short gene
+    /// `high` drops a gene with no intact copy and an unconfirmed short gene.
+    /// `strict` also drops a shorter gene already covered by a longer one.
     #[arg(long, value_enum, default_value = "standard")]
     quality: Quality,
 }
@@ -289,6 +290,7 @@ fn quality_name(quality: Quality) -> &'static str {
     match quality {
         Quality::Standard => "standard",
         Quality::High => "high",
+        Quality::Strict => "strict",
     }
 }
 
@@ -347,6 +349,10 @@ mod tests {
         assert_eq!(
             Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--quality", "high"]).unwrap().quality,
             Quality::High
+        );
+        assert_eq!(
+            Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--quality", "strict"]).unwrap().quality,
+            Quality::Strict
         );
         assert!(Cli::try_parse_from(["rustroo", "-i", "gff"]).is_err());
     }

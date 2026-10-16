@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
+use crate::align::fit_short_in_long;
 use crate::cluster::cluster_families;
 use crate::error::{Error, Result};
-use crate::genetic_code::{is_intact, orf_status};
+use crate::genetic_code::{is_intact, orf_status, translate};
 use crate::log::{self, progress};
 use crate::model::{Call, Pools};
 use crate::reference::{join_fragments, Allele, choose_reference};
@@ -259,11 +260,11 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             .then(a.id.cmp(&b.id))
     });
     let removed = apply_quality(&mut genes, params.quality);
-    if params.quality == Quality::High {
-        progress!("rustroo: quality high removed {removed} genes");
+    if params.quality != Quality::Standard {
+        progress!("rustroo: quality {label} removed {removed} genes", label = quality_label(params.quality));
         if genes.is_empty() {
             return Err(Error::new(
-                "no gene remained after the high quality filter",
+                "no gene remained after the quality filter",
             ));
         }
     }
@@ -338,18 +339,30 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     })
 }
 
+fn quality_label(quality: Quality) -> &'static str {
+    match quality {
+        Quality::Standard => "standard",
+        Quality::High => "high",
+        Quality::Strict => "strict",
+    }
+}
+
 /// `high` removes a family with no intact copy, and a short family the
 /// collection does not support by frequency or by neighboring genes.
+/// `strict` then removes a shorter family whose reference is a piece of a
+/// longer gene that is already present in every sample the short family
+/// occupies. A short allele that is the only copy in some genome stays.
 fn apply_quality(genes: &mut Vec<Gene>, quality: Quality) -> usize {
     if quality == Quality::Standard {
         return 0;
     }
     let before = genes.len();
+    let label = quality_label(quality);
     genes.retain(|gene| {
         let reject = !gene.intact || gene.length_evidence == UNCONFIRMED_SHORT;
         if reject && log::enabled() {
             log::record(&format!(
-                "quality\thigh\tdrop\t{}\tintact\t{}\tlength_evidence\t{}",
+                "quality\t{label}\tdrop\t{}\tintact\t{}\tlength_evidence\t{}",
                 gene.id,
                 if gene.intact { "yes" } else { "no" },
                 gene.length_evidence,
@@ -357,7 +370,100 @@ fn apply_quality(genes: &mut Vec<Gene>, quality: Quality) -> usize {
         }
         !reject
     });
+    if quality == Quality::Strict {
+        let redundant = redundant_fragments(genes);
+        let mut index = 0;
+        genes.retain(|_| {
+            let reject = redundant.contains(&index);
+            index += 1;
+            !reject
+        });
+    }
     before - genes.len()
+}
+
+/// Indexes of genes that add no family: the protein is a piece of a longer
+/// gene, and every sample that has the piece already has that longer gene.
+fn redundant_fragments(genes: &[Gene]) -> HashSet<usize> {
+    let proteins: Vec<Vec<u8>> = genes.iter().map(|gene| translate(&gene.reference_dna)).collect();
+    let mut postings: HashMap<[u8; 4], Vec<usize>> = HashMap::new();
+    let mut kmer_counts = vec![0u32; genes.len()];
+    for (index, protein) in proteins.iter().enumerate() {
+        if protein.len() < 4 {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        for window in protein.windows(4) {
+            let key = [window[0], window[1], window[2], window[3]];
+            if seen.insert(key) {
+                postings.entry(key).or_default().push(index);
+                kmer_counts[index] += 1;
+            }
+        }
+    }
+    postings.retain(|_, hits| hits.len() <= 64);
+    let mut order: Vec<usize> = (0..genes.len()).collect();
+    order.sort_by(|&left, &right| proteins[left].len().cmp(&proteins[right].len()).then(left.cmp(&right)));
+    let mut redundant = HashSet::new();
+    for short in order {
+        let needed = kmer_counts[short];
+        if needed == 0 || redundant.contains(&short) {
+            continue;
+        }
+        let mut scores: HashMap<usize, u32> = HashMap::new();
+        let protein = &proteins[short];
+        let mut seen = HashSet::new();
+        for window in protein.windows(4) {
+            let key = [window[0], window[1], window[2], window[3]];
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(hits) = postings.get(&key) else {
+                continue;
+            };
+            for &long in hits {
+                if proteins[long].len() > protein.len() {
+                    *scores.entry(long).or_default() += 1;
+                }
+            }
+        }
+        let mut ranked: Vec<(usize, u32)> = scores
+            .into_iter()
+            .filter(|&(_, score)| score * 2 >= needed)
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked.truncate(8);
+        for (long, _) in ranked {
+            if !presence_covered(&genes[short].presence, &genes[long].presence) {
+                continue;
+            }
+            let Some(fit) = fit_short_in_long(protein, &proteins[long]) else {
+                continue;
+            };
+            let span = fit.long_end.saturating_sub(fit.long_start);
+            if fit.identity + f64::EPSILON < 0.90
+                || fit.coverage + f64::EPSILON < 0.90
+                || fit.internal_gap > 5
+                || span * 10 >= proteins[long].len() * 9
+            {
+                continue;
+            }
+            if log::enabled() {
+                log::record(&format!(
+                    "quality\tstrict\tdrop\t{}\tcovered_by\t{}",
+                    genes[short].id, genes[long].id,
+                ));
+            }
+            redundant.insert(short);
+            break;
+        }
+    }
+    redundant
+}
+
+fn presence_covered(short: &[bool], long: &[bool]) -> bool {
+    short.len() == long.len()
+        && short.iter().zip(long).all(|(&has_short, &has_long)| !has_short || has_long)
 }
 
 fn log_field(value: &str) -> String {
@@ -924,6 +1030,36 @@ mod tests {
         assert_eq!(super::apply_quality(&mut genes, Quality::High), 2);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["core", "short_ok"]);
+    }
+
+    #[test]
+    fn strict_drops_a_covered_fragment_and_keeps_a_private_short_allele() {
+        use crate::genetic_code::back_translate;
+        use crate::synteny::LENGTH_SUFFICIENT;
+        let long_aa = random_protein(80, 7);
+        let piece_aa = long_aa[20..50].to_vec();
+        let near_aa = long_aa[..76].to_vec();
+        let mut long = labelled("long", true, LENGTH_SUFFICIENT);
+        long.reference_dna = back_translate(&long_aa);
+        long.presence = vec![true, true, false];
+        long.samples_present = 2;
+        let mut piece = labelled("piece", true, LENGTH_SUFFICIENT);
+        piece.reference_dna = back_translate(&piece_aa);
+        piece.presence = vec![true, false, false];
+        piece.samples_present = 1;
+        let mut alone = labelled("alone", true, LENGTH_SUFFICIENT);
+        alone.reference_dna = back_translate(&piece_aa);
+        alone.presence = vec![false, false, true];
+        alone.samples_present = 1;
+        let mut near = labelled("near", true, LENGTH_SUFFICIENT);
+        near.reference_dna = back_translate(&near_aa);
+        near.presence = vec![true, false, false];
+        near.samples_present = 1;
+        let mut genes = vec![long, piece, alone, near];
+        assert_eq!(super::apply_quality(&mut genes.clone(), Quality::High), 0);
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict), 1);
+        let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
+        assert_eq!(ids, vec!["long", "alone", "near"]);
     }
 
     #[test]

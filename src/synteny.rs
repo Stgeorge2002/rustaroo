@@ -461,7 +461,8 @@ pub fn merge_fragments(calls: &mut [Call], pools: &Pools, contig_lengths: &[Vec<
         progress!("rustroo: proposed {rescues} strand-aware shortened-allele adoptions; unions remain sample-guarded");
     }
     legacy.extend(abutting_pieces(calls, &reps, &members));
-    let (merged, terminal_merged, blocked) = apply_adoptions(calls, pools, members, &legacy, &terminal);
+    let contained = contained_adoptions(calls, pools, &reps, &members, &kmers);
+    let (merged, terminal_merged, blocked) = apply_adoptions(calls, pools, members, &legacy, &terminal, &contained);
     if merged > 0 {
         progress!(
             "rustroo: merged {merged} groups, including {terminal_merged} guarded shortened-allele groups"
@@ -669,12 +670,24 @@ fn shortened_identity(short: &[u8], long: &[u8], side: AlleleSide) -> Option<f64
     terminal_identity_parts(short, &[], window)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Adoption {
+    /// Flank or abutment evidence. Overlap is allowed only for one physical locus.
+    Legacy,
+    /// A shortened allele. Any shared sample blocks the merge.
+    Terminal,
+    /// The short protein is part of the long one. A shared sample is allowed
+    /// only when the short call sits inside the long call.
+    Contained,
+}
+
 fn apply_adoptions(
     calls: &mut [Call],
     pools: &Pools,
     mut members: HashMap<u32, HashSet<u32>>,
     legacy: &[(u32, u32)],
     terminal: &[(u32, u32)],
+    contained: &[(u32, u32)],
 ) -> (usize, usize, usize) {
     let mut parent: HashMap<u32, u32> = HashMap::new();
     let mut locations: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -684,11 +697,13 @@ fn apply_adoptions(
     let mut pair_cache = HashMap::new();
     let mut merged = 0;
     let mut terminal_merged = 0;
+    let mut contained_merged = 0;
     let mut blocked = 0;
-    for (child, parent_id, guarded) in legacy
+    for (child, parent_id, kind) in legacy
         .iter()
-        .map(|&(child, parent)| (child, parent, false))
-        .chain(terminal.iter().map(|&(child, parent)| (child, parent, true)))
+        .map(|&(child, parent)| (child, parent, Adoption::Legacy))
+        .chain(terminal.iter().map(|&(child, parent)| (child, parent, Adoption::Terminal)))
+        .chain(contained.iter().map(|&(child, parent)| (child, parent, Adoption::Contained)))
     {
         let root = find(&mut parent, parent_id);
         let child_root = find(&mut parent, child);
@@ -698,10 +713,18 @@ fn apply_adoptions(
         // Pairwise-disjoint proposals can still form a chain that joins two
         // copies in one sample. Check the accumulated groups, not just inputs.
         if !members[&child_root].is_disjoint(&members[&root]) {
-            if guarded || !cooccurring_loci_compatible(
-                &locations[&child_root], &locations[&root], &members[&child_root],
-                &members[&root], calls, pools, &mut pair_cache,
-            ) {
+            let allowed = match kind {
+                Adoption::Terminal => false,
+                Adoption::Legacy => cooccurring_loci_compatible(
+                    &locations[&child_root], &locations[&root], &members[&child_root],
+                    &members[&root], calls, pools, &mut pair_cache,
+                ),
+                Adoption::Contained => intervals_inside(
+                    &locations[&child_root], &locations[&root],
+                    Some(&members[&child_root]), Some(&members[&root]), calls,
+                ),
+            };
+            if !allowed {
                 blocked += 1;
                 continue;
             }
@@ -712,7 +735,13 @@ fn apply_adoptions(
         let child_locations = locations.remove(&child_root).expect("child locations exist");
         locations.get_mut(&root).expect("parent locations exist").extend(child_locations);
         merged += 1;
-        terminal_merged += usize::from(guarded);
+        terminal_merged += usize::from(kind == Adoption::Terminal);
+        contained_merged += usize::from(kind == Adoption::Contained);
+    }
+    if contained_merged > 0 {
+        progress!(
+            "rustroo: adopted {contained_merged} length-contained fragments into the longer gene"
+        );
     }
     for call in calls.iter_mut() {
         call.cluster = find(&mut parent, call.cluster);
@@ -851,6 +880,159 @@ fn best_merge_target(
     } else {
         None
     }
+}
+
+/// A Bakta call that is only a piece of a longer gene.
+///
+/// Homology will not join them: the length ratio stays strict so a real
+/// paralogue a few percent shorter is not swallowed. Adoption is sequence
+/// containment at 90% identity over 90% of the short protein, and the placed
+/// span must cover less than 90% of the long protein. A sample that has both
+/// calls joins only when every short interval lies inside a long call on the
+/// same contig and strand. Calls that never share a genome join as alleles.
+/// Two eligible parents, or a short call sitting beside the long gene, stay
+/// separate.
+fn contained_adoptions(
+    calls: &[Call],
+    pools: &Pools,
+    reps: &HashMap<u32, Vec<u8>>,
+    members: &HashMap<u32, HashSet<u32>>,
+    kmers: &HashMap<u32, HashSet<&[u8]>>,
+) -> Vec<(u32, u32)> {
+    let postings = containment_postings(kmers);
+    let mut locations: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (index, call) in calls.iter().enumerate() {
+        locations.entry(call.cluster).or_default().push(index);
+    }
+    let mut ids: Vec<u32> = kmers.keys().copied().collect();
+    ids.sort_unstable();
+    let mut pairs: Vec<(u32, u32)> = ids
+        .par_iter()
+        .filter_map(|&short_id| {
+            let short = reps.get(&short_id)?;
+            let short_kmers = kmers.get(&short_id)?;
+            let needed = short_kmers.len() as u32;
+            if needed == 0 {
+                return None;
+            }
+            let mut scores: HashMap<u32, u32> = HashMap::new();
+            for window in short_kmers {
+                let Some(hits) = postings.get(window) else {
+                    continue;
+                };
+                for &long_id in hits {
+                    if long_id != short_id {
+                        *scores.entry(long_id).or_default() += 1;
+                    }
+                }
+            }
+            let mut ranked: Vec<(u32, u32)> = scores
+                .into_iter()
+                .filter(|&(long_id, score)| {
+                    reps.get(&long_id).is_some_and(|long| long.len() > short.len())
+                        && score * 2 >= needed
+                })
+                .collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            ranked.truncate(8);
+            let mut fits = Vec::new();
+            for (long_id, _) in ranked {
+                let long = &reps[&long_id];
+                let Some(fit) = fit_short_in_long(short, long) else {
+                    continue;
+                };
+                let span = fit.long_end.saturating_sub(fit.long_start);
+                if fit.identity + f64::EPSILON < 0.90
+                    || fit.coverage + f64::EPSILON < 0.90
+                    || fit.internal_gap > 5
+                    || span * 10 >= long.len() * 9
+                {
+                    continue;
+                }
+                fits.push(long_id);
+            }
+            // A second sequence match is ambiguity, including a damaged host
+            // and one the coordinates later reject.
+            if fits.len() != 1 {
+                return None;
+            }
+            let long_id = fits[0];
+            if !host_is_intact(calls, pools, long_id, &reps[&long_id]) {
+                return None;
+            }
+            intervals_inside(
+                locations.get(&short_id).map_or(&[], Vec::as_slice),
+                locations.get(&long_id).map_or(&[], Vec::as_slice),
+                members.get(&short_id),
+                members.get(&long_id),
+                calls,
+            )
+            .then_some((short_id, long_id))
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs
+}
+
+fn host_is_intact(calls: &[Call], pools: &Pools, cluster: u32, representative: &[u8]) -> bool {
+    calls.iter().any(|call| {
+        call.cluster == cluster
+            && pools.protein[call.protein as usize] == representative
+            && is_intact(&pools.dna[call.dna as usize])
+    })
+}
+
+fn containment_postings<'a>(
+    kmers: &'a HashMap<u32, HashSet<&'a [u8]>>,
+) -> HashMap<&'a [u8], Vec<u32>> {
+    let mut postings: HashMap<&[u8], Vec<u32>> = HashMap::new();
+    for (&id, windows) in kmers {
+        for window in windows {
+            postings.entry(window).or_default().push(id);
+        }
+    }
+    // A 4-mer shared by dozens of families cannot point at one parent.
+    postings.retain(|_, ids| ids.len() <= 64);
+    postings
+}
+
+/// Every short call in a shared genome lies inside a long call.
+/// No shared genome is containment, not a conflict.
+fn intervals_inside(
+    short_indexes: &[usize],
+    long_indexes: &[usize],
+    short_samples: Option<&HashSet<u32>>,
+    long_samples: Option<&HashSet<u32>>,
+    calls: &[Call],
+) -> bool {
+    let (Some(short_samples), Some(long_samples)) = (short_samples, long_samples) else {
+        return true;
+    };
+    for &sample in short_samples.intersection(long_samples) {
+        let mut pending = 0usize;
+        for &index in short_indexes {
+            let short = &calls[index];
+            if short.sample != sample {
+                continue;
+            }
+            pending += 1;
+            let inside = long_indexes.iter().any(|&long_index| {
+                let long = &calls[long_index];
+                long.sample == sample
+                    && long.contig == short.contig
+                    && long.strand == short.strand
+                    && short.start >= long.start
+                    && short.end <= long.end
+            });
+            if !inside {
+                return false;
+            }
+        }
+        if pending == 0 {
+            return false;
+        }
+    }
+    true
 }
 
 fn terminal_identity(short: &[u8], long: &[u8]) -> Option<f64> {
@@ -2428,6 +2610,76 @@ mod tests {
         assert!(shortened_identity(&variant, &full, AlleleSide::Either).unwrap() < TERMINAL_IDENTITY);
     }
 
+    fn cluster_of(calls: &[Call], pools: &Pools, sequence: &[u8]) -> u32 {
+        let protein = pools.protein.iter().position(|stored| stored == sequence).unwrap() as u32;
+        calls.iter().find(|call| call.protein == protein).unwrap().cluster
+    }
+
+    #[test]
+    fn a_short_call_inside_the_longer_gene_joins_it() {
+        let full = intact_protein(120, 42);
+        let piece = &full[30..70];
+        let mut pools = Pools::default();
+        let mut calls = Vec::new();
+        for sample in 0..2u32 {
+            let long = call(sample, 1, 1000, &full, &mut pools);
+            let mut inner = call(sample, 0, long.start + 60, piece, &mut pools);
+            assert!(inner.end <= long.end);
+            inner.strand = long.strand;
+            calls.push(long);
+            calls.push(inner);
+        }
+        let lengths = vec![vec![8000], vec![8000]];
+        assert!(merge_fragments(&mut calls, &pools, &lengths));
+        assert_eq!(cluster_of(&calls, &pools, piece), cluster_of(&calls, &pools, &full));
+    }
+
+    #[test]
+    fn a_short_call_beside_the_longer_gene_stays_separate() {
+        let full = intact_protein(120, 42);
+        let piece = &full[30..70];
+        let mut pools = Pools::default();
+        let mut calls = Vec::new();
+        for sample in 0..2u32 {
+            let long = call(sample, 1, 1000, &full, &mut pools);
+            let beside = call(sample, 0, long.end + 50, piece, &mut pools);
+            calls.push(long);
+            calls.push(beside);
+        }
+        let lengths = vec![vec![8000], vec![8000]];
+        assert!(!merge_fragments(&mut calls, &pools, &lengths));
+        assert_ne!(cluster_of(&calls, &pools, piece), cluster_of(&calls, &pools, &full));
+    }
+
+    #[test]
+    fn a_short_call_that_never_shares_a_genome_joins_the_longer_gene() {
+        let full = intact_protein(120, 42);
+        let piece = &full[30..70];
+        let mut pools = Pools::default();
+        let mut calls = vec![
+            call(0, 0, 100, piece, &mut pools),
+            call(1, 1, 1000, &full, &mut pools),
+        ];
+        let lengths = vec![vec![8000], vec![8000]];
+        assert!(merge_fragments(&mut calls, &pools, &lengths));
+        assert_eq!(cluster_of(&calls, &pools, piece), cluster_of(&calls, &pools, &full));
+    }
+
+    #[test]
+    fn two_longer_genes_that_both_contain_the_short_call_are_not_chosen() {
+        let full = intact_protein(120, 42);
+        let piece = &full[30..70];
+        let mut pools = Pools::default();
+        let mut calls = vec![
+            call(0, 0, 100, piece, &mut pools),
+            call(1, 1, 1000, &full, &mut pools),
+            call(2, 2, 1000, &full, &mut pools),
+        ];
+        let lengths = vec![vec![8000], vec![8000], vec![8000]];
+        assert!(!merge_fragments(&mut calls, &pools, &lengths));
+        assert_eq!(cluster_of(&calls, &pools, piece), 0);
+    }
+
     #[test]
     fn legacy_fragment_merges_keep_one_flank_and_containment_rules() {
         let full = protein(100, 42);
@@ -2468,9 +2720,9 @@ mod tests {
             let first = [(0, 1)];
             let all = [(0, 1), (1, 2)];
             let (merged, terminal, blocked) = if legacy {
-                apply_adoptions(&mut calls, &pools, members, &first, &[(1, 2)])
+                apply_adoptions(&mut calls, &pools, members, &first, &[(1, 2)], &[])
             } else {
-                apply_adoptions(&mut calls, &pools, members, &[], &all)
+                apply_adoptions(&mut calls, &pools, members, &[], &all, &[])
             };
             assert_eq!(merged, 1);
             assert_eq!(terminal, usize::from(!legacy));
@@ -2645,7 +2897,7 @@ mod tests {
         let mut calls = vec![first, second, observed];
         let members = sample_sets(&calls);
         assert_eq!(
-            apply_adoptions(&mut calls, &pools, members, &[(0, 2), (1, 2)], &[]),
+            apply_adoptions(&mut calls, &pools, members, &[(0, 2), (1, 2)], &[], &[]),
             (2, 0, 0),
         );
         assert_eq!(physical_loci(&calls, &pools).len(), 2);
@@ -2667,7 +2919,7 @@ mod tests {
             freeze_contexts(&mut calls, &pools);
             let members = sample_sets(&calls);
             assert_eq!(
-                apply_adoptions(&mut calls, &pools, members, &[(0, 1)], &[]),
+                apply_adoptions(&mut calls, &pools, members, &[(0, 1)], &[], &[]),
                 (0, 0, 1),
             );
             assert_ne!(calls[0].cluster, calls[1].cluster);
@@ -2687,7 +2939,7 @@ mod tests {
         ];
         let members = sample_sets(&calls);
         assert_eq!(
-            apply_adoptions(&mut calls, &pools, members, &[(0, 1), (1, 2)], &[]),
+            apply_adoptions(&mut calls, &pools, members, &[(0, 1), (1, 2)], &[], &[]),
             (1, 0, 1),
         );
         assert_eq!(calls[0].cluster, calls[2].cluster);
@@ -2778,7 +3030,7 @@ mod tests {
         freeze_contexts(&mut calls, &pools);
         calls[2].cluster = 12;
         let members = sample_sets(&calls);
-        assert_eq!(apply_adoptions(&mut calls, &pools, members, &[], &[(10, 11)]), (1, 1, 0));
+        assert_eq!(apply_adoptions(&mut calls, &pools, members, &[], &[(10, 11)], &[]), (1, 1, 0));
         assert_eq!(calls[0].cluster, calls[1].cluster);
         assert_ne!(calls[0].cluster, calls[2].cluster, "anchors are not ortholog assignments");
         assert!(calls.iter().all(|call| call.context == 10));
