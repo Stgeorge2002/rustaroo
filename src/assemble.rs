@@ -349,9 +349,10 @@ fn quality_label(quality: Quality) -> &'static str {
 
 /// `high` removes a family with no intact copy, and a short family the
 /// collection does not support by frequency or by neighboring genes.
-/// `strict` then removes a shorter family whose reference is a piece of a
-/// longer gene that is already present in every sample the short family
-/// occupies. A short allele that is the only copy in some genome stays.
+/// `strict` then removes a family that adds no presence: its protein is a
+/// piece of a longer gene, or a near-identical second copy, and every sample
+/// that has it already has that other gene. A diverged paralogue stays. A
+/// short allele that is the only copy in some genome stays.
 fn apply_quality(genes: &mut Vec<Gene>, quality: Quality) -> usize {
     if quality == Quality::Standard {
         return 0;
@@ -382,8 +383,10 @@ fn apply_quality(genes: &mut Vec<Gene>, quality: Quality) -> usize {
     before - genes.len()
 }
 
-/// Indexes of genes that add no family: the protein is a piece of a longer
-/// gene, and every sample that has the piece already has that longer gene.
+/// Indexes of genes that add no presence. A piece is at least 90% identical
+/// over at least 90% of itself and covers less than 98% of a longer protein.
+/// A second copy is at least 98% identical at any length, and the copy present
+/// in fewer genomes is the one removed. Equal support keeps the earlier gene.
 fn redundant_fragments(genes: &[Gene]) -> HashSet<usize> {
     let proteins: Vec<Vec<u8>> = genes.iter().map(|gene| translate(&gene.reference_dna)).collect();
     let mut postings: HashMap<[u8; 4], Vec<usize>> = HashMap::new();
@@ -422,7 +425,7 @@ fn redundant_fragments(genes: &[Gene]) -> HashSet<usize> {
                 continue;
             };
             for &long in hits {
-                if proteins[long].len() > protein.len() {
+                if is_covered_by(short, long, &proteins, genes) {
                     *scores.entry(long).or_default() += 1;
                 }
             }
@@ -441,10 +444,12 @@ fn redundant_fragments(genes: &[Gene]) -> HashSet<usize> {
                 continue;
             };
             let span = fit.long_end.saturating_sub(fit.long_start);
+            let piece = span * 50 < proteins[long].len() * 49;
+            let near_copy = fit.identity + f64::EPSILON >= 0.98;
             if fit.identity + f64::EPSILON < 0.90
                 || fit.coverage + f64::EPSILON < 0.90
                 || fit.internal_gap > 5
-                || span * 10 >= proteins[long].len() * 9
+                || !(piece || near_copy)
             {
                 continue;
             }
@@ -459,6 +464,20 @@ fn redundant_fragments(genes: &[Gene]) -> HashSet<usize> {
         }
     }
     redundant
+}
+
+/// `long` already explains `short`: it is a longer protein, or the same length
+/// and present in more genomes. Equal length and equal support keep the
+/// earlier gene, so a mutual match cannot remove both.
+fn is_covered_by(short: usize, long: usize, proteins: &[Vec<u8>], genes: &[Gene]) -> bool {
+    match proteins[long].len().cmp(&proteins[short].len()) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            genes[long].samples_present > genes[short].samples_present
+                || (genes[long].samples_present == genes[short].samples_present && long < short)
+        }
+    }
 }
 
 fn presence_covered(short: &[bool], long: &[bool]) -> bool {
@@ -1033,12 +1052,17 @@ mod tests {
     }
 
     #[test]
-    fn strict_drops_a_covered_fragment_and_keeps_a_private_short_allele() {
+    fn strict_drops_a_covered_copy_and_keeps_a_private_allele_and_a_diverged_paralog() {
         use crate::genetic_code::back_translate;
         use crate::synteny::LENGTH_SUFFICIENT;
         let long_aa = random_protein(80, 7);
         let piece_aa = long_aa[20..50].to_vec();
         let near_aa = long_aa[..76].to_vec();
+        let copy_aa = long_aa[..79].to_vec();
+        let mut paralog_aa = long_aa.clone();
+        for site in [4, 12, 20, 28, 36, 44, 52, 60] {
+            paralog_aa[site] = if paralog_aa[site] == b'A' { b'L' } else { b'A' };
+        }
         let mut long = labelled("long", true, LENGTH_SUFFICIENT);
         long.reference_dna = back_translate(&long_aa);
         long.presence = vec![true, true, false];
@@ -1055,11 +1079,23 @@ mod tests {
         near.reference_dna = back_translate(&near_aa);
         near.presence = vec![true, false, false];
         near.samples_present = 1;
-        let mut genes = vec![long, piece, alone, near];
+        let mut copy = labelled("copy", true, LENGTH_SUFFICIENT);
+        copy.reference_dna = back_translate(&copy_aa);
+        copy.presence = vec![true, false, false];
+        copy.samples_present = 1;
+        let mut twin = labelled("twin", true, LENGTH_SUFFICIENT);
+        twin.reference_dna = back_translate(&long_aa);
+        twin.presence = vec![true, true, false];
+        twin.samples_present = 2;
+        let mut paralog = labelled("paralog", true, LENGTH_SUFFICIENT);
+        paralog.reference_dna = back_translate(&paralog_aa);
+        paralog.presence = vec![true, true, false];
+        paralog.samples_present = 2;
+        let mut genes = vec![long, piece, alone, near, copy, twin, paralog];
         assert_eq!(super::apply_quality(&mut genes.clone(), Quality::High), 0);
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict), 1);
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict), 4);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
-        assert_eq!(ids, vec!["long", "alone", "near"]);
+        assert_eq!(ids, vec!["long", "alone", "paralog"]);
     }
 
     #[test]
