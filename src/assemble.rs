@@ -219,6 +219,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
                 sample_names.len(),
                 bounded.contains(&cluster),
                 &contig_lengths,
+                params.quality == Quality::Strict,
             );
             let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
             if total >= 100 && (done == 1 || done == total || done % 250 == 0) {
@@ -361,8 +362,9 @@ fn quality_label(quality: Quality) -> &'static str {
 /// `strict` then removes a second reference of a gene already kept. A nested
 /// or deep fragment can match at 80% identity, a shorter piece at 85%, and a
 /// copy at 90%. The same allele in other genomes is folded into the longer
-/// gene so those genomes stay present. A paralogue below 90% identity at
-/// nearly the same length stays.
+/// gene so those genomes stay present. A gene with two finished lengths uses
+/// the length shared by more genomes, so both references can cover each other.
+/// A paralogue below 90% identity at nearly the same length stays.
 fn apply_quality(
     genes: &mut Vec<Gene>,
     quality: Quality,
@@ -522,13 +524,28 @@ fn absorb(keeper: &mut Gene, extra: &Gene) {
     if keeper.presence.len() != extra.presence.len() {
         return;
     }
+    // A near-full-length copy that is at least as common as the longer one is
+    // the sequence the match can cover. A fragment stays out of the reference.
+    let use_shorter = extra.reference_dna.len() < keeper.reference_dna.len()
+        && extra.reference_dna.len() * 10 >= keeper.reference_dna.len() * 9
+        && extra.samples_present >= keeper.samples_present;
+    let shorter = use_shorter.then(|| extra.reference_dna.clone());
+    let shorter_exact = extra.samples_with_exact_reference;
     for index in 0..keeper.presence.len() {
         if extra.presence[index] && !keeper.presence[index] {
             keeper.presence[index] = true;
-            if keeper.lengths.len() == extra.lengths.len() {
+            if index < keeper.lengths.len()
+                && keeper.lengths.len() == extra.lengths.len()
+            {
                 keeper.lengths[index] = extra.lengths[index];
             }
         }
+    }
+    if let Some(dna) = shorter {
+        keeper.modal_end_bp = dna.len() as u32;
+        keeper.reference_dna = dna;
+        keeper.selection = "intact_modal_end";
+        keeper.samples_with_exact_reference = shorter_exact;
     }
     keeper.samples_present = keeper.presence.iter().filter(|&&present| present).count() as u32;
 }
@@ -660,6 +677,7 @@ fn compute_partial_gene(
     sample_count: usize,
     between_neighbors: bool,
     contig_lengths: &[Vec<usize>],
+    prefer_modal: bool,
 ) -> Option<PartialGene> {
     let alleles = alleles_of(indexes, calls, pools, contig_lengths, locus_ids);
     let joined = joined_allele(indexes, calls, pools, locus_ids);
@@ -675,7 +693,7 @@ fn compute_partial_gene(
             });
         }
     }
-    let choice = choose_reference(&with_join, reps, cluster, sample_count)?;
+    let choice = choose_reference(&with_join, reps, cluster, sample_count, prefer_modal)?;
     let mut presence = vec![false; sample_count];
     let mut lengths = vec![0u32; sample_count];
     let mut intervals: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::new();
@@ -1251,6 +1269,31 @@ mod tests {
         assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 7);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["long", "alone", "paralog"]);
+    }
+
+    #[test]
+    fn strict_writes_the_more_common_shorter_length() {
+        use crate::genetic_code::back_translate;
+        use crate::synteny::LENGTH_SUFFICIENT;
+        let long_aa = random_protein(80, 9);
+        let short_aa = long_aa[..76].to_vec();
+        let mut long = labelled("long", true, LENGTH_SUFFICIENT);
+        long.reference_dna = back_translate(&long_aa);
+        long.presence = vec![true, false, false];
+        long.samples_present = 1;
+        long.samples_with_exact_reference = 1;
+        let mut short = labelled("short", true, LENGTH_SUFFICIENT);
+        short.reference_dna = back_translate(&short_aa);
+        short.presence = vec![false, true, true];
+        short.samples_present = 2;
+        short.samples_with_exact_reference = 2;
+        let mut genes = vec![long, short];
+        let loci = std::collections::HashMap::new();
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 1);
+        assert_eq!(genes[0].id, "long");
+        assert_eq!(genes[0].reference_dna, back_translate(&short_aa));
+        assert_eq!(genes[0].presence, vec![true, true, true]);
+        assert_eq!(genes[0].selection, "intact_modal_end");
     }
 
     #[test]
