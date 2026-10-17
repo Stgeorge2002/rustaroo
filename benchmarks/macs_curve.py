@@ -308,7 +308,7 @@ def panaroo_argv(sif, gffs, cohort_dir, threads, input_root):
         "panaroo", "-i",
     ] + inside + [
         "-o", "/cohort/panaroo",
-        "--clean-mode", "strict", "--remove-invalid-genes", "--verbose",
+        "--clean-mode", "strict", "--remove-invalid-genes",
         "-t", str(threads),
     ]
 
@@ -333,6 +333,18 @@ blastn -task blastn -query /work/rustroo.fa -db /work/panaroo_db -num_threads "$
 
 def cohort_folder(n):
     return "n{0:04d}".format(n)
+
+
+def report_failure(row, result_path, message, log_path):
+    row["error"] = message
+    save_json(result_path, row)
+    print(message, flush=True)
+    if log_path.is_file():
+        with log_path.open(errors="replace") as handle:
+            lines = handle.read().splitlines()
+        if lines:
+            print("\n".join(lines[-20:]), flush=True)
+    return row
 
 
 def run_cohort(root, cohort, input_root, binary, sif, threads, env, quality):
@@ -384,9 +396,9 @@ def run_cohort(root, cohort, input_root, binary, sif, threads, env, quality):
     row.update(reported_rustroo_minutes(logs / "rustroo.stdout"))
     save_json(result_path, row)
     if code != 0:
-        row["error"] = "rustroo exited {0}".format(code)
-        save_json(result_path, row)
-        return row
+        return report_failure(
+            row, result_path, "rustroo exited {0}".format(code), logs / "rustroo.stdout",
+        )
 
     pan_dir = folder / "panaroo"
     code, wall, cpu = run_timed(
@@ -399,16 +411,17 @@ def run_cohort(root, cohort, input_root, binary, sif, threads, env, quality):
     })
     save_json(result_path, row)
     if code != 0:
-        row["error"] = "panaroo exited {0}".format(code)
-        save_json(result_path, row)
-        return row
+        return report_failure(
+            row, result_path, "panaroo exited {0}".format(code), logs / "panaroo.stdout",
+        )
 
     rust_fa = rust_dir / "genes.fa"
     pan_fa = pan_dir / "pan_genome_reference.fa"
     if not rust_fa.is_file() or not pan_fa.is_file():
-        row["error"] = "A reference FASTA is missing after both tools exited 0"
-        save_json(result_path, row)
-        return row
+        return report_failure(
+            row, result_path, "A reference FASTA is missing after both tools exited 0",
+            logs / "panaroo.stdout",
+        )
     rust_seqs = fasta_sequences(rust_fa)
     pan_seqs = fasta_sequences(pan_fa)
     row.update({"rustroo_genes": len(rust_seqs), "panaroo_genes": len(pan_seqs)})
@@ -426,9 +439,9 @@ def run_cohort(root, cohort, input_root, binary, sif, threads, env, quality):
         "blast_cpu_min": _minutes(cpu),
     })
     if code != 0:
-        row["error"] = "blastn exited {0}".format(code)
-        save_json(result_path, row)
-        return row
+        return report_failure(
+            row, result_path, "blastn exited {0}".format(code), logs / "blast.stdout",
+        )
     metrics, pairs = compare_references(
         work / "forward.tsv", work / "reverse.tsv", pan_seqs, rust_seqs,
         MIN_IDENTITY, MIN_COVERAGE,

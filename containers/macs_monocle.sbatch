@@ -11,6 +11,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
+#SBATCH --job-name=rustroo_curve
 #SBATCH --output=logs/%x_%A_%a.out
 
 set -euo pipefail

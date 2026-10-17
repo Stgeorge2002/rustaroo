@@ -63,7 +63,8 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(rust[rust.index("--threads") + 1], "32")
         self.assertEqual(rust[rust.index("--quality") + 1], "high")
         self.assertEqual(pan[pan.index("-t") + 1], "32")
-        self.assertIn("--verbose", pan)
+        self.assertNotIn("--verbose", pan)
+        self.assertNotIn("--quiet", pan)
         self.assertIn("OMP_NUM_THREADS=32", pan)
 
     def test_curve_diagram_uses_finished_points(self) -> None:
