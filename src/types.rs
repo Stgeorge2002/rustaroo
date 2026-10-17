@@ -7,9 +7,10 @@ use crate::error::{Error, Result};
 /// between neighboring genes. `strict` also drops a second reference that is
 /// already the same gene: a nested or deep fragment down to 80% identity, a
 /// shorter piece down to 85%, a copy at 90% identity, or the same allele in
-/// other genomes, which is folded into the longer gene. When a gene has two
-/// finished lengths, the reference is the length shared by more genomes.
-/// A paralogue below 90% identity at nearly the same length stays.
+/// other genomes, which is folded into the longer gene. Repeated copies of
+/// one gene fold even when they match each other. A fragment that matches two
+/// different longer genes stays, and so does a paralogue below 90% identity
+/// at nearly the same length. The reference stays the longer finished allele.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Quality {
     Standard,

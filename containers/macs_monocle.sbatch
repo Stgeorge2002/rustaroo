@@ -42,6 +42,19 @@ if [[ -n "$N" ]]; then
     OUTPUT="${RUSTROO_OUTPUT:-$MACS/runs/curve_${QUALITY}}"
 fi
 
+# The job log is written outside the run directory. Copy it in when the
+# task ends, including after a failed tool, so it downloads with the cohort.
+copy_job_log() {
+    mkdir -p "$OUTPUT/logs" || return 0
+    if [[ -n "${SLURM_ARRAY_JOB_ID:-}" && -n "${SLURM_ARRAY_TASK_ID:-}" && -n "${SLURM_JOB_NAME:-}" ]]; then
+        local src="logs/${SLURM_JOB_NAME}_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.out"
+        if [[ -f "$src" ]]; then
+            cp -f "$src" "$OUTPUT/logs/slurm_${SLURM_ARRAY_TASK_ID}.out" || true
+        fi
+    fi
+}
+trap copy_job_log EXIT
+
 test "$(uname -m)" = x86_64
 if [[ ! -x "$BIN" ]]; then
     echo "No rustroo binary at $BIN" >&2

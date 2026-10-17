@@ -308,7 +308,8 @@ def panaroo_argv(sif, gffs, cohort_dir, threads, input_root):
         "panaroo", "-i",
     ] + inside + [
         "-o", "/cohort/panaroo",
-        "--clean-mode", "strict", "--remove-invalid-genes", "-t", str(threads),
+        "--clean-mode", "strict", "--remove-invalid-genes", "--verbose",
+        "-t", str(threads),
     ]
 
 
@@ -363,16 +364,24 @@ def run_cohort(root, cohort, input_root, binary, sif, threads, env, quality):
     save_json(result_path, row)
     print("cohort n={0} disjoint={1}".format(cohort["n"], cohort["disjoint"]), flush=True)
 
+    # One directory per cohort, next to the references, so a download of the
+    # run folder includes every tool log.
+    logs = folder / "logs"
+    logs.mkdir()
+    print("logs {0}".format(logs), flush=True)
     rust_dir = folder / "rustroo"
     code, wall, cpu = run_timed(
-        rustroo_argv(binary, gffs, rust_dir, threads, quality), folder / "rustroo.stdout", env,
+        rustroo_argv(binary, gffs, rust_dir, threads, quality), logs / "rustroo.stdout", env,
     )
+    detail = rust_dir / "rustroo.log"
+    if detail.is_file():
+        shutil.copy2(detail, logs / "rustroo.log")
     row.update({
         "rustroo_exit": code,
         "rustroo_wall_min": _minutes(wall),
         "rustroo_cpu_min": _minutes(cpu),
     })
-    row.update(reported_rustroo_minutes(folder / "rustroo.stdout"))
+    row.update(reported_rustroo_minutes(logs / "rustroo.stdout"))
     save_json(result_path, row)
     if code != 0:
         row["error"] = "rustroo exited {0}".format(code)
@@ -381,7 +390,7 @@ def run_cohort(root, cohort, input_root, binary, sif, threads, env, quality):
 
     pan_dir = folder / "panaroo"
     code, wall, cpu = run_timed(
-        panaroo_argv(sif, gffs, folder, threads, input_root), folder / "panaroo.stdout", env,
+        panaroo_argv(sif, gffs, folder, threads, input_root), logs / "panaroo.stdout", env,
     )
     row.update({
         "panaroo_exit": code,
@@ -409,7 +418,7 @@ def run_cohort(root, cohort, input_root, binary, sif, threads, env, quality):
     shutil.copy2(rust_fa, work / "rustroo.fa")
     code, wall, cpu = run_timed(
         blast_argv(sif, work, threads, len(rust_seqs), len(pan_seqs)),
-        folder / "blast.stdout", env,
+        logs / "blast.stdout", env,
     )
     row.update({
         "blast_exit": code,

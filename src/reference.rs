@@ -76,7 +76,6 @@ pub fn choose_reference(
     reps: &HashMap<u32, Vec<u8>>,
     own_cluster: u32,
     n_samples: usize,
-    prefer_modal: bool,
 ) -> Option<Choice> {
     let observed: Vec<&Allele> = alleles.iter().filter(|allele| !allele.synthetic).collect();
     if observed.is_empty() && alleles.is_empty() {
@@ -160,19 +159,13 @@ pub fn choose_reference(
         }
     }
 
+    // The longer finished allele is the reference. The common shorter end
+    // fails the 90% both-coverage comparison against a longer copy of the
+    // same gene, which is the length the other reference usually keeps.
     let longest = kept.iter().map(|allele| allele.dna.len()).max()?;
-    let modal = census.modal_bp as usize;
-    // The benchmark needs 90% of both references covered. The longer finished
-    // allele fails that against the common shorter end, so strict asks for
-    // the end shared by more genomes. Equal support keeps the shorter end.
-    let target_len = if prefer_modal && census.active && kept.iter().any(|allele| allele.dna.len() == modal) {
-        modal
-    } else {
-        longest
-    };
     let mut class: Vec<&Allele> = kept
         .into_iter()
-        .filter(|allele| allele.dna.len() == target_len)
+        .filter(|allele| allele.dna.len() == longest)
         .collect();
     if class.iter().any(|allele| orf_status(&allele.dna).terminal_stop) {
         class.retain(|allele| orf_status(&allele.dna).terminal_stop);
@@ -224,9 +217,6 @@ pub fn choose_reference(
         } else if chosen_finished >= support && other_finished {
             selection = "intact_length_polymorphism";
         }
-    }
-    if prefer_modal && target_len < longest {
-        selection = "intact_modal_end";
     }
 
     let exact_copies = pool
@@ -647,7 +637,7 @@ mod tests {
 
     fn choose(alleles: &[Allele], reps: &HashMap<u32, Vec<u8>>) -> Choice {
         let samples = alleles.iter().map(|allele| allele.count as usize).sum::<usize>().max(1);
-        choose_reference(alleles, reps, 0, samples, false).unwrap()
+        choose_reference(alleles, reps, 0, samples).unwrap()
     }
 
     /// Builds the "other families" map `choose_reference` now takes directly,
@@ -683,7 +673,7 @@ mod tests {
         assert_eq!(short_dna.len(), 270);
         assert_eq!(full_dna.len(), 300);
         let finished = vec![allele(&full_dna, 1), allele(&short_dna, 399)];
-        let choice = choose_reference(&finished, &no_others(), 0, 400, false).unwrap();
+        let choice = choose_reference(&finished, &no_others(), 0, 400).unwrap();
         assert_eq!(choice.dna, short_dna);
         assert!(choice.intact);
         assert_eq!(choice.selection, "intact_conserved_end");
@@ -693,7 +683,7 @@ mod tests {
         assert_eq!(choice.extension_samples, 1);
 
         let clipped_copies = vec![allele(&full_dna, 1), clipped(&short_dna, 399)];
-        let kept = choose_reference(&clipped_copies, &no_others(), 0, 400, false).unwrap();
+        let kept = choose_reference(&clipped_copies, &no_others(), 0, 400).unwrap();
         assert_eq!(kept.dna, full_dna, "{}", kept.selection);
         assert_eq!(kept.selection, "intact_longest");
         assert_eq!(kept.extension_samples, 0);
@@ -709,7 +699,6 @@ mod tests {
             &no_others(),
             0,
             400,
-            false,
         )
         .unwrap();
         assert_eq!(choice.dna, back_translate(&common));
@@ -727,7 +716,6 @@ mod tests {
             &no_others(),
             0,
             400,
-            false,
         )
         .unwrap();
         assert_eq!(choice.dna, back_translate(&long));
@@ -735,16 +723,6 @@ mod tests {
         assert_eq!(choice.modal_end_bp, back_translate(&short).len() as u32);
         assert_eq!(choice.modal_end_samples, 200);
         assert_eq!(choice.extension_samples, 200);
-        let modal = choose_reference(
-            &[allele(&back_translate(&long), 200), allele(&back_translate(&short), 200)],
-            &no_others(),
-            0,
-            400,
-            true,
-        )
-        .unwrap();
-        assert_eq!(modal.dna, back_translate(&short));
-        assert_eq!(modal.selection, "intact_modal_end");
     }
 
     #[test]
@@ -761,7 +739,6 @@ mod tests {
             &no_others(),
             0,
             400,
-            false,
         )
         .unwrap();
         assert_eq!(choice.dna, back_translate(&long), "{}", choice.selection);
@@ -787,7 +764,6 @@ mod tests {
             &no_others(),
             0,
             400,
-            false,
         )
         .unwrap();
         assert_eq!(choice.selection, "intact_conserved_end");
@@ -809,7 +785,6 @@ mod tests {
             &no_others(),
             0,
             100,
-            false,
         )
         .unwrap();
         assert_eq!(choice.dna, back_translate(&short));

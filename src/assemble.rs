@@ -219,7 +219,6 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
                 sample_names.len(),
                 bounded.contains(&cluster),
                 &contig_lengths,
-                params.quality == Quality::Strict,
             );
             let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
             if total >= 100 && (done == 1 || done == total || done % 250 == 0) {
@@ -424,22 +423,39 @@ const NEAR_COPY_IDENTITY: f64 = 0.90;
 /// is the one removed. Equal support keeps the earlier gene.
 fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -> HashSet<usize> {
     let proteins: Vec<Vec<u8>> = genes.iter().map(|gene| translate(&gene.reference_dna)).collect();
-    let mut postings: HashMap<[u8; 4], Vec<usize>> = HashMap::new();
+    // Five residues is specific enough to connect a fragment with its long
+    // copy. A tetrapeptide shared by dozens of unrelated genes is not.
+    let mut postings: HashMap<[u8; 5], Vec<usize>> = HashMap::new();
     let mut kmer_counts = vec![0u32; genes.len()];
     for (index, protein) in proteins.iter().enumerate() {
-        if protein.len() < 4 {
+        if protein.len() < 5 {
             continue;
         }
         let mut seen = HashSet::new();
-        for window in protein.windows(4) {
-            let key = [window[0], window[1], window[2], window[3]];
+        for window in protein.windows(5) {
+            let key = [window[0], window[1], window[2], window[3], window[4]];
             if seen.insert(key) {
                 postings.entry(key).or_default().push(index);
                 kmer_counts[index] += 1;
             }
         }
     }
-    postings.retain(|_, hits| hits.len() <= 64);
+    // A repeated family shares every k-mer, so the posting is large. Dropping
+    // it hid the long copy from every fragment. Keep the longest members,
+    // and the earliest index on a tie, which is the copy the others fold into.
+    for hits in postings.values_mut() {
+        if hits.len() <= 64 {
+            continue;
+        }
+        hits.sort_by(|&left, &right| {
+            proteins[right]
+                .len()
+                .cmp(&proteins[left].len())
+                .then(genes[right].samples_present.cmp(&genes[left].samples_present))
+                .then(left.cmp(&right))
+        });
+        hits.truncate(64);
+    }
     let mut order: Vec<usize> = (0..genes.len()).collect();
     order.sort_by(|&left, &right| proteins[left].len().cmp(&proteins[right].len()).then(left.cmp(&right)));
     let mut redundant = HashSet::new();
@@ -451,8 +467,8 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
         let mut scores: HashMap<usize, u32> = HashMap::new();
         let protein = &proteins[short];
         let mut seen = HashSet::new();
-        for window in protein.windows(4) {
-            let key = [window[0], window[1], window[2], window[3]];
+        for window in protein.windows(5) {
+            let key = [window[0], window[1], window[2], window[3], window[4]];
             if !seen.insert(key) {
                 continue;
             }
@@ -460,7 +476,7 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
                 continue;
             };
             for &long in hits {
-                if is_covered_by(short, long, &proteins, genes) {
+                if long != short && is_covered_by(short, long, &proteins, genes) {
                     *scores.entry(long).or_default() += 1;
                 }
             }
@@ -469,29 +485,62 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
             .into_iter()
             .filter(|&(_, score)| score * 2 >= needed)
             .collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        ranked.truncate(8);
-        let mut subset_parent: Option<usize> = None;
-        let mut exclusive_parents: Vec<usize> = Vec::new();
+        // Longest first, so a pile of equal copies cannot crowd the real parent
+        // out of the alignments.
+        ranked.sort_by(|a, b| {
+            proteins[b.0]
+                .len()
+                .cmp(&proteins[a.0].len())
+                .then(b.1.cmp(&a.1))
+                .then(a.0.cmp(&b.0))
+        });
+        ranked.truncate(16);
+        let mut longer_subset: Option<usize> = None;
+        let mut equal_subset: Option<usize> = None;
+        let mut longer_exclusive: Vec<usize> = Vec::new();
+        let mut equal_exclusive: Vec<usize> = Vec::new();
         for (long, _) in ranked {
+            if redundant.contains(&long) {
+                continue;
+            }
             let Some(fit) = fit_short_in_long(protein, &proteins[long]) else {
                 continue;
             };
             let nested = calls_nested(loci, &genes[short].id, &genes[long].id);
+            let longer = proteins[long].len() > protein.len();
             if presence_covered(&genes[short].presence, &genes[long].presence) {
-                if subset_parent.is_none() && covered_duplicate(&fit, proteins[long].len(), nested) {
-                    subset_parent = Some(long);
+                if !covered_duplicate(&fit, proteins[long].len(), nested) {
+                    continue;
+                }
+                if longer {
+                    longer_subset.get_or_insert(long);
+                } else {
+                    equal_subset.get_or_insert(long);
                 }
             } else if exclusive_allele(&fit, proteins[long].len()) {
-                exclusive_parents.push(long);
+                if longer {
+                    longer_exclusive.push(long);
+                } else {
+                    equal_exclusive.push(long);
+                }
             }
         }
-        let parent = if let Some(long) = subset_parent {
+        // One longer gene explains the fragment. Several longer copies of
+        // that same gene do too. Two longer genes that are not the same
+        // reference leave the fragment in place. Equal-length copies are
+        // one reference and fold even when several of them match.
+        let parent = if let Some(long) = longer_subset {
             Some(long)
-        } else if exclusive_parents.len() == 1 {
-            Some(exclusive_parents[0])
-        } else {
+        } else if let Some(long) = one_gene(&proteins, &longer_exclusive) {
+            Some(long)
+        } else if !longer_exclusive.is_empty() {
             None
+        } else if let Some(long) = equal_subset {
+            Some(long)
+        } else {
+            equal_exclusive.into_iter().min_by_key(|&index| {
+                (std::cmp::Reverse(genes[index].samples_present), index)
+            })
         };
         if let Some(long) = parent {
             if log::enabled() {
@@ -505,6 +554,27 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
         }
     }
     redundant
+}
+
+/// The longest of `parents` when every parent is that same reference.
+/// Two parents that fail the duplicate test are different genes.
+fn one_gene(proteins: &[Vec<u8>], parents: &[usize]) -> Option<usize> {
+    let best = parents.iter().copied().min_by_key(|&index| {
+        (std::cmp::Reverse(proteins[index].len()), index)
+    })?;
+    let same = parents.iter().copied().all(|other| {
+        if other == best {
+            return true;
+        }
+        let (shorter, longer) = if proteins[other].len() <= proteins[best].len() {
+            (other, best)
+        } else {
+            (best, other)
+        };
+        fit_short_in_long(&proteins[shorter], &proteins[longer])
+            .is_some_and(|fit| exclusive_allele(&fit, proteins[longer].len()))
+    });
+    same.then_some(best)
 }
 
 fn absorb_at(genes: &mut [Gene], long: usize, short: usize) {
@@ -524,13 +594,8 @@ fn absorb(keeper: &mut Gene, extra: &Gene) {
     if keeper.presence.len() != extra.presence.len() {
         return;
     }
-    // A near-full-length copy that is at least as common as the longer one is
-    // the sequence the match can cover. A fragment stays out of the reference.
-    let use_shorter = extra.reference_dna.len() < keeper.reference_dna.len()
-        && extra.reference_dna.len() * 10 >= keeper.reference_dna.len() * 9
-        && extra.samples_present >= keeper.samples_present;
-    let shorter = use_shorter.then(|| extra.reference_dna.clone());
-    let shorter_exact = extra.samples_with_exact_reference;
+    // Presence moves onto the keeper. Its sequence stays: the shorter allele
+    // fails coverage of a longer reference of the same gene.
     for index in 0..keeper.presence.len() {
         if extra.presence[index] && !keeper.presence[index] {
             keeper.presence[index] = true;
@@ -540,12 +605,6 @@ fn absorb(keeper: &mut Gene, extra: &Gene) {
                 keeper.lengths[index] = extra.lengths[index];
             }
         }
-    }
-    if let Some(dna) = shorter {
-        keeper.modal_end_bp = dna.len() as u32;
-        keeper.reference_dna = dna;
-        keeper.selection = "intact_modal_end";
-        keeper.samples_with_exact_reference = shorter_exact;
     }
     keeper.samples_present = keeper.presence.iter().filter(|&&present| present).count() as u32;
 }
@@ -677,7 +736,6 @@ fn compute_partial_gene(
     sample_count: usize,
     between_neighbors: bool,
     contig_lengths: &[Vec<usize>],
-    prefer_modal: bool,
 ) -> Option<PartialGene> {
     let alleles = alleles_of(indexes, calls, pools, contig_lengths, locus_ids);
     let joined = joined_allele(indexes, calls, pools, locus_ids);
@@ -693,7 +751,7 @@ fn compute_partial_gene(
             });
         }
     }
-    let choice = choose_reference(&with_join, reps, cluster, sample_count, prefer_modal)?;
+    let choice = choose_reference(&with_join, reps, cluster, sample_count)?;
     let mut presence = vec![false; sample_count];
     let mut lengths = vec![0u32; sample_count];
     let mut intervals: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::new();
@@ -1200,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_drops_a_covered_copy_and_keeps_a_private_allele_and_a_diverged_paralog() {
+    fn strict_folds_a_private_allele_and_keeps_a_diverged_paralog() {
         use crate::genetic_code::back_translate;
         use crate::synteny::LENGTH_SUFFICIENT;
         let long_aa = random_protein(80, 7);
@@ -1266,13 +1324,81 @@ mod tests {
         let mut genes = vec![long, piece, alone, near, copy, twin, paralog, close, deep, band];
         let loci = std::collections::HashMap::new();
         assert_eq!(super::apply_quality(&mut genes.clone(), Quality::High, &loci), 0);
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 7);
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 8);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
-        assert_eq!(ids, vec!["long", "alone", "paralog"]);
+        assert_eq!(ids, vec!["long", "paralog"]);
+        assert_eq!(genes[0].presence, vec![true, true, true]);
+        assert_eq!(genes[0].reference_dna, back_translate(&long_aa));
     }
 
     #[test]
-    fn strict_writes_the_more_common_shorter_length() {
+    fn strict_folds_a_repeated_family_and_keeps_a_fragment_of_two_genes() {
+        use crate::genetic_code::back_translate;
+        use crate::synteny::LENGTH_SUFFICIENT;
+        let long_aa = random_protein(80, 13);
+        let fragment = long_aa[..30].to_vec();
+        let mut long = labelled("long", true, LENGTH_SUFFICIENT);
+        long.reference_dna = back_translate(&long_aa);
+        let mut presence = vec![false; 71];
+        presence[0] = true;
+        long.presence = presence;
+        long.samples_present = 1;
+        let mut genes = vec![long];
+        for index in 1..71 {
+            let mut copy = labelled(&format!("copy{index}"), true, LENGTH_SUFFICIENT);
+            copy.reference_dna = back_translate(&fragment);
+            let mut where_present = vec![false; 71];
+            where_present[index] = true;
+            copy.presence = where_present;
+            copy.samples_present = 1;
+            genes.push(copy);
+        }
+        let loci = std::collections::HashMap::new();
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 70);
+        assert_eq!(genes.len(), 1);
+        assert_eq!(genes[0].id, "long");
+        assert_eq!(genes[0].samples_present, 71);
+        assert_eq!(genes[0].reference_dna, back_translate(&long_aa));
+
+        let mut other = long_aa.clone();
+        for site in 40..80 {
+            other[site] = if other[site] == b'A' { b'G' } else { b'A' };
+        }
+        let mut left = labelled("left", true, LENGTH_SUFFICIENT);
+        left.reference_dna = back_translate(&long_aa);
+        left.presence = vec![true, false, false];
+        left.samples_present = 1;
+        let mut right = labelled("right", true, LENGTH_SUFFICIENT);
+        right.reference_dna = back_translate(&other);
+        right.presence = vec![false, true, false];
+        right.samples_present = 1;
+        let mut shared = labelled("shared", true, LENGTH_SUFFICIENT);
+        shared.reference_dna = back_translate(&fragment);
+        shared.presence = vec![false, false, true];
+        shared.samples_present = 1;
+        let mut ambiguous = vec![left, right, shared];
+        assert_eq!(super::apply_quality(&mut ambiguous, Quality::Strict, &loci), 0);
+        let ids: Vec<_> = ambiguous.iter().map(|gene| gene.id.as_str()).collect();
+        assert_eq!(ids, vec!["left", "right", "shared"]);
+
+        let mut same = Vec::new();
+        for index in 0..5 {
+            let mut gene = labelled(&format!("same{index}"), true, LENGTH_SUFFICIENT);
+            gene.reference_dna = back_translate(&long_aa);
+            let mut where_present = vec![false; 5];
+            where_present[index] = true;
+            gene.presence = where_present;
+            gene.samples_present = 1;
+            same.push(gene);
+        }
+        assert_eq!(super::apply_quality(&mut same, Quality::Strict, &loci), 4);
+        assert_eq!(same[0].id, "same0");
+        assert_eq!(same[0].samples_present, 5);
+        assert_eq!(same[0].reference_dna, back_translate(&long_aa));
+    }
+
+    #[test]
+    fn strict_folds_the_shorter_allele_and_keeps_the_longer_sequence() {
         use crate::genetic_code::back_translate;
         use crate::synteny::LENGTH_SUFFICIENT;
         let long_aa = random_protein(80, 9);
@@ -1291,9 +1417,9 @@ mod tests {
         let loci = std::collections::HashMap::new();
         assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 1);
         assert_eq!(genes[0].id, "long");
-        assert_eq!(genes[0].reference_dna, back_translate(&short_aa));
+        assert_eq!(genes[0].reference_dna, back_translate(&long_aa));
         assert_eq!(genes[0].presence, vec![true, true, true]);
-        assert_eq!(genes[0].selection, "intact_modal_end");
+        assert_eq!(genes[0].selection, "intact_longest");
     }
 
     #[test]
