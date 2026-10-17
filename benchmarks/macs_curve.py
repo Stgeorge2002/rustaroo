@@ -27,7 +27,9 @@ import sys
 import time
 
 
-PARTIAL_SIZES = (50, 150, 300, 800)
+CURVE_STEPS = 20
+CURVE_START = 1
+CURVE_STOP = 1500
 MIN_IDENTITY = 70.0
 MIN_COVERAGE = 90.0
 EVALUE = "1e-10"
@@ -77,38 +79,72 @@ def gff_paths(directory):
     return sorted(files, key=lambda path: path.name)
 
 
-def split_cohorts(names, sizes=PARTIAL_SIZES, seed=1729):
-    """Shuffle once, then cut non-overlapping cohorts. The full list is last."""
+def curve_sizes(steps=CURVE_STEPS, start=CURVE_START, stop=CURVE_STOP):
+    """`steps` sizes from `start` to `stop`. Growth is exponential, so most steps are small."""
+    if steps < 2 or start < 1 or stop < start:
+        raise ValueError("The curve needs at least two increasing sizes")
+    log_start = math.log(start)
+    log_stop = math.log(stop)
+    sizes = []
+    for index in range(steps):
+        grown = math.exp(log_start + (log_stop - log_start) * index / float(steps - 1))
+        size = int(round(grown))
+        if sizes and size <= sizes[-1]:
+            size = sizes[-1] + 1
+        sizes.append(size)
+    if sizes[-1] != stop:
+        sizes[-1] = stop
+    if sizes[-1] <= sizes[-2]:
+        raise ValueError("The curve ends are too close for {0} steps".format(steps))
+    return tuple(sizes)
+
+
+def split_cohorts(names, sizes=None, seed=1729):
+    """Shuffle once. Small cohorts take unused genomes. A size that no longer fits reuses them."""
+    if sizes is None:
+        sizes = curve_sizes()
     ordered = tuple(sorted(names))
-    if any(size < 1 for size in sizes):
-        raise ValueError("Cohort sizes must be positive")
-    needed = sum(sizes)
-    if needed > len(ordered):
-        raise ValueError(
-            "Disjoint cohorts need {0} assemblies; the input has {1}".format(needed, len(ordered))
-        )
+    limit = len(ordered)
+    if limit < 1:
+        raise ValueError("No assemblies to split")
+    resolved = []
+    seen_size = set()
+    for size in sizes:
+        if size < 1:
+            raise ValueError("Cohort sizes must be positive")
+        capped = size if size <= limit else limit
+        if capped in seen_size:
+            continue
+        seen_size.add(capped)
+        resolved.append(capped)
     draw = list(ordered)
     random.Random(seed).shuffle(draw)
     cohorts = []
-    seen = set()
     cursor = 0
-    for size in sizes:
-        group = tuple(draw[cursor:cursor + size])
-        cursor += size
-        if len(group) != size or seen.intersection(group):
-            raise RuntimeError("Disjoint split failed")
-        seen.update(group)
-        cohorts.append({"n": size, "disjoint": True, "files": group})
-    cohorts.append({"n": len(ordered), "disjoint": False, "files": ordered})
+    for size in resolved:
+        if cursor + size <= limit:
+            group = tuple(draw[cursor:cursor + size])
+            cursor += size
+            disjoint = True
+        else:
+            group = tuple(draw[:size])
+            disjoint = False
+        if len(group) != size:
+            raise RuntimeError("Cohort split failed")
+        cohorts.append({"n": size, "disjoint": disjoint, "files": group})
     return cohorts
 
 
-def choose_cohorts(cohorts, only):
-    """`only` is a sample count or ``full``. ``None`` keeps every cohort."""
+def choose_cohorts(cohorts, only=None, task=None):
+    """`only` is a sample count or ``full``. ``task`` is one curve step."""
+    if task is not None:
+        if task < 0 or task >= len(cohorts):
+            raise SystemExit("array task {0} has no cohort".format(task))
+        return [cohorts[task]]
     if only is None:
         return cohorts
     if only == "full":
-        chosen = [cohort for cohort in cohorts if not cohort["disjoint"]]
+        chosen = [max(cohorts, key=lambda cohort: cohort["n"])]
     else:
         try:
             size = int(only)
@@ -507,8 +543,15 @@ def plot(path, title, ylabel, series):
             '<line x1="{0}" y1="{1:.1f}" x2="{2}" y2="{1:.1f}" stroke="#ddd"/>'.format(left, yy, left + width)
         )
         lines.append('<text x="82" y="{0:.1f}" text-anchor="end">{1:.3g}</text>'.format(yy + 4, value))
+    labeled_at = None
     for n in sizes:
-        lines.append('<text x="{0:.1f}" y="377" text-anchor="middle">{1}</text>'.format(x_of(n), n))
+        x = x_of(n)
+        if labeled_at is not None and x - labeled_at < 46 and n != sizes[-1]:
+            continue
+        if labeled_at is not None and x - labeled_at < 46:
+            lines.pop()
+        lines.append('<text x="{0:.1f}" y="377" text-anchor="middle">{1}</text>'.format(x, n))
+        labeled_at = x
     lines.append('<text x="420" y="396" text-anchor="middle">Assemblies</text>')
     for index, name in enumerate(present):
         points = present[name]
@@ -566,6 +609,7 @@ def parse_args(argv):
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--quality", default="standard", choices=("standard", "high", "strict"))
     parser.add_argument("--n", default=None, help="one sample count, or full, on this node")
+    parser.add_argument("--task", type=int, default=None, help="one curve step, counting from 0")
     return parser.parse_args(argv)
 
 
@@ -581,7 +625,9 @@ def main(argv):
     if not args.rustroo.is_file() or not args.panaroo_sif.is_file():
         raise SystemExit("rustroo binary or Panaroo image is missing")
     names = [path.name for path in gff_paths(args.input)]
-    cohorts = choose_cohorts(split_cohorts(names, PARTIAL_SIZES, args.seed), args.n)
+    cohorts = choose_cohorts(
+        split_cohorts(names, curve_sizes(), args.seed), args.n, args.task,
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     manifest = "run.json" if args.n is None else "run.{0}.json".format(args.n)
     save_json(args.output / manifest, {
@@ -590,7 +636,7 @@ def main(argv):
         "quality": args.quality,
         "slurm_cpus": slurm_cpus,
         "slurm_mem_mb": os.environ.get("SLURM_MEM_PER_NODE"),
-        "partial_sizes": list(PARTIAL_SIZES),
+        "partial_sizes": [cohort["n"] for cohort in cohorts],
         "full_n": len(names),
         "identity_pct": MIN_IDENTITY,
         "coverage_pct": MIN_COVERAGE,

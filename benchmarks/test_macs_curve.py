@@ -8,38 +8,55 @@ import macs_curve
 
 
 class SplitTests(unittest.TestCase):
-    def test_partial_cohorts_are_disjoint_and_the_full_set_is_everyone(self) -> None:
-        names = [f"s{i:04d}.gff3" for i in range(1400)]
+    def test_twenty_sizes_run_from_one_to_the_stop(self) -> None:
+        sizes = macs_curve.curve_sizes()
+        self.assertEqual(len(sizes), 20)
+        self.assertEqual(sizes[0], 1)
+        self.assertEqual(sizes[-1], 1500)
+        self.assertEqual(sizes, tuple(sorted(set(sizes))))
+        self.assertGreater(
+            sum(1 for size in sizes if size <= 500),
+            sum(1 for size in sizes if size > 500),
+        )
+
+    def test_small_cohorts_are_disjoint_and_the_large_ones_reuse_genomes(self) -> None:
+        names = [f"s{i:04d}.gff3" for i in range(1514)]
         first = macs_curve.split_cohorts(names, seed=1729)
         again = macs_curve.split_cohorts(names, seed=1729)
+        self.assertEqual(len(first), 20)
         partials = [cohort for cohort in first if cohort["disjoint"]]
-        self.assertEqual([cohort["n"] for cohort in partials], [50, 150, 300, 800])
+        self.assertGreaterEqual(len(partials), 5)
         seen = [name for cohort in partials for name in cohort["files"]]
         self.assertEqual(len(seen), len(set(seen)))
         self.assertEqual(sum(cohort["n"] for cohort in partials), len(seen))
-        full = first[-1]
-        self.assertFalse(full["disjoint"])
-        self.assertEqual(full["n"], 1400)
-        self.assertEqual(set(full["files"]), set(names))
+        self.assertLessEqual(len(seen), len(names))
+        largest = first[-1]
+        self.assertFalse(largest["disjoint"])
+        self.assertEqual(largest["n"], 1500)
+        self.assertEqual(len(largest["files"]), 1500)
         self.assertEqual(
             [cohort["files"] for cohort in first],
             [cohort["files"] for cohort in again],
         )
 
     def test_one_node_keeps_the_same_cohort_as_the_full_split(self) -> None:
-        names = [f"s{i:04d}.gff3" for i in range(1400)]
+        names = [f"s{i:04d}.gff3" for i in range(1514)]
         cohorts = macs_curve.split_cohorts(names, seed=1729)
-        one = macs_curve.choose_cohorts(cohorts, "300")
-        self.assertEqual([cohort["n"] for cohort in one], [300])
-        self.assertEqual(one[0]["files"], next(cohort["files"] for cohort in cohorts if cohort["n"] == 300))
+        one = macs_curve.choose_cohorts(cohorts, task=0)
+        self.assertEqual(one[0]["n"], 1)
+        self.assertEqual(one[0]["files"], cohorts[0]["files"])
         full = macs_curve.choose_cohorts(cohorts, "full")
-        self.assertEqual(full[0]["n"], 1400)
+        self.assertEqual(full[0]["n"], 1500)
         self.assertFalse(full[0]["disjoint"])
         self.assertEqual(macs_curve.choose_cohorts(cohorts, None), cohorts)
 
-    def test_too_few_assemblies_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            macs_curve.split_cohorts(["a.gff3"] * 100)
+    def test_a_short_collection_caps_the_large_steps(self) -> None:
+        cohorts = macs_curve.split_cohorts([f"s{i:04d}.gff3" for i in range(100)], seed=1)
+        self.assertEqual(cohorts[-1]["n"], 100)
+        self.assertFalse(cohorts[-1]["disjoint"])
+        disjoint = [cohort for cohort in cohorts if cohort["disjoint"]]
+        seen = [name for cohort in disjoint for name in cohort["files"]]
+        self.assertEqual(len(seen), len(set(seen)))
 
 
 class CaptureTests(unittest.TestCase):

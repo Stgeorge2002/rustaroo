@@ -1,8 +1,8 @@
 #!/bin/bash
 # One node. Rustroo finishes, then Panaroo starts, so each tool gets
 # all 32 CPUs and the whole 64 GB. Running them together would split both.
-# Submit with --array=0-4 to put each sample size on its own node.
-# 24 hours is the site task cap; the 800- and full-set Panaroo runs are the long ones.
+# Submit with --array=0-19. Sizes grow exponentially from 1 to 1500.
+# 24 hours is the site task cap; the large Panaroo runs are the long ones.
 #SBATCH --account=brics.b36ad
 #SBATCH --partition=genoa
 #SBATCH --qos=normal
@@ -27,15 +27,11 @@ THREADS="${SLURM_CPUS_PER_TASK:?Submit with --cpus-per-task}"
 QUALITY="${RUSTROO_QUALITY:-standard}"
 # An array task is one sample size. Rustroo and Panaroo still share that node,
 # one after the other, so each keeps all of its CPUs and memory.
+TASK=""
+N=""
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    case "$SLURM_ARRAY_TASK_ID" in
-        0) N=50 ;;
-        1) N=150 ;;
-        2) N=300 ;;
-        3) N=800 ;;
-        4) N=full ;;
-        *) echo "array task ${SLURM_ARRAY_TASK_ID} has no sample size" >&2; exit 1 ;;
-    esac
+    TASK="$SLURM_ARRAY_TASK_ID"
+    N="task"
 else
     N="${RUSTROO_N:-}"
 fi
@@ -86,7 +82,9 @@ args=(
     --quality "$QUALITY"
     --seed 1729
 )
-if [[ -n "$N" ]]; then
+if [[ -n "$TASK" ]]; then
+    args+=(--task "$TASK")
+elif [[ -n "$N" ]]; then
     args+=(--n "$N")
 fi
 "${args[@]}"
