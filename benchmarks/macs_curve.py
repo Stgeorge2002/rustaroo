@@ -41,7 +41,9 @@ BLAST_FORMAT = (
 
 
 def save_json(path, value):
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    # Each writer uses its own temporary file. Twenty array tasks share this
+    # directory, and one shared name makes replace lose the source.
+    temporary = path.with_name("{0}.{1}.tmp".format(path.name, os.getpid()))
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
 
@@ -63,10 +65,12 @@ def write_tsv(path, rows):
             if key not in seen:
                 seen.add(key)
                 fields.append(key)
-    with path.open("w", newline="") as handle:
+    temporary = path.with_name("{0}.{1}.tmp".format(path.name, os.getpid()))
+    with temporary.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
         writer.writeheader()
         writer.writerows(rows)
+    temporary.replace(path)
 
 
 def gff_paths(directory):
@@ -335,6 +339,11 @@ def panaroo_argv(sif, gffs, cohort_dir, threads, input_root):
     # panaroo/ inside it; binding that subdirectory first would require it
     # to exist before Panaroo is allowed to create it.
     inside = ["/inputs/{0}".format(path.name) for path in gffs]
+    # One argument is read as a list of paths, not as a GFF. A real GFF then
+    # fails with an empty extension. Hand Panaroo a one-line list instead.
+    if len(inside) == 1:
+        (cohort_dir / "panaroo_inputs.txt").write_text("{0}\n".format(inside[0]))
+        inside = ["/cohort/panaroo_inputs.txt"]
     return [
         "apptainer", "exec", "--cleanenv", "--no-home",
         "--bind", "{0}:/inputs:ro".format(input_root),
@@ -563,7 +572,9 @@ def plot(path, title, ylabel, series):
             lines.append('<circle cx="{0:.1f}" cy="{1:.1f}" r="4" fill="{2}"/>'.format(x_of(n), y_of(value), color))
         lines.append('<text x="770" y="{0}" fill="{1}">{2}</text>'.format(80 + index * 22, color, _xml(name)))
     lines.append("</g></svg>\n")
-    path.write_text("\n".join(lines))
+    temporary = path.with_name("{0}.{1}.tmp".format(path.name, os.getpid()))
+    temporary.write_text("\n".join(lines))
+    temporary.replace(path)
 
 
 def _xml(text):
@@ -629,7 +640,12 @@ def main(argv):
         split_cohorts(names, curve_sizes(), args.seed), args.n, args.task,
     )
     args.output.mkdir(parents=True, exist_ok=True)
-    manifest = "run.json" if args.n is None else "run.{0}.json".format(args.n)
+    if args.task is not None:
+        manifest = "run.task{0}.json".format(args.task)
+    elif args.n is None:
+        manifest = "run.json"
+    else:
+        manifest = "run.{0}.json".format(args.n)
     save_json(args.output / manifest, {
         "seed": args.seed,
         "threads": args.threads,

@@ -84,6 +84,14 @@ class CaptureTests(unittest.TestCase):
         self.assertNotIn("--quiet", pan)
         self.assertIn("OMP_NUM_THREADS=32", pan)
 
+    def test_one_genome_is_a_panaroo_list_rather_than_one_gff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cohort = Path(temporary)
+            argv = macs_curve.panaroo_argv(Path("pan.sif"), [Path("sample.gff")], cohort, 4, Path("gffs"))
+            self.assertEqual((cohort / "panaroo_inputs.txt").read_text(), "/inputs/sample.gff\n")
+            self.assertIn("/cohort/panaroo_inputs.txt", argv)
+            self.assertNotIn("/inputs/sample.gff", argv)
+
     def test_curve_diagram_uses_finished_points(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
