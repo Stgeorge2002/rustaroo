@@ -359,11 +359,11 @@ fn quality_label(quality: Quality) -> &'static str {
 /// `high` removes a family with no intact copy, and a short family the
 /// collection does not support by frequency or by neighboring genes.
 /// `strict` then removes a second reference of a gene already kept. A nested
-/// or deep fragment can match at 80% identity, a shorter piece at 85%, and a
-/// copy at 90%. The same allele in other genomes is folded into the longer
-/// gene so those genomes stay present. A gene with two finished lengths uses
-/// the length shared by more genomes, so both references can cover each other.
-/// A paralogue below 90% identity at nearly the same length stays.
+/// or deep fragment, or any shorter piece, can match at 80% identity, and a
+/// copy at 90%. A repeat offset does not keep the second copy. The same allele
+/// in other genomes is folded into the longer gene so those genomes stay
+/// present. The reference stays the longer finished allele. A paralogue below
+/// 90% identity at nearly the same length stays.
 fn apply_quality(
     genes: &mut Vec<Gene>,
     quality: Quality,
@@ -411,8 +411,9 @@ const NESTED_PIECE_IDENTITY: f64 = 0.80;
 /// A fragment this close, covering less than 90% of the longer protein, is
 /// the same peptide.
 const DEEP_PIECE_IDENTITY: f64 = 0.80;
-/// A piece covering less than 98% of the longer protein.
-const PIECE_IDENTITY: f64 = 0.85;
+/// A piece covering less than 98% of the longer protein. Same floor as a
+/// deep fragment. A paralogue below 90% identity at nearly full length stays.
+const PIECE_IDENTITY: f64 = 0.80;
 /// Minimum fraction of the shorter protein that must align.
 const COVERED: f64 = 0.90;
 /// A second copy this close is the same gene, including at full length.
@@ -444,7 +445,7 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
     // it hid the long copy from every fragment. Keep the longest members,
     // and the earliest index on a tie, which is the copy the others fold into.
     for hits in postings.values_mut() {
-        if hits.len() <= 64 {
+        if hits.len() <= 256 {
             continue;
         }
         hits.sort_by(|&left, &right| {
@@ -454,7 +455,7 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
                 .then(genes[right].samples_present.cmp(&genes[left].samples_present))
                 .then(left.cmp(&right))
         });
-        hits.truncate(64);
+        hits.truncate(256);
     }
     let mut order: Vec<usize> = (0..genes.len()).collect();
     order.sort_by(|&left, &right| proteins[left].len().cmp(&proteins[right].len()).then(left.cmp(&right)));
@@ -481,9 +482,11 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
                 }
             }
         }
+        // One mismatch wipes five 5-mers, so an 80% piece keeps only a small
+        // share of them. The alignment, not this count, decides the fold.
         let mut ranked: Vec<(usize, u32)> = scores
             .into_iter()
-            .filter(|&(_, score)| score * 2 >= needed)
+            .filter(|&(_, score)| score * 10 >= needed)
             .collect();
         // Longest first, so a pile of equal copies cannot crowd the real parent
         // out of the alignments.
@@ -494,7 +497,7 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
                 .then(b.1.cmp(&a.1))
                 .then(a.0.cmp(&b.0))
         });
-        ranked.truncate(16);
+        ranked.truncate(32);
         let mut longer_subset: Option<usize> = None;
         let mut equal_subset: Option<usize> = None;
         let mut longer_exclusive: Vec<usize> = Vec::new();
@@ -655,9 +658,11 @@ fn calls_nested(loci: &HashMap<String, Vec<Locus>>, short_id: &str, long_id: &st
 }
 
 fn covered_duplicate(fit: &crate::align::Fit, long_len: usize, nested: Option<bool>) -> bool {
-    if fit.coverage + f64::EPSILON < COVERED || fit.internal_gap > 5 {
+    if fit.coverage + f64::EPSILON < COVERED {
         return false;
     }
+    // A second diagonal is a repeat of the same peptide, not a second gene,
+    // once this diagonal already covers the shorter protein.
     let span = fit.long_end.saturating_sub(fit.long_start);
     let deep = span * 10 < long_len * 9;
     let piece = span * 50 < long_len * 49;
@@ -673,7 +678,7 @@ fn covered_duplicate(fit: &crate::align::Fit, long_len: usize, nested: Option<bo
 /// Same gene in genomes the longer copy does not already cover. A near-full
 /// paralogue below 90% identity is not an allele split.
 fn exclusive_allele(fit: &crate::align::Fit, long_len: usize) -> bool {
-    if fit.coverage + f64::EPSILON < COVERED || fit.internal_gap > 5 {
+    if fit.coverage + f64::EPSILON < COVERED {
         return false;
     }
     let span = fit.long_end.saturating_sub(fit.long_start);
@@ -1324,10 +1329,61 @@ mod tests {
         let mut genes = vec![long, piece, alone, near, copy, twin, paralog, close, deep, band];
         let loci = std::collections::HashMap::new();
         assert_eq!(super::apply_quality(&mut genes.clone(), Quality::High, &loci), 0);
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 8);
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 7);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
-        assert_eq!(ids, vec!["long", "paralog"]);
-        assert_eq!(genes[0].presence, vec![true, true, true]);
+        // `alone` is an exact piece of `long` and also of the diverged paralogue,
+        // so it is not assigned to either gene.
+        assert_eq!(ids, vec!["long", "alone", "paralog"]);
+        assert_eq!(genes[0].presence, vec![true, true, false]);
+        assert_eq!(genes[0].reference_dna, back_translate(&long_aa));
+    }
+
+    #[test]
+    fn strict_folds_a_diverged_piece_and_a_repeat_and_keeps_a_full_paralog() {
+        use crate::genetic_code::back_translate;
+        use crate::synteny::LENGTH_SUFFICIENT;
+        let long_aa = random_protein(100, 21);
+        let mut piece_aa = long_aa[..95].to_vec();
+        for site in [0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60, 66, 72, 78, 84, 90] {
+            piece_aa[site] = if piece_aa[site] == b'A' { b'L' } else { b'A' };
+        }
+        let mut paralog_aa = long_aa.clone();
+        for site in [4, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92] {
+            paralog_aa[site] = if paralog_aa[site] == b'A' { b'L' } else { b'A' };
+        }
+        let head = long_aa[..40].to_vec();
+        let tail = long_aa[60..].to_vec();
+        let mut split_aa = head.clone();
+        split_aa.extend_from_slice(&tail);
+        let mut inserted = head.clone();
+        inserted.extend(std::iter::repeat(b'W').take(20));
+        inserted.extend_from_slice(&tail);
+        let mut long = labelled("long", true, LENGTH_SUFFICIENT);
+        long.reference_dna = back_translate(&long_aa);
+        long.presence = vec![true, false, false, false];
+        long.samples_present = 1;
+        let mut piece = labelled("piece", true, LENGTH_SUFFICIENT);
+        piece.reference_dna = back_translate(&piece_aa);
+        piece.presence = vec![false, true, false, false];
+        piece.samples_present = 1;
+        let mut paralog = labelled("paralog", true, LENGTH_SUFFICIENT);
+        paralog.reference_dna = back_translate(&paralog_aa);
+        paralog.presence = vec![true, true, false, false];
+        paralog.samples_present = 2;
+        let mut host = labelled("host", true, LENGTH_SUFFICIENT);
+        host.reference_dna = back_translate(&inserted);
+        host.presence = vec![false, false, true, false];
+        host.samples_present = 1;
+        let mut split = labelled("split", true, LENGTH_SUFFICIENT);
+        split.reference_dna = back_translate(&split_aa);
+        split.presence = vec![false, false, false, true];
+        split.samples_present = 1;
+        let mut genes = vec![long, piece, paralog, host, split];
+        let loci = std::collections::HashMap::new();
+        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 1);
+        let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
+        assert_eq!(ids, vec!["long", "paralog", "host", "split"]);
+        assert_eq!(genes[0].presence, vec![true, true, false, false]);
         assert_eq!(genes[0].reference_dna, back_translate(&long_aa));
     }
 

@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 /// a family with no intact copy, and a short family that is rare and not
 /// between neighboring genes. `strict` also drops a second reference that is
 /// already the same gene: a nested or deep fragment down to 80% identity, a
-/// shorter piece down to 85%, a copy at 90% identity, or the same allele in
+/// shorter piece down to 80%, a copy at 90% identity, or the same allele in
 /// other genomes, which is folded into the longer gene. Repeated copies of
 /// one gene fold even when they match each other. A fragment that matches two
 /// different longer genes stays, and so does a paralogue below 90% identity
