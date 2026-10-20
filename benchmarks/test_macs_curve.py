@@ -47,6 +47,22 @@ class SplitTests(unittest.TestCase):
         self.assertEqual(one[0]["files"], cohorts[0]["files"])
         full = macs_curve.choose_cohorts(cohorts, "full")
         self.assertEqual(full[0]["n"], 1500)
+        self.assertEqual(macs_curve.MAX_QUEUED, 16)
+        first = [
+            cohorts[macs_curve.curve_index_for_array_task(array_task)]["n"]
+            for array_task in range(macs_curve.MAX_QUEUED)
+        ]
+        self.assertEqual(first, list(reversed(macs_curve.curve_sizes()[-macs_curve.MAX_QUEUED:])))
+        self.assertEqual(first[0], 1500)
+        self.assertEqual(cohorts[macs_curve.curve_index_for_array_task(16)]["n"], 4)
+        self.assertEqual(cohorts[macs_curve.curve_index_for_array_task(18)]["n"], 2)
+        with self.assertRaises(SystemExit):
+            macs_curve.curve_index_for_array_task(19)
+        script = Path(__file__).resolve().parents[1] / "containers" / "macs_monocle.sbatch"
+        self.assertIn(
+            "#SBATCH --array=0-{0}".format(macs_curve.MAX_QUEUED - 1),
+            script.read_text(),
+        )
         self.assertFalse(full[0]["disjoint"])
         self.assertEqual(macs_curve.choose_cohorts(cohorts, None), cohorts)
 

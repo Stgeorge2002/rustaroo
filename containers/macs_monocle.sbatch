@@ -1,8 +1,13 @@
 #!/bin/bash
 # One node. Rustroo finishes, then Panaroo starts, so each tool gets
 # all 32 CPUs and the whole 64 GB. Running them together would split both.
-# Submit with --array=0-19. Sizes grow exponentially from 1 to 1500.
+# The account allows 16 queued jobs. This file submits that many.
+# Array task 0 is the largest cohort. Tasks 0-15 are the first batch.
+# After those have left the queue, submit the three smallest with
+# --array=16-18. n=1 is not scheduled. Do not pass --array for the first batch:
+# a command-line array replaces this one.
 # 24 hours is the site task cap; the large Panaroo runs are the long ones.
+#SBATCH --array=0-15
 #SBATCH --account=brics.b36ad
 #SBATCH --partition=genoa
 #SBATCH --qos=normal
@@ -83,7 +88,7 @@ args=(
     --seed 1729
 )
 if [[ -n "$TASK" ]]; then
-    args+=(--task "$TASK")
+    args+=(--array-task "$TASK")
 elif [[ -n "$N" ]]; then
     args+=(--n "$N")
 fi
