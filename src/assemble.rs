@@ -276,7 +276,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             strand: call.strand,
         });
     }
-    let mut removed = apply_quality(&mut genes, params.quality, &loci);
+    let removed = apply_quality(&mut genes, params.quality, &loci);
     let cluster_of_gene: HashMap<String, u32> = name_of_cluster
         .iter()
         .map(|(&cluster, id)| (id.clone(), cluster))
@@ -287,9 +287,6 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
         &cluster_facts(&calls, &pools),
         sample_names.len(),
     );
-    if params.quality == Quality::Strict {
-        removed += drop_unsupported(&mut genes);
-    }
     if params.quality != Quality::Standard {
         progress!(
             "rustroo: quality {label} removed {removed} genes",
@@ -417,7 +414,7 @@ fn quality_label(quality: Quality) -> &'static str {
 /// in other genomes is folded into the longer gene so those genomes stay
 /// present. The reference stays the longer finished allele. A paralogue below
 /// 90% identity at nearly the same length stays. Support labels are applied
-/// afterwards. `strict` then drops only `unsupported`.
+/// afterwards and every labelled gene is kept.
 fn apply_quality(
     genes: &mut Vec<Gene>,
     quality: Quality,
@@ -497,21 +494,6 @@ fn assign_support(
         };
         gene.support = support_label(gene.samples_present, n_samples, annotated, neighbors_agree);
     }
-}
-
-fn drop_unsupported(genes: &mut Vec<Gene>) -> usize {
-    let before = genes.len();
-    genes.retain(|gene| {
-        let reject = gene.support == SUPPORT_UNSUPPORTED;
-        if reject && log::enabled() {
-            log::record(&format!(
-                "quality\tstrict\tdrop\t{}\tsupport\t{SUPPORT_UNSUPPORTED}",
-                gene.id,
-            ));
-        }
-        !reject
-    });
-    before - genes.len()
 }
 
 struct Locus {
@@ -1291,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_drops_only_an_unsupported_gene() {
+    fn strict_keeps_an_unsupported_gene() {
         let left = random_protein(90, 1);
         let middle = random_protein(90, 2);
         let right = random_protein(90, 3);
@@ -1356,10 +1338,10 @@ mod tests {
         let mut strict = params();
         strict.quality = Quality::Strict;
         let strict = build(inputs, &strict).unwrap();
-        assert_eq!(labelled(&strict.genes, "wander"), None);
+        assert_eq!(labelled(&strict.genes, "wander"), Some(SUPPORT_UNSUPPORTED));
         assert_eq!(labelled(&strict.genes, "middle"), Some(SUPPORT_CORE));
         assert_eq!(labelled(&strict.genes, "private"), Some(SUPPORT_ACCESSORY));
-        assert_eq!(strict.genes.len() + 1, standard.genes.len());
+        assert_eq!(strict.genes.len(), standard.genes.len());
     }
 
     #[test]
