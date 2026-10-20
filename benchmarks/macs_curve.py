@@ -30,9 +30,6 @@ import time
 CURVE_STEPS = 20
 CURVE_START = 1
 CURVE_STOP = 1500
-# The account rejects more than this many pending jobs. The first submission
-# is this many array tasks, and those tasks are the largest cohorts.
-MAX_QUEUED = 16
 MIN_IDENTITY = 70.0
 MIN_COVERAGE = 90.0
 EVALUE = "1e-10"
@@ -140,16 +137,6 @@ def split_cohorts(names, sizes=None, seed=1729):
             raise RuntimeError("Cohort split failed")
         cohorts.append({"n": size, "disjoint": disjoint, "files": group})
     return cohorts
-
-
-def curve_index_for_array_task(array_task, steps=CURVE_STEPS):
-    """Array task 0 is the largest cohort. The one-genome step is not scheduled."""
-    if array_task < 0:
-        raise SystemExit("array task must be >= 0")
-    index = steps - 1 - array_task
-    if index < 1 or index >= steps:
-        raise SystemExit("array task {0} is outside the scheduled curve".format(array_task))
-    return index
 
 
 def choose_cohorts(cohorts, only=None, task=None):
@@ -634,10 +621,6 @@ def parse_args(argv):
     parser.add_argument("--quality", default="standard", choices=("standard", "high", "strict"))
     parser.add_argument("--n", default=None, help="one sample count, or full, on this node")
     parser.add_argument("--task", type=int, default=None, help="one curve step, counting from 0")
-    parser.add_argument(
-        "--array-task", type=int, default=None,
-        help="Slurm array id; 0 is the largest cohort, and ids below {0} are the first batch".format(MAX_QUEUED),
-    )
     return parser.parse_args(argv)
 
 
@@ -652,18 +635,13 @@ def main(argv):
         )
     if not args.rustroo.is_file() or not args.panaroo_sif.is_file():
         raise SystemExit("rustroo binary or Panaroo image is missing")
-    if args.array_task is not None and args.task is not None:
-        raise SystemExit("pass only one of --task and --array-task")
-    task = args.task
-    if args.array_task is not None:
-        task = curve_index_for_array_task(args.array_task)
     names = [path.name for path in gff_paths(args.input)]
     cohorts = choose_cohorts(
-        split_cohorts(names, curve_sizes(), args.seed), args.n, task,
+        split_cohorts(names, curve_sizes(), args.seed), args.n, args.task,
     )
     args.output.mkdir(parents=True, exist_ok=True)
-    if task is not None:
-        manifest = "run.task{0}.json".format(task)
+    if args.task is not None:
+        manifest = "run.task{0}.json".format(args.task)
     elif args.n is None:
         manifest = "run.json"
     else:
