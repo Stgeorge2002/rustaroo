@@ -6,7 +6,10 @@ use clap::{Args, Parser, Subcommand};
 use rayon::prelude::*;
 
 use rustroo::log;
-use rustroo::{build, is_gff, parse_gff_file, validate, write_pangenome, Error, Params, Quality, Result, TreeMode, ValidationOptions};
+use rustroo::{
+    build, is_gff, parse_gff_file, validate, write_pangenome, Error, Params, Quality, Result,
+    TreeMode, ValidationOptions,
+};
 
 #[derive(Parser)]
 #[command(
@@ -57,7 +60,8 @@ struct Cli {
     audit_members: bool,
 
     /// `high` drops a gene with no intact copy and an unconfirmed short gene.
-    /// `strict` drops a duplicate reference already represented by another gene.
+    /// `strict` also drops a duplicate reference, and a rare gene whose
+    /// neighbors do not agree. Core, accessory, and refound genes stay.
     #[arg(long, value_enum, default_value = "standard")]
     quality: Quality,
 }
@@ -194,18 +198,28 @@ fn cpu_seconds_from_stat(text: &str, ticks_per_second: f64) -> Option<f64> {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Some(Command::Validate(args)) = cli.command {
-        let summary = validate(&args.input, &args.output_dir, &ValidationOptions {
-            threads: args.threads, tree_mode: args.tree_mode,
-            bootstrap_replicates: args.bootstrap_replicates, max_tree_alleles: args.max_tree_alleles,
-            max_alignment_cells: args.max_alignment_cells, min_tree_sites: args.min_tree_sites,
-        })?;
+        let summary = validate(
+            &args.input,
+            &args.output_dir,
+            &ValidationOptions {
+                threads: args.threads,
+                tree_mode: args.tree_mode,
+                bootstrap_replicates: args.bootstrap_replicates,
+                max_tree_alleles: args.max_tree_alleles,
+                max_alignment_cells: args.max_alignment_cells,
+                min_tree_sites: args.min_tree_sites,
+            },
+        )?;
         println!("validated_families\t{}", summary.families);
         println!("unassessed_alignments\t{}", summary.unassessed_alignments);
         println!("diagnostic_trees\t{}", summary.trees_written);
         println!("validation\t{}", args.output_dir.display());
         return Ok(());
     }
-    let output_dir = cli.output_dir.as_deref().ok_or_else(|| Error::new("missing output directory"))?;
+    let output_dir = cli
+        .output_dir
+        .as_deref()
+        .ok_or_else(|| Error::new("missing output directory"))?;
     let params = Params {
         precluster_identity: cli.precluster_identity,
         family_identity: cli.family_identity,
@@ -218,8 +232,14 @@ fn run() -> Result<()> {
     };
     let paths = collect_inputs(&cli.input)?;
     log::open(&output_dir.join("rustroo.log"))?;
-    log::record(&format!("param\tprecluster_identity\t{}", params.precluster_identity));
-    log::record(&format!("param\tfamily_identity\t{}", params.family_identity));
+    log::record(&format!(
+        "param\tprecluster_identity\t{}",
+        params.precluster_identity
+    ));
+    log::record(&format!(
+        "param\tfamily_identity\t{}",
+        params.family_identity
+    ));
     log::record(&format!("param\tlength_ratio\t{}", params.length_ratio));
     log::record(&format!("param\tmin_cds_bp\t{}", params.min_cds_bp));
     log::record(&format!("param\trefind\t{}", params.refind));
@@ -268,15 +288,14 @@ fn run() -> Result<()> {
     );
     println!("log\t{}", output_dir.join("rustroo.log").display());
     log::record(&format!("result\tgenes\t{}", pangenome.genes.len()));
-    log::record(&format!("result\tsamples\t{}", pangenome.sample_names.len()));
+    log::record(&format!(
+        "result\tsamples\t{}",
+        pangenome.sample_names.len()
+    ));
     if cli.audit_members {
         println!("members\t{}", output_dir.join("members.tsv").display());
     }
-    let broken = pangenome
-        .genes
-        .iter()
-        .filter(|gene| !gene.intact)
-        .count();
+    let broken = pangenome.genes.iter().filter(|gene| !gene.intact).count();
     if broken > 0 {
         log::write_progress(&format!(
             "rustroo: {broken} genes had no intact copy; their reference is the least-damaged allele"
@@ -340,18 +359,23 @@ mod tests {
 
     #[test]
     fn build_cli_keeps_existing_required_arguments_and_defaults() {
-        let cli = Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--audit-members"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--audit-members"]).unwrap();
         assert!(cli.command.is_none());
         assert_eq!(cli.output_dir, Some(PathBuf::from("out")));
         assert_eq!(cli.family_identity, 0.70);
         assert!(cli.audit_members);
         assert_eq!(cli.quality, Quality::Standard);
         assert_eq!(
-            Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--quality", "high"]).unwrap().quality,
+            Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--quality", "high"])
+                .unwrap()
+                .quality,
             Quality::High
         );
         assert_eq!(
-            Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--quality", "strict"]).unwrap().quality,
+            Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--quality", "strict"])
+                .unwrap()
+                .quality,
             Quality::Strict
         );
         assert!(Cli::try_parse_from(["rustroo", "-i", "gff"]).is_err());
@@ -359,13 +383,37 @@ mod tests {
 
     #[test]
     fn standalone_validation_does_not_require_build_inputs() {
-        let cli = Cli::try_parse_from(["rustroo", "validate", "-i", "run", "-o", "validation", "--threads", "2"]).unwrap();
-        let Some(Command::Validate(args)) = cli.command else { panic!("validation subcommand"); };
+        let cli = Cli::try_parse_from([
+            "rustroo",
+            "validate",
+            "-i",
+            "run",
+            "-o",
+            "validation",
+            "--threads",
+            "2",
+        ])
+        .unwrap();
+        let Some(Command::Validate(args)) = cli.command else {
+            panic!("validation subcommand");
+        };
         assert_eq!(args.input, PathBuf::from("run"));
         assert_eq!(args.tree_mode, TreeMode::Uncertain);
         assert_eq!(args.threads, 2);
         assert_eq!(args.bootstrap_replicates, 100);
-        assert!(Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "validate", "-i", "run", "-o", "validation"]).is_err());
+        assert!(Cli::try_parse_from([
+            "rustroo",
+            "-i",
+            "gff",
+            "-o",
+            "out",
+            "validate",
+            "-i",
+            "run",
+            "-o",
+            "validation"
+        ])
+        .is_err());
     }
 
     #[test]

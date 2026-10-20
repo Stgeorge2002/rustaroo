@@ -86,7 +86,11 @@ pub fn choose_reference(
     } else {
         observed
     };
-    let intact: Vec<&Allele> = pool.iter().copied().filter(|allele| is_intact(&allele.dna)).collect();
+    let intact: Vec<&Allele> = pool
+        .iter()
+        .copied()
+        .filter(|allele| is_intact(&allele.dna))
+        .collect();
     if intact.is_empty() {
         return Some(broken_fallback(pool));
     }
@@ -115,7 +119,10 @@ pub fn choose_reference(
         if kept.is_empty() {
             kept = intact.clone();
         }
-        for allele in alleles.iter().filter(|allele| allele.synthetic && is_intact(&allele.dna)) {
+        for allele in alleles
+            .iter()
+            .filter(|allele| allele.synthetic && is_intact(&allele.dna))
+        {
             if allele_is_clean(allele, &baseline_protein, reps, own_cluster) {
                 kept.push(allele);
             }
@@ -134,7 +141,10 @@ pub fn choose_reference(
         if kept.is_empty() {
             kept = intact.clone();
         }
-        for allele in alleles.iter().filter(|allele| allele.synthetic && is_intact(&allele.dna)) {
+        for allele in alleles
+            .iter()
+            .filter(|allele| allele.synthetic && is_intact(&allele.dna))
+        {
             let protein = translate(&allele.dna);
             if protein_is_clean(&protein, &proteins[baseline_at], reps, own_cluster) {
                 kept.push(allele);
@@ -146,7 +156,8 @@ pub fn choose_reference(
     let mut census = Census::inactive();
     if !uniform {
         if let Some(end) = finished_end(&intact, &proteins, n_samples) {
-            census = refuse_private_extensions(&mut kept, &intact, &proteins, &joined, end, n_samples);
+            census =
+                refuse_private_extensions(&mut kept, &intact, &proteins, &joined, end, n_samples);
             if kept.is_empty() {
                 // The clean-check fallback must not put a refused private
                 // extension back. The finished end itself is still intact.
@@ -167,7 +178,10 @@ pub fn choose_reference(
         .into_iter()
         .filter(|allele| allele.dna.len() == longest)
         .collect();
-    if class.iter().any(|allele| orf_status(&allele.dna).terminal_stop) {
+    if class
+        .iter()
+        .any(|allele| orf_status(&allele.dna).terminal_stop)
+    {
         class.retain(|allele| orf_status(&allele.dna).terminal_stop);
     }
     // Prefer a sequence that exists in a sample over a join of the same length.
@@ -225,7 +239,11 @@ pub fn choose_reference(
         .map(|allele| allele.count)
         .sum();
     let (modal_end_bp, modal_end_samples, extension_samples) = if census.active {
-        (census.modal_bp, census.modal_samples, census.extension_samples)
+        (
+            census.modal_bp,
+            census.modal_samples,
+            census.extension_samples,
+        )
     } else {
         (
             chosen.dna.len() as u32,
@@ -483,7 +501,10 @@ fn refuse_private_extensions<'a>(
 }
 
 fn matches_other_gene(
-    peptide: &[u8], whole: &[u8], reps: &HashMap<u32, Vec<u8>>, own_cluster: u32,
+    peptide: &[u8],
+    whole: &[u8],
+    reps: &HashMap<u32, Vec<u8>>,
+    own_cluster: u32,
 ) -> bool {
     if peptide.len() < FUSION_MIN_AA {
         return false;
@@ -492,11 +513,13 @@ fn matches_other_gene(
         .filter(|(id, _)| **id != own_cluster)
         .any(|(_, other)| {
             let matches_tail = if peptide.len() <= other.len() {
-                fit_short_in_long(peptide, other)
-                    .is_some_and(|fit| fit.identity >= FUSION_IDENTITY && fit.coverage >= FUSION_COVERAGE)
+                fit_short_in_long(peptide, other).is_some_and(|fit| {
+                    fit.identity >= FUSION_IDENTITY && fit.coverage >= FUSION_COVERAGE
+                })
             } else {
-                fit_short_in_long(other, peptide)
-                    .is_some_and(|fit| fit.identity >= FUSION_IDENTITY && fit.coverage >= FUSION_COVERAGE)
+                fit_short_in_long(other, peptide).is_some_and(|fit| {
+                    fit.identity >= FUSION_IDENTITY && fit.coverage >= FUSION_COVERAGE
+                })
             };
             if !matches_tail {
                 return false;
@@ -607,7 +630,11 @@ pub fn join_fragments(parts: &[&str]) -> Option<String> {
             dna.push_str(strip_terminal_stop(part));
         }
     }
-    if is_intact(&dna) { Some(dna) } else { None }
+    if is_intact(&dna) {
+        Some(dna)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -636,7 +663,11 @@ mod tests {
     }
 
     fn choose(alleles: &[Allele], reps: &HashMap<u32, Vec<u8>>) -> Choice {
-        let samples = alleles.iter().map(|allele| allele.count as usize).sum::<usize>().max(1);
+        let samples = alleles
+            .iter()
+            .map(|allele| allele.count as usize)
+            .sum::<usize>()
+            .max(1);
         choose_reference(alleles, reps, 0, samples).unwrap()
     }
 
@@ -695,7 +726,10 @@ mod tests {
         let mut longer = common.clone();
         longer.extend_from_slice(b"ACD");
         let choice = choose_reference(
-            &[allele(&back_translate(&longer), 1), allele(&back_translate(&common), 399)],
+            &[
+                allele(&back_translate(&longer), 1),
+                allele(&back_translate(&common), 399),
+            ],
             &no_others(),
             0,
             400,
@@ -712,7 +746,10 @@ mod tests {
         let mut long = short.clone();
         long.extend_from_slice(&protein(11, 8)[1..]);
         let choice = choose_reference(
-            &[allele(&back_translate(&long), 200), allele(&back_translate(&short), 200)],
+            &[
+                allele(&back_translate(&long), 200),
+                allele(&back_translate(&short), 200),
+            ],
             &no_others(),
             0,
             400,

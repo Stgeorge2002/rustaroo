@@ -26,10 +26,7 @@ const ALLELE_MIN_AA: usize = 30;
 
 /// Split fusion CDS into the two genes they contain. Returns the number split.
 pub fn split_fusions(calls: &mut Vec<Call>, pools: &mut Pools) -> usize {
-    let (reps, counts) = rayon::join(
-        || representatives(calls, pools),
-        || sample_counts(calls),
-    );
+    let (reps, counts) = rayon::join(|| representatives(calls, pools), || sample_counts(calls));
     let kmers = kmer_sets(&reps);
     let mut cluster_ids: Vec<u32> = reps.keys().copied().collect();
     // Sorted so the `best` tie-breaks below (strict `>` on a support score)
@@ -179,7 +176,10 @@ pub fn split_paralogs(calls: &mut [Call], pools: &Pools) -> usize {
     let contexts = stabilize_contexts(calls, &loci, &contexts, |call| call.context);
     let mut by_cluster: HashMap<u32, Vec<usize>> = HashMap::new();
     for (index, locus) in loci.iter().enumerate() {
-        by_cluster.entry(calls[locus.first].cluster).or_default().push(index);
+        by_cluster
+            .entry(calls[locus.first].cluster)
+            .or_default()
+            .push(index);
     }
     let mut next_id = calls.iter().map(|call| call.cluster).max().unwrap_or(0) + 1;
     let mut cluster_list: Vec<u32> = by_cluster.keys().copied().collect();
@@ -236,7 +236,9 @@ fn paralog_split_groups(
 ) -> ParalogPlan {
     let mut per_sample: HashMap<u32, usize> = HashMap::new();
     for &index in indexes {
-        *per_sample.entry(calls[loci[index].first].sample).or_default() += 1;
+        *per_sample
+            .entry(calls[loci[index].first].sample)
+            .or_default() += 1;
     }
     if per_sample.values().all(|&count| count <= 1) {
         return ParalogPlan::default();
@@ -259,7 +261,12 @@ fn paralog_split_groups(
                 }
             }
             let anchored = samples.iter().any(|sample| per_sample[sample] > 1);
-            ContextBucket { context, loci: indexes, samples, anchored }
+            ContextBucket {
+                context,
+                loci: indexes,
+                samples,
+                anchored,
+            }
         })
         .collect();
     let mut left: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -291,7 +298,10 @@ fn paralog_split_groups(
         }
     }
     let mut parents: HashMap<u32, u32> = HashMap::new();
-    let mut samples: Vec<HashSet<u32>> = buckets.iter().map(|bucket| bucket.samples.clone()).collect();
+    let mut samples: Vec<HashSet<u32>> = buckets
+        .iter()
+        .map(|bucket| bucket.samples.clone())
+        .collect();
     reconcile_disjoint_pairs(pairs, &mut parents, &mut samples);
     // Exact whole alleles can bridge rearranged contexts. Use roots after
     // flank reconciliation so weaker sequence evidence cannot undo it.
@@ -301,7 +311,10 @@ fn paralog_split_groups(
         for &index in &bucket.loci {
             let locus = &loci[index];
             if locus.first == locus.last {
-                by_protein.entry(calls[locus.first].protein).or_default().push(root);
+                by_protein
+                    .entry(calls[locus.first].protein)
+                    .or_default()
+                    .push(root);
             }
         }
     }
@@ -354,7 +367,11 @@ fn paralog_split_groups(
         })
         .collect();
     groups.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
-    ParalogPlan { groups: groups.into_iter().skip(1).collect(), unresolved_loci, allele_unions }
+    ParalogPlan {
+        groups: groups.into_iter().skip(1).collect(),
+        unresolved_loci,
+        allele_unions,
+    }
 }
 
 fn reconcile_disjoint_pairs(
@@ -375,15 +392,13 @@ fn reconcile_disjoint_pairs(
         .iter()
         .map(|hosts| {
             let mut seen = HashSet::new();
-            hosts.iter().any(|&host| {
-                samples[host].iter().any(|&sample| !seen.insert(sample))
-            })
+            hosts
+                .iter()
+                .any(|&host| samples[host].iter().any(|&sample| !seen.insert(sample)))
         })
         .collect();
     pairs.sort_by(|&(a, b), &(c, d)| {
-        let support = |left: usize, right: usize| {
-            samples[left].len() + samples[right].len()
-        };
+        let support = |left: usize, right: usize| samples[left].len() + samples[right].len();
         support(c, d).cmp(&support(a, b)).then((a, b).cmp(&(c, d)))
     });
     let mut merged = 0;
@@ -416,10 +431,12 @@ pub fn merge_fragments(calls: &mut [Call], pools: &Pools, contig_lengths: &[Vec<
     let contexts = locus_contexts(calls, &loci, |call| call.cluster);
     let contexts = stabilize_contexts(calls, &loci, &contexts, |call| call.cluster);
     let ((flanks, kmers), alleles) = rayon::join(
-        || rayon::join(
-            || modal_flanks_of(calls, &loci, &contexts),
-            || kmer_sets(&reps),
-        ),
+        || {
+            rayon::join(
+                || modal_flanks_of(calls, &loci, &contexts),
+                || kmer_sets(&reps),
+            )
+        },
         || AlleleIndex::new(calls, pools, &loci, &contexts, contig_lengths),
     );
     let index = MergeIndex::new(&flanks, &adjacency);
@@ -462,14 +479,17 @@ pub fn merge_fragments(calls: &mut [Call], pools: &Pools, contig_lengths: &[Vec<
     }
     legacy.extend(abutting_pieces(calls, &reps, &members));
     let contained = contained_adoptions(calls, pools, &reps, &members, &kmers);
-    let (merged, terminal_merged, blocked) = apply_adoptions(calls, pools, members, &legacy, &terminal, &contained);
+    let (merged, terminal_merged, blocked) =
+        apply_adoptions(calls, pools, members, &legacy, &terminal, &contained);
     if merged > 0 {
         progress!(
             "rustroo: merged {merged} groups, including {terminal_merged} guarded shortened-allele groups"
         );
     }
     if blocked > 0 {
-        progress!("rustroo: blocked {blocked} merges that would combine distinct co-occurring loci");
+        progress!(
+            "rustroo: blocked {blocked} merges that would combine distinct co-occurring loci"
+        );
     }
     merged > 0
 }
@@ -506,8 +526,11 @@ struct AlleleIndex {
 
 impl AlleleIndex {
     fn new(
-        calls: &[Call], pools: &Pools, loci: &[Locus],
-        contexts: &[(Option<u32>, Option<u32>)], contig_lengths: &[Vec<usize>],
+        calls: &[Call],
+        pools: &Pools,
+        loci: &[Locus],
+        contexts: &[(Option<u32>, Option<u32>)],
+        contig_lengths: &[Vec<usize>],
     ) -> Self {
         let representatives = representative_ids(calls, pools);
         let mut occurrences: HashMap<u32, Vec<AlleleOccurrence>> = HashMap::new();
@@ -520,7 +543,8 @@ impl AlleleIndex {
         for (position, (locus, &context)) in loci.iter().zip(contexts).enumerate() {
             let call = &calls[locus.first];
             let cluster = call.cluster;
-            if locus.first != locus.last || !samples.entry(cluster).or_default().insert(call.sample) {
+            if locus.first != locus.last || !samples.entry(cluster).or_default().insert(call.sample)
+            {
                 ineligible.insert(cluster);
             }
             let length = contig_lengths[call.sample as usize][call.contig as usize];
@@ -532,28 +556,46 @@ impl AlleleIndex {
                 let next = &calls[loci[position + 1].first];
                 next.sample != call.sample || next.contig != call.contig
             };
-            let start_edge = first_on_contig && context.0.is_none() && call.start as usize <= ALLELE_EDGE_BP;
-            let end_edge = last_on_contig && context.1.is_none() && locus.end as usize <= length
+            let start_edge =
+                first_on_contig && context.0.is_none() && call.start as usize <= ALLELE_EDGE_BP;
+            let end_edge = last_on_contig
+                && context.1.is_none()
+                && locus.end as usize <= length
                 && length - locus.end as usize <= ALLELE_EDGE_BP;
             let (flanks, upstream_edge, downstream_edge) = if call.strand >= 0 {
                 (context, start_edge, end_edge)
             } else {
                 ((context.1, context.0), end_edge, start_edge)
             };
-            occurrences.entry(cluster).or_default().push(AlleleOccurrence {
-                protein: call.protein, flanks, upstream_edge, downstream_edge,
-            });
-            let intact = *intact_cache.entry(call.dna)
+            occurrences
+                .entry(cluster)
+                .or_default()
+                .push(AlleleOccurrence {
+                    protein: call.protein,
+                    flanks,
+                    upstream_edge,
+                    downstream_edge,
+                });
+            let intact = *intact_cache
+                .entry(call.dna)
                 .or_insert_with(|| is_intact(&pools.dna[call.dna as usize]));
             let representative_length = pools.protein[representatives[&cluster] as usize].len();
             let full_length = (locus.first..=locus.last).any(|index| {
-                pools.protein[calls[index].protein as usize].len() * 100 >= representative_length * 95
+                pools.protein[calls[index].protein as usize].len() * 100
+                    >= representative_length * 95
             });
             if full_length {
                 if let (Some(upstream), Some(downstream)) = flanks {
-                    observed.entry((upstream, downstream)).or_default().insert(cluster);
+                    observed
+                        .entry((upstream, downstream))
+                        .or_default()
+                        .insert(cluster);
                     if locus.first == locus.last && intact {
-                        *votes.entry((upstream, downstream)).or_default().entry(cluster).or_default() += 1;
+                        *votes
+                            .entry((upstream, downstream))
+                            .or_default()
+                            .entry(cluster)
+                            .or_default() += 1;
                     }
                 }
             }
@@ -580,13 +622,23 @@ impl AlleleIndex {
                 }
             }
         }
-        Self { occurrences, representatives, intact_representatives, pairs, upstream, downstream, replicated }
+        Self {
+            occurrences,
+            representatives,
+            intact_representatives,
+            pairs,
+            upstream,
+            downstream,
+            replicated,
+        }
     }
 
     fn hosts(&self, occurrence: &AlleleOccurrence) -> Option<&HashSet<u32>> {
         match occurrence.flanks {
             (Some(upstream), Some(downstream)) => self.pairs.get(&(upstream, downstream)),
-            (None, Some(downstream)) if occurrence.upstream_edge => self.downstream.get(&downstream),
+            (None, Some(downstream)) if occurrence.upstream_edge => {
+                self.downstream.get(&downstream)
+            }
             (Some(upstream), None) if occurrence.downstream_edge => self.upstream.get(&upstream),
             _ => None,
         }
@@ -623,10 +675,12 @@ impl AlleleIndex {
                     (Some(_), None) => AlleleSide::MissingSuffix,
                     _ => AlleleSide::Either,
                 };
-                *cache.entry((occurrence.protein, long_id, side)).or_insert_with(|| {
-                    shortened_identity(&pools.protein[occurrence.protein as usize], long, side)
-                        .is_some_and(|identity| identity + f64::EPSILON >= TERMINAL_IDENTITY)
-                })
+                *cache
+                    .entry((occurrence.protein, long_id, side))
+                    .or_insert_with(|| {
+                        shortened_identity(&pools.protein[occurrence.protein as usize], long, side)
+                            .is_some_and(|identity| identity + f64::EPSILON >= TERMINAL_IDENTITY)
+                    })
             });
             if !compatible {
                 continue;
@@ -634,31 +688,53 @@ impl AlleleIndex {
             // Count all sequence/context hosts before sample-overlap rejection.
             // A co-occurring host must not make a competing host look unique.
             if matched.is_some() {
-                return AlleleDecision { target: None, ambiguous: true };
+                return AlleleDecision {
+                    target: None,
+                    ambiguous: true,
+                };
             }
             matched = Some(candidate);
         }
         let Some(candidate) = matched else {
             return AlleleDecision::default();
         };
-        if !self.occurrences.contains_key(&candidate) || !self.intact_representatives.contains(&candidate) {
-            return AlleleDecision { target: None, ambiguous: true };
+        if !self.occurrences.contains_key(&candidate)
+            || !self.intact_representatives.contains(&candidate)
+        {
+            return AlleleDecision {
+                target: None,
+                ambiguous: true,
+            };
         }
         let supported = self.replicated.get(&candidate).is_some_and(|witnesses| {
-            occurrences.iter().all(|occurrence| match occurrence.flanks {
-                (Some(upstream), Some(downstream)) => witnesses.contains(&(upstream, downstream)),
-                (None, Some(downstream)) => witnesses.iter().any(|&(_, flank)| flank == downstream),
-                (Some(upstream), None) => witnesses.iter().any(|&(flank, _)| flank == upstream),
-                _ => false,
-            })
+            occurrences
+                .iter()
+                .all(|occurrence| match occurrence.flanks {
+                    (Some(upstream), Some(downstream)) => {
+                        witnesses.contains(&(upstream, downstream))
+                    }
+                    (None, Some(downstream)) => {
+                        witnesses.iter().any(|&(_, flank)| flank == downstream)
+                    }
+                    (Some(upstream), None) => witnesses.iter().any(|&(flank, _)| flank == upstream),
+                    _ => false,
+                })
         });
-        AlleleDecision { target: supported.then_some(candidate), ambiguous: false }
+        AlleleDecision {
+            target: supported.then_some(candidate),
+            ambiguous: false,
+        }
     }
 }
 
 fn shortened_identity(short: &[u8], long: &[u8], side: AlleleSide) -> Option<f64> {
-    if short.len() < ALLELE_MIN_AA || short.len() >= long.len() || short.len() * 2 < long.len()
-        || short.iter().chain(long).any(|&residue| residue == b'X' || residue == b'*')
+    if short.len() < ALLELE_MIN_AA
+        || short.len() >= long.len()
+        || short.len() * 2 < long.len()
+        || short
+            .iter()
+            .chain(long)
+            .any(|&residue| residue == b'X' || residue == b'*')
     {
         return None;
     }
@@ -702,8 +778,16 @@ fn apply_adoptions(
     for (child, parent_id, kind) in legacy
         .iter()
         .map(|&(child, parent)| (child, parent, Adoption::Legacy))
-        .chain(terminal.iter().map(|&(child, parent)| (child, parent, Adoption::Terminal)))
-        .chain(contained.iter().map(|&(child, parent)| (child, parent, Adoption::Contained)))
+        .chain(
+            terminal
+                .iter()
+                .map(|&(child, parent)| (child, parent, Adoption::Terminal)),
+        )
+        .chain(
+            contained
+                .iter()
+                .map(|&(child, parent)| (child, parent, Adoption::Contained)),
+        )
     {
         let root = find(&mut parent, parent_id);
         let child_root = find(&mut parent, child);
@@ -716,12 +800,20 @@ fn apply_adoptions(
             let allowed = match kind {
                 Adoption::Terminal => false,
                 Adoption::Legacy => cooccurring_loci_compatible(
-                    &locations[&child_root], &locations[&root], &members[&child_root],
-                    &members[&root], calls, pools, &mut pair_cache,
+                    &locations[&child_root],
+                    &locations[&root],
+                    &members[&child_root],
+                    &members[&root],
+                    calls,
+                    pools,
+                    &mut pair_cache,
                 ),
                 Adoption::Contained => intervals_inside(
-                    &locations[&child_root], &locations[&root],
-                    Some(&members[&child_root]), Some(&members[&root]), calls,
+                    &locations[&child_root],
+                    &locations[&root],
+                    Some(&members[&child_root]),
+                    Some(&members[&root]),
+                    calls,
                 ),
             };
             if !allowed {
@@ -730,10 +822,18 @@ fn apply_adoptions(
             }
         }
         let child_samples = members.remove(&child_root).expect("child root exists");
-        members.get_mut(&root).expect("parent root exists").extend(child_samples);
+        members
+            .get_mut(&root)
+            .expect("parent root exists")
+            .extend(child_samples);
         parent.insert(child_root, root);
-        let child_locations = locations.remove(&child_root).expect("child locations exist");
-        locations.get_mut(&root).expect("parent locations exist").extend(child_locations);
+        let child_locations = locations
+            .remove(&child_root)
+            .expect("child locations exist");
+        locations
+            .get_mut(&root)
+            .expect("parent locations exist")
+            .extend(child_locations);
         merged += 1;
         terminal_merged += usize::from(kind == Adoption::Terminal);
         contained_merged += usize::from(kind == Adoption::Contained);
@@ -795,17 +895,30 @@ fn cooccurring_loci_compatible(
     pools: &Pools,
     cache: &mut HashMap<(u32, u32), bool>,
 ) -> bool {
-    let template_id = left.iter().chain(right).map(|&index| calls[index].protein)
+    let template_id = left
+        .iter()
+        .chain(right)
+        .map(|&index| calls[index].protein)
         .max_by(|a, b| {
-            pools.protein[*a as usize].len().cmp(&pools.protein[*b as usize].len())
+            pools.protein[*a as usize]
+                .len()
+                .cmp(&pools.protein[*b as usize].len())
                 .then(b.cmp(a))
-        }).expect("merge groups contain calls");
+        })
+        .expect("merge groups contain calls");
     let template = &pools.protein[template_id as usize];
     for &sample in left_samples.intersection(right_samples) {
-        let mut indexes: Vec<usize> = left.iter().chain(right)
-            .copied().filter(|&index| calls[index].sample == sample).collect();
+        let mut indexes: Vec<usize> = left
+            .iter()
+            .chain(right)
+            .copied()
+            .filter(|&index| calls[index].sample == sample)
+            .collect();
         indexes.sort_unstable();
-        if !indexes.windows(2).all(|pair| same_physical_locus(pair[0], pair[1], calls, pools, template, cache)) {
+        if !indexes
+            .windows(2)
+            .all(|pair| same_physical_locus(pair[0], pair[1], calls, pools, template, cache))
+        {
             return false;
         }
     }
@@ -866,7 +979,9 @@ fn best_merge_target(
         let Some(fit) = fit_short_in_long(short, long) else {
             continue;
         };
-        if fit.identity < CONTAIN_IDENTITY || fit.coverage < CONTAIN_COVERAGE || fit.internal_gap > 5
+        if fit.identity < CONTAIN_IDENTITY
+            || fit.coverage < CONTAIN_COVERAGE
+            || fit.internal_gap > 5
         {
             continue;
         }
@@ -874,9 +989,15 @@ fn best_merge_target(
         legacy_matches += 1;
     }
     if terminal_matches == 1 {
-        terminal_target.map(|cluster| MergeTarget { cluster, terminal: true })
+        terminal_target.map(|cluster| MergeTarget {
+            cluster,
+            terminal: true,
+        })
     } else if terminal_matches == 0 && legacy_matches == 1 {
-        legacy_target.map(|cluster| MergeTarget { cluster, terminal: false })
+        legacy_target.map(|cluster| MergeTarget {
+            cluster,
+            terminal: false,
+        })
     } else {
         None
     }
@@ -929,7 +1050,8 @@ fn contained_adoptions(
             let mut ranked: Vec<(u32, u32)> = scores
                 .into_iter()
                 .filter(|&(long_id, score)| {
-                    reps.get(&long_id).is_some_and(|long| long.len() > short.len())
+                    reps.get(&long_id)
+                        .is_some_and(|long| long.len() > short.len())
                         && score * 2 >= needed
                 })
                 .collect();
@@ -1137,8 +1259,10 @@ pub fn refind(calls: &mut Vec<Call>, pools: &mut Pools, contigs: &[Vec<String>])
         return 0;
     }
     let reps = representatives(calls, pools);
-    let context_of: HashMap<u32, u32> =
-        calls.iter().map(|call| (call.cluster, call.context)).collect();
+    let context_of: HashMap<u32, u32> = calls
+        .iter()
+        .map(|call| (call.cluster, call.context))
+        .collect();
     let mut present: HashMap<u32, HashSet<u32>> = HashMap::new();
     for call in calls.iter() {
         present.entry(call.sample).or_default().insert(call.cluster);
@@ -1164,7 +1288,14 @@ pub fn refind(calls: &mut Vec<Call>, pools: &mut Pools, contigs: &[Vec<String>])
         .par_iter()
         .flat_map(|&(sample, start, end)| {
             let local_present = present.get(&sample).cloned().unwrap_or_default();
-            refind_in_sample(&calls[start..end], sample, &target_of, &reps, contigs, local_present)
+            refind_in_sample(
+                &calls[start..end],
+                sample,
+                &target_of,
+                &reps,
+                contigs,
+                local_present,
+            )
         })
         .collect();
     let n = found.len();
@@ -1181,6 +1312,7 @@ pub fn refind(calls: &mut Vec<Call>, pools: &mut Pools, contigs: &[Vec<String>])
             context: context_of[&gene.cluster],
             locus: None,
             source: None,
+            refound: true,
             fusion_piece: false,
             symbol: String::new(),
             product: String::new(),
@@ -1244,7 +1376,9 @@ fn refind_in_sample(
             };
             let sequence = contig_sequence(contigs, sample, contig);
             let from = pair[0].end as usize;
-            let to = (pair[1].start as usize).saturating_sub(1).min(sequence.len());
+            let to = (pair[1].start as usize)
+                .saturating_sub(1)
+                .min(sequence.len());
             if from >= to || to > sequence.len() {
                 continue;
             }
@@ -1323,32 +1457,33 @@ fn best_orf(gap: &str, target: &[u8]) -> Option<FoundOrf> {
             }
         }
     }
-    let score = |&(strand, start, end, offset): &(i8, usize, usize, u32)| -> Option<(f64, FoundOrf)> {
-        let sequence = if strand > 0 { gap } else { reverse.as_str() };
-        let protein = translate_bytes(&sequence.as_bytes()[start..end]);
-        let identity = if protein.len().abs_diff(target.len()) * 5 <= target.len() {
-            global_identity(&protein, target).unwrap_or(0.0)
-        } else if protein.len() <= target.len() {
-            fit_short_in_long(&protein, target)
-                .map(|fit| fit.identity)
-                .unwrap_or(0.0)
-        } else {
-            fit_short_in_long(target, &protein)
-                .map(|fit| fit.identity)
-                .unwrap_or(0.0)
+    let score =
+        |&(strand, start, end, offset): &(i8, usize, usize, u32)| -> Option<(f64, FoundOrf)> {
+            let sequence = if strand > 0 { gap } else { reverse.as_str() };
+            let protein = translate_bytes(&sequence.as_bytes()[start..end]);
+            let identity = if protein.len().abs_diff(target.len()) * 5 <= target.len() {
+                global_identity(&protein, target).unwrap_or(0.0)
+            } else if protein.len() <= target.len() {
+                fit_short_in_long(&protein, target)
+                    .map(|fit| fit.identity)
+                    .unwrap_or(0.0)
+            } else {
+                fit_short_in_long(target, &protein)
+                    .map(|fit| fit.identity)
+                    .unwrap_or(0.0)
+            };
+            if identity < 0.8 {
+                return None;
+            }
+            Some((
+                identity,
+                FoundOrf {
+                    dna: sequence[start..end].to_string(),
+                    offset,
+                    strand,
+                },
+            ))
         };
-        if identity < 0.8 {
-            return None;
-        }
-        Some((
-            identity,
-            FoundOrf {
-                dna: sequence[start..end].to_string(),
-                offset,
-                strand,
-            },
-        ))
-    };
     let scored: Vec<Option<(f64, FoundOrf)>> = if spans.len() >= 4 {
         spans.par_iter().map(score).collect()
     } else {
@@ -1356,7 +1491,11 @@ fn best_orf(gap: &str, target: &[u8]) -> Option<FoundOrf> {
     };
     let mut best: Option<(f64, FoundOrf)> = None;
     for found in scored.into_iter().flatten() {
-        if best.as_ref().map(|(identity, _)| found.0 > *identity).unwrap_or(true) {
+        if best
+            .as_ref()
+            .map(|(identity, _)| found.0 > *identity)
+            .unwrap_or(true)
+        {
             best = Some(found);
         }
     }
@@ -1429,7 +1568,8 @@ fn shares_kmer_cached(
 }
 
 fn representatives(calls: &[Call], pools: &Pools) -> HashMap<u32, Vec<u8>> {
-    representative_ids(calls, pools).into_iter()
+    representative_ids(calls, pools)
+        .into_iter()
         .map(|(cluster, protein)| (cluster, pools.protein[protein as usize].clone()))
         .collect()
 }
@@ -1480,7 +1620,9 @@ fn modal_flanks(calls: &[Call], pools: &Pools) -> HashMap<u32, (Option<u32>, Opt
 }
 
 fn modal_flanks_of(
-    calls: &[Call], loci: &[Locus], contexts: &[(Option<u32>, Option<u32>)],
+    calls: &[Call],
+    loci: &[Locus],
+    contexts: &[(Option<u32>, Option<u32>)],
 ) -> HashMap<u32, (Option<u32>, Option<u32>)> {
     let mut votes: HashMap<u32, HashMap<(Option<u32>, Option<u32>), u32>> = HashMap::new();
     for (locus, &context) in loci.iter().zip(contexts) {
@@ -1533,11 +1675,7 @@ impl MergeIndex {
         index
     }
 
-    fn candidates(
-        &self,
-        id: u32,
-        flanks: &HashMap<u32, (Option<u32>, Option<u32>)>,
-    ) -> Vec<u32> {
+    fn candidates(&self, id: u32, flanks: &HashMap<u32, (Option<u32>, Option<u32>)>) -> Vec<u32> {
         let mut candidates = self.adjacent.get(&id).cloned().unwrap_or_default();
         if let Some(&(left, right)) = flanks.get(&id) {
             if let Some(left) = left.and_then(|flank| self.left.get(&flank)) {
@@ -1616,8 +1754,8 @@ fn same_physical_locus(
         return true;
     }
     let overlap = i64::from(a.end.min(b.end)) - i64::from(a.start.max(b.start)) + 1;
-    let shorter = (i64::from(a.end) - i64::from(a.start) + 1)
-        .min(i64::from(b.end) - i64::from(b.start) + 1);
+    let shorter =
+        (i64::from(a.end) - i64::from(a.start) + 1).min(i64::from(b.end) - i64::from(b.start) + 1);
     if shorter > 0 && overlap * 100 >= shorter * 95 {
         return true;
     }
@@ -1646,8 +1784,11 @@ fn same_physical_locus(
     }
     let pair = (a.protein.min(b.protein), a.protein.max(b.protein));
     *cache.entry(pair).or_insert_with(|| {
-        global_identity(&pools.protein[a.protein as usize], &pools.protein[b.protein as usize])
-            .is_some_and(|identity| identity < 0.4)
+        global_identity(
+            &pools.protein[a.protein as usize],
+            &pools.protein[b.protein as usize],
+        )
+        .is_some_and(|identity| identity < 0.4)
     })
 }
 
@@ -1659,8 +1800,12 @@ fn physical_loci(calls: &[Call], pools: &Pools) -> Vec<Locus> {
         if let Some(previous) = loci.last_mut() {
             if calls[previous.first].cluster == call.cluster
                 && same_physical_locus(
-                    previous.last, index, calls, pools,
-                    &pools.protein[representatives[&call.cluster] as usize], &mut cache,
+                    previous.last,
+                    index,
+                    calls,
+                    pools,
+                    &pools.protein[representatives[&call.cluster] as usize],
+                    &mut cache,
                 )
             {
                 previous.last = index;
@@ -1668,13 +1813,78 @@ fn physical_loci(calls: &[Call], pools: &Pools) -> Vec<Locus> {
                 continue;
             }
         }
-        loci.push(Locus { first: index, last: index, end: call.end });
+        loci.push(Locus {
+            first: index,
+            last: index,
+            end: call.end,
+        });
     }
     loci
 }
 
+/// Whether a finished family was annotated, and whether its copies share one
+/// neighborhood. Calls must already be ordered by sample, contig, and start.
+#[derive(Clone, Copy)]
+pub struct ClusterFacts {
+    pub annotated: bool,
+    pub neighbors_agree: bool,
+}
+
+pub fn cluster_facts(calls: &[Call], pools: &Pools) -> HashMap<u32, ClusterFacts> {
+    debug_assert!(calls.windows(2).all(|pair| {
+        pair[0].sample < pair[1].sample
+            || (pair[0].sample == pair[1].sample && pair[0].contig < pair[1].contig)
+            || (pair[0].sample == pair[1].sample
+                && pair[0].contig == pair[1].contig
+                && pair[0].start <= pair[1].start)
+    }));
+    let mut facts: HashMap<u32, ClusterFacts> = HashMap::new();
+    for call in calls {
+        let fact = facts.entry(call.cluster).or_insert(ClusterFacts {
+            annotated: false,
+            neighbors_agree: false,
+        });
+        if !call.refound {
+            fact.annotated = true;
+        }
+    }
+    let loci = physical_loci(calls, pools);
+    let contexts = locus_contexts(calls, &loci, |call| call.cluster);
+    let mut seen: HashMap<u32, Vec<(Option<u32>, Option<u32>)>> = HashMap::new();
+    for (locus, context) in loci.iter().zip(contexts) {
+        seen.entry(calls[locus.first].cluster)
+            .or_default()
+            .push(context);
+    }
+    for (cluster, contexts) in seen {
+        if let Some(fact) = facts.get_mut(&cluster) {
+            fact.neighbors_agree = same_neighborhood(&contexts);
+        }
+    }
+    facts
+}
+
+/// One neighborhood covers more than half of the copies that have a neighbor.
+/// A single copy between two genes agrees with itself. Copies with no neighbor
+/// on either side do not count as support.
+fn same_neighborhood(contexts: &[(Option<u32>, Option<u32>)]) -> bool {
+    let mut counts: HashMap<(Option<u32>, Option<u32>), usize> = HashMap::new();
+    let mut known = 0usize;
+    for &context in contexts {
+        if context.0.is_none() && context.1.is_none() {
+            continue;
+        }
+        known += 1;
+        *counts.entry(context).or_default() += 1;
+    }
+    let best = counts.into_values().max().unwrap_or(0);
+    known > 0 && best * 2 > known
+}
+
 fn locus_contexts(
-    calls: &[Call], loci: &[Locus], family: impl Fn(&Call) -> u32,
+    calls: &[Call],
+    loci: &[Locus],
+    family: impl Fn(&Call) -> u32,
 ) -> Vec<(Option<u32>, Option<u32>)> {
     let mut contexts = vec![(None, None); loci.len()];
     let mut index = 0;
@@ -1689,7 +1899,9 @@ fn locus_contexts(
         }
         for cursor in index..end {
             let prev = if cursor > index {
-                let gap = i64::from(calls[loci[cursor].first].start) - i64::from(loci[cursor - 1].end) - 1;
+                let gap = i64::from(calls[loci[cursor].first].start)
+                    - i64::from(loci[cursor - 1].end)
+                    - 1;
                 if (-15..=i64::from(NEIGHBOR_GAP)).contains(&gap) {
                     Some(family(&calls[loci[cursor - 1].first]))
                 } else {
@@ -1699,7 +1911,9 @@ fn locus_contexts(
                 None
             };
             let next = if cursor + 1 < end {
-                let gap = i64::from(calls[loci[cursor + 1].first].start) - i64::from(loci[cursor].end) - 1;
+                let gap = i64::from(calls[loci[cursor + 1].first].start)
+                    - i64::from(loci[cursor].end)
+                    - 1;
                 if (-15..=i64::from(NEIGHBOR_GAP)).contains(&gap) {
                     Some(family(&calls[loci[cursor + 1].first]))
                 } else {
@@ -1714,7 +1928,6 @@ fn locus_contexts(
     }
     contexts
 }
-
 
 fn contig_sequence(contigs: &[Vec<String>], sample: u32, contig: u32) -> &str {
     contigs
@@ -1838,7 +2051,12 @@ fn record_removed(calls: &[Call], pools: &Pools, clusters: &HashSet<u32>, reason
     }
     log::record("removed\treason\tcluster\tsymbol\tproduct\tsamples\tcopies\tlongest_bp");
     let mut ordered: Vec<_> = rows.into_iter().collect();
-    ordered.sort_by(|left, right| left.1.symbol.cmp(&right.1.symbol).then(left.0.cmp(&right.0)));
+    ordered.sort_by(|left, right| {
+        left.1
+            .symbol
+            .cmp(&right.1.symbol)
+            .then(left.0.cmp(&right.0))
+    });
     for (cluster, row) in ordered {
         log::record(&format!(
             "removed\t{reason}\t{cluster}\t{}\t{}\t{}\t{}\t{}",
@@ -1947,8 +2165,26 @@ fn contig_end_tail_families(calls: &[Call], loci: &[Locus], n_samples: usize) ->
         {
             end += 1;
         }
-        consume_tail(&mut consumed, calls, loci, index..end, true, &support, &internal, threshold);
-        consume_tail(&mut consumed, calls, loci, index..end, false, &support, &internal, threshold);
+        consume_tail(
+            &mut consumed,
+            calls,
+            loci,
+            index..end,
+            true,
+            &support,
+            &internal,
+            threshold,
+        );
+        consume_tail(
+            &mut consumed,
+            calls,
+            loci,
+            index..end,
+            false,
+            &support,
+            &internal,
+            threshold,
+        );
         index = end;
     }
     // A family stays if any copy was not on a tail walk. Dropping the family
@@ -2049,7 +2285,11 @@ fn stabilize_contexts(
     contexts: &[(Option<u32>, Option<u32>)],
     family_of: impl Fn(&Call) -> u32,
 ) -> Vec<(Option<u32>, Option<u32>)> {
-    let n_samples = calls.iter().map(|call| call.sample as usize + 1).max().unwrap_or(0);
+    let n_samples = calls
+        .iter()
+        .map(|call| call.sample as usize + 1)
+        .max()
+        .unwrap_or(0);
     let threshold = weak_flank_threshold(n_samples);
     let mut support: HashMap<(u32, Option<u32>, Option<u32>), HashSet<u32>> = HashMap::new();
     for (locus, context) in loci.iter().zip(contexts.iter()) {
@@ -2073,8 +2313,10 @@ fn stabilize_contexts(
             if count(family, context.0, context.1) >= threshold {
                 return *context;
             }
-            let next = supported_alternative(family, context.0, context.1, true, threshold, &support);
-            let prev = supported_alternative(family, context.0, context.1, false, threshold, &support);
+            let next =
+                supported_alternative(family, context.0, context.1, true, threshold, &support);
+            let prev =
+                supported_alternative(family, context.0, context.1, false, threshold, &support);
             // Replacing both sides at once builds a neighborhood this gene was
             // never in. A missing side is also left missing: an absent flank
             // at a contig break is evidence, not a value to invent.
@@ -2105,7 +2347,12 @@ fn supported_alternative(
     let mut alternatives: Vec<(usize, u32)> = support
         .iter()
         .filter(|((id, pair_prev, pair_next), _)| {
-            *id == family && if fix_next { *pair_prev == prev } else { *pair_next == next }
+            *id == family
+                && if fix_next {
+                    *pair_prev == prev
+                } else {
+                    *pair_next == next
+                }
         })
         .filter_map(|((_, pair_prev, pair_next), samples)| {
             let neighbor = if fix_next { *pair_next } else { *pair_prev };
@@ -2118,7 +2365,9 @@ fn supported_alternative(
     alternatives.dedup_by(|a, b| a.1 == b.1);
     let observed = if fix_next { next } else { prev };
     match alternatives.as_slice() {
-        [(count, neighbor)] if observed != Some(*neighbor) && *count >= threshold => Some(*neighbor),
+        [(count, neighbor)] if observed != Some(*neighbor) && *count >= threshold => {
+            Some(*neighbor)
+        }
         _ => observed,
     }
 }
@@ -2147,7 +2396,8 @@ mod tests {
             lengths.resize_with(lengths.len().max(call.sample as usize + 1), Vec::new);
             let sample = &mut lengths[call.sample as usize];
             sample.resize(sample.len().max(call.contig as usize + 1), 0);
-            sample[call.contig as usize] = sample[call.contig as usize].max(call.end as usize + 300);
+            sample[call.contig as usize] =
+                sample[call.contig as usize].max(call.end as usize + 300);
         }
         merge_fragments(calls, pools, &lengths)
     }
@@ -2159,7 +2409,12 @@ mod tests {
     ) -> Option<MergeTarget> {
         let index = MergeIndex::new(flanks, &HashSet::new());
         best_merge_target(
-            0, reps, members, flanks, &kmer_sets(reps), &index.candidates(0, flanks),
+            0,
+            reps,
+            members,
+            flanks,
+            &kmer_sets(reps),
+            &index.candidates(0, flanks),
         )
     }
 
@@ -2193,9 +2448,7 @@ mod tests {
     fn moderately_shortened_terminal_alleles_merge_at_length_boundaries() {
         let full = protein(100, 42);
         let members = HashMap::from([(0, HashSet::from([0])), (1, HashSet::from([1]))]);
-        let flanks = HashMap::from([
-            (0, (Some(10), Some(11))), (1, (Some(10), Some(11))),
-        ]);
+        let flanks = HashMap::from([(0, (Some(10), Some(11))), (1, (Some(10), Some(11)))]);
         for length in [81, 90, 94, 95, 99] {
             for short in [&full[..length], &full[100 - length..]] {
                 let reps = HashMap::from([(0, short.to_vec()), (1, full.clone())]);
@@ -2210,18 +2463,13 @@ mod tests {
     fn terminal_merges_require_both_known_flanks_and_disjoint_samples() {
         let full = protein(100, 42);
         let reps = HashMap::from([(0, full[..90].to_vec()), (1, full)]);
-        let mut members = HashMap::from([
-            (0, HashSet::from([0])), (1, HashSet::from([1, 2, 3, 4, 5])),
-        ]);
+        let mut members =
+            HashMap::from([(0, HashSet::from([0])), (1, HashSet::from([1, 2, 3, 4, 5]))]);
         for context in [(Some(10), None), (None, Some(11)), (Some(10), Some(12))] {
-            let flanks = HashMap::from([
-                (0, context), (1, (Some(10), Some(11))),
-            ]);
+            let flanks = HashMap::from([(0, context), (1, (Some(10), Some(11)))]);
             assert!(target(&reps, &members, &flanks).is_none());
         }
-        let flanks = HashMap::from([
-            (0, (Some(10), Some(11))), (1, (Some(10), Some(11))),
-        ]);
+        let flanks = HashMap::from([(0, (Some(10), Some(11))), (1, (Some(10), Some(11)))]);
         members.get_mut(&1).unwrap().insert(0);
         assert!(target(&reps, &members, &flanks).is_none());
     }
@@ -2230,9 +2478,7 @@ mod tests {
     fn interior_domains_and_internal_deletions_are_not_terminal_alleles() {
         let full = protein(100, 42);
         let members = HashMap::from([(0, HashSet::from([0])), (1, HashSet::from([1]))]);
-        let flanks = HashMap::from([
-            (0, (Some(10), Some(11))), (1, (Some(10), Some(11))),
-        ]);
+        let flanks = HashMap::from([(0, (Some(10), Some(11))), (1, (Some(10), Some(11)))]);
         let mut deleted = full[..45].to_vec();
         deleted.extend_from_slice(&full[55..]);
         for short in [full[5..95].to_vec(), deleted] {
@@ -2245,9 +2491,7 @@ mod tests {
     fn terminal_identity_requires_full_coverage_and_98_percent_identity() {
         let full = protein(100, 42);
         let members = HashMap::from([(0, HashSet::from([0])), (1, HashSet::from([1]))]);
-        let flanks = HashMap::from([
-            (0, (Some(10), Some(11))), (1, (Some(10), Some(11))),
-        ]);
+        let flanks = HashMap::from([(0, (Some(10), Some(11))), (1, (Some(10), Some(11)))]);
         let mut short = full[..90].to_vec();
         for changes in 1..=2 {
             let at = changes * 20;
@@ -2265,13 +2509,18 @@ mod tests {
     fn competing_terminal_targets_are_not_merged_arbitrarily() {
         let full = protein(100, 42);
         let reps = HashMap::from([
-            (0, full[..90].to_vec()), (1, full.clone()), (2, full[..95].to_vec()),
+            (0, full[..90].to_vec()),
+            (1, full.clone()),
+            (2, full[..95].to_vec()),
         ]);
         let members = HashMap::from([
-            (0, HashSet::from([0])), (1, HashSet::from([1])), (2, HashSet::from([2])),
+            (0, HashSet::from([0])),
+            (1, HashSet::from([1])),
+            (2, HashSet::from([2])),
         ]);
         let flanks = HashMap::from([
-            (0, (Some(10), Some(11))), (1, (Some(10), Some(11))),
+            (0, (Some(10), Some(11))),
+            (1, (Some(10), Some(11))),
             (2, (Some(10), Some(11))),
         ]);
         assert!(target(&reps, &members, &flanks).is_none());
@@ -2281,19 +2530,28 @@ mod tests {
     fn competing_legacy_fragment_targets_are_not_chosen_by_sample_support() {
         let full = protein(120, 42);
         let reps = HashMap::from([
-            (0, full[..60].to_vec()), (1, full.clone()), (2, full[..110].to_vec()),
+            (0, full[..60].to_vec()),
+            (1, full.clone()),
+            (2, full[..110].to_vec()),
         ]);
         let members = HashMap::from([
-            (0, HashSet::from([0])), (1, HashSet::from([1, 2, 3])), (2, HashSet::from([4])),
+            (0, HashSet::from([0])),
+            (1, HashSet::from([1, 2, 3])),
+            (2, HashSet::from([4])),
         ]);
         let flanks = HashMap::from([
-            (0, (Some(10), None)), (1, (Some(10), Some(11))), (2, (Some(10), Some(12))),
+            (0, (Some(10), None)),
+            (1, (Some(10), Some(11))),
+            (2, (Some(10), Some(12))),
         ]);
         assert!(target(&reps, &members, &flanks).is_none());
     }
 
     fn allele_fixture(
-        short: &[u8], long: &[u8], side: AlleleSide, reverse: bool,
+        short: &[u8],
+        long: &[u8],
+        side: AlleleSide,
+        reverse: bool,
     ) -> (Pools, Vec<Call>, Vec<Vec<usize>>) {
         let mut pools = Pools::default();
         let mut calls = Vec::new();
@@ -2321,8 +2579,15 @@ mod tests {
             calls.push(middle);
             calls.push(call(sample, right, 1200, b"ACDEFGHIKLMNP", &mut pools));
         }
-        let lengths = vec![vec![if missing_right { short_end as usize + 78 } else { 4000 }],
-                           vec![4000], vec![4000]];
+        let lengths = vec![
+            vec![if missing_right {
+                short_end as usize + 78
+            } else {
+                4000
+            }],
+            vec![4000],
+            vec![4000],
+        ];
         (pools, calls, lengths)
     }
 
@@ -2354,11 +2619,28 @@ mod tests {
                     assert_eq!(allele_target(&mut calls, &pools, &lengths).target, Some(1));
                     freeze_contexts(&mut calls, &pools);
                     assert!(merge_fragments(&mut calls, &pools, &lengths));
-                    let id = calls.iter().find(|call| call.sample == 0
-                        && call.protein == pools.protein.iter().position(|sequence| sequence == short).unwrap() as u32)
-                        .unwrap().cluster;
-                    assert!(calls.iter().filter(|call| call.protein == pools.protein.iter()
-                        .position(|sequence| sequence == &full).unwrap() as u32).all(|call| call.cluster == id));
+                    let id = calls
+                        .iter()
+                        .find(|call| {
+                            call.sample == 0
+                                && call.protein
+                                    == pools
+                                        .protein
+                                        .iter()
+                                        .position(|sequence| sequence == short)
+                                        .unwrap() as u32
+                        })
+                        .unwrap()
+                        .cluster;
+                    assert!(calls
+                        .iter()
+                        .filter(|call| call.protein
+                            == pools
+                                .protein
+                                .iter()
+                                .position(|sequence| sequence == &full)
+                                .unwrap() as u32)
+                        .all(|call| call.cluster == id));
                     assert_eq!(split_paralogs(&mut calls, &pools), 0);
                     assert!(!merge_fragments(&mut calls, &pools, &lengths));
                 }
@@ -2371,7 +2653,8 @@ mod tests {
         let full = intact_protein(120, 42);
         for reverse in [false, true] {
             for short in [&full[..90], &full[30..]] {
-                let (pools, mut calls, lengths) = allele_fixture(short, &full, AlleleSide::Either, reverse);
+                let (pools, mut calls, lengths) =
+                    allele_fixture(short, &full, AlleleSide::Either, reverse);
                 assert_eq!(allele_target(&mut calls, &pools, &lengths).target, Some(1));
             }
         }
@@ -2383,19 +2666,31 @@ mod tests {
         let (pools, mut calls, mut lengths) =
             allele_fixture(&full[..90], &full, AlleleSide::MissingSuffix, false);
         lengths[0][0] += 13;
-        assert!(allele_target(&mut calls, &pools, &lengths).target.is_none(), "91 bases is not near the edge");
+        assert!(
+            allele_target(&mut calls, &pools, &lengths).target.is_none(),
+            "91 bases is not near the edge"
+        );
         let (pools, mut calls, lengths) =
             allele_fixture(&full[..90], &full, AlleleSide::MissingPrefix, false);
-        assert!(allele_target(&mut calls, &pools, &lengths).target.is_none(), "N-edge evidence cannot justify a C-terminal deletion");
+        assert!(
+            allele_target(&mut calls, &pools, &lengths).target.is_none(),
+            "N-edge evidence cannot justify a C-terminal deletion"
+        );
         let (pools, mut calls, lengths) =
             allele_fixture(&full[30..], &full, AlleleSide::MissingPrefix, false);
-        calls.iter_mut().find(|call| call.cluster == 0).unwrap().start = 91;
+        calls
+            .iter_mut()
+            .find(|call| call.cluster == 0)
+            .unwrap()
+            .start = 91;
         assert!(allele_target(&mut calls, &pools, &lengths).target.is_none());
         let (mut pools, mut calls, lengths) =
             allele_fixture(&full[30..], &full, AlleleSide::MissingPrefix, false);
         calls.push(call(0, 99, 1, &intact_protein(80, 123), &mut pools));
-        assert!(allele_target(&mut calls, &pools, &lengths).target.is_none(),
-            "an overlapping predecessor is not a lost contig flank");
+        assert!(
+            allele_target(&mut calls, &pools, &lengths).target.is_none(),
+            "an overlapping predecessor is not a lost contig flank"
+        );
     }
 
     #[test]
@@ -2410,11 +2705,16 @@ mod tests {
         let short_dna = crate::genetic_code::back_translate(&full[..60]);
         let shorter = pools.intern_protein(full[..60].to_vec());
         let dna = pools.intern_dna(short_dna);
-        let witness = calls.iter_mut().find(|call| call.sample == 2 && call.cluster == 1).unwrap();
+        let witness = calls
+            .iter_mut()
+            .find(|call| call.sample == 2 && call.cluster == 1)
+            .unwrap();
         witness.protein = shorter;
         witness.dna = dna;
-        assert!(allele_target(&mut calls, &pools, &lengths).target.is_none(),
-            "partial alleles cannot count as full-length witnesses");
+        assert!(
+            allele_target(&mut calls, &pools, &lengths).target.is_none(),
+            "partial alleles cannot count as full-length witnesses"
+        );
         let mut broken = full.clone();
         broken[0] = b'A';
         let (pools, mut calls, lengths) =
@@ -2422,8 +2722,10 @@ mod tests {
         let decision = allele_target(&mut calls, &pools, &lengths);
         assert!(decision.target.is_none());
         assert!(decision.ambiguous);
-        assert!(!merge_fragments(&mut calls, &pools, &lengths),
-            "a nonintact host must not bypass rescue rejection through the legacy route");
+        assert!(
+            !merge_fragments(&mut calls, &pools, &lengths),
+            "a nonintact host must not bypass rescue rejection through the legacy route"
+        );
     }
 
     #[test]
@@ -2439,7 +2741,14 @@ mod tests {
         }
         for sample in 2..4 {
             lengths.push(vec![4000]);
-            bracketed(&mut calls, &mut pools, sample, 1, (10, 11), &[(1, full.as_slice())]);
+            bracketed(
+                &mut calls,
+                &mut pools,
+                sample,
+                1,
+                (10, 11),
+                &[(1, full.as_slice())],
+            );
         }
         lengths.push(vec![4000]);
         bracketed(&mut calls, &mut pools, 4, 1, (10, 12), &[(0, short)]);
@@ -2448,13 +2757,30 @@ mod tests {
         let loci = physical_loci(&calls, &pools);
         let raw = locus_contexts(&calls, &loci, |call| call.cluster);
         let stabilized = stabilize_contexts(&calls, &loci, &raw, |call| call.cluster);
-        let decision = AlleleIndex::new(&calls, &pools, &loci, &stabilized, &lengths).target(0, &pools);
+        let decision =
+            AlleleIndex::new(&calls, &pools, &loci, &stabilized, &lengths).target(0, &pools);
         assert_eq!(decision.target, Some(1));
         assert!(merge_fragments(&mut calls, &pools, &lengths));
-        let short_protein = pools.protein.iter().position(|sequence| sequence == short).unwrap() as u32;
-        let full_protein = pools.protein.iter().position(|sequence| sequence == &full).unwrap() as u32;
-        let short_cluster = calls.iter().find(|call| call.protein == short_protein).unwrap().cluster;
-        let full_cluster = calls.iter().find(|call| call.protein == full_protein).unwrap().cluster;
+        let short_protein = pools
+            .protein
+            .iter()
+            .position(|sequence| sequence == short)
+            .unwrap() as u32;
+        let full_protein = pools
+            .protein
+            .iter()
+            .position(|sequence| sequence == &full)
+            .unwrap() as u32;
+        let short_cluster = calls
+            .iter()
+            .find(|call| call.protein == short_protein)
+            .unwrap()
+            .cluster;
+        let full_cluster = calls
+            .iter()
+            .find(|call| call.protein == full_protein)
+            .unwrap()
+            .cluster;
         assert_eq!(short_cluster, full_cluster);
     }
 
@@ -2481,8 +2807,14 @@ mod tests {
                     variant[index] = if variant[index] == b'A' { b'C' } else { b'A' };
                 }
             }
-            bracketed(&mut calls, &mut pools, 3, 1,
-                if change_context { (10, 12) } else { (10, 11) }, &[(0, &variant)]);
+            bracketed(
+                &mut calls,
+                &mut pools,
+                3,
+                1,
+                if change_context { (10, 12) } else { (10, 11) },
+                &[(0, &variant)],
+            );
             assert!(allele_target(&mut calls, &pools, &lengths).target.is_none());
         }
     }
@@ -2503,21 +2835,44 @@ mod tests {
             allele_fixture(&full[..90], &full, AlleleSide::Either, false);
         for sample in 3..=4 {
             lengths.push(vec![5000]);
-            let model: Vec<_> = calls.iter().filter(|call| call.sample == 1).cloned().collect();
+            let model: Vec<_> = calls
+                .iter()
+                .filter(|call| call.sample == 1)
+                .cloned()
+                .collect();
             for mut copy in model {
                 copy.sample = sample;
-                if copy.cluster == 1 { copy.cluster = 2; }
+                if copy.cluster == 1 {
+                    copy.cluster = 2;
+                }
                 calls.push(copy);
             }
         }
-        bracketed(&mut calls, &mut pools, 3, 3001, (10, 11), &[(0, &full[..90])]);
+        bracketed(
+            &mut calls,
+            &mut pools,
+            3,
+            3001,
+            (10, 11),
+            &[(0, &full[..90])],
+        );
         let decision = allele_target(&mut calls, &pools, &lengths);
         assert!(decision.ambiguous);
         assert!(decision.target.is_none());
         assert!(!merge_fragments(&mut calls, &pools, &lengths));
-        assert_eq!(calls.iter().filter(|call| call.protein == pools.protein.iter()
-            .position(|sequence| sequence == &full[..90]).unwrap() as u32)
-            .map(|call| call.cluster).collect::<HashSet<_>>(), HashSet::from([0]));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.protein
+                    == pools
+                        .protein
+                        .iter()
+                        .position(|sequence| sequence == &full[..90])
+                        .unwrap() as u32)
+                .map(|call| call.cluster)
+                .collect::<HashSet<_>>(),
+            HashSet::from([0])
+        );
         calls.retain(|call| call.sample != 4);
         assert!(allele_target(&mut calls, &pools, &lengths).ambiguous,
             "a singleton alternative host is still ambiguity, not permission to choose the frequent host");
@@ -2529,8 +2884,18 @@ mod tests {
         for bundled in [false, true] {
             let (mut pools, mut calls, mut lengths) =
                 allele_fixture(&full[30..], &full, AlleleSide::MissingPrefix, false);
-            let upstream = pools.protein[calls.iter().find(|call| call.cluster == 10).unwrap().protein as usize].clone();
-            let downstream = pools.protein[calls.iter().find(|call| call.cluster == 11).unwrap().protein as usize].clone();
+            let upstream = pools.protein[calls
+                .iter()
+                .find(|call| call.cluster == 10)
+                .unwrap()
+                .protein as usize]
+                .clone();
+            let downstream = pools.protein[calls
+                .iter()
+                .find(|call| call.cluster == 11)
+                .unwrap()
+                .protein as usize]
+                .clone();
             for sample in 3..=4 {
                 calls.extend([
                     call(sample, 10, 200, &upstream, &mut pools),
@@ -2567,7 +2932,11 @@ mod tests {
         let full = intact_protein(120, 42);
         let (pools, mut calls, lengths) =
             allele_fixture(&full[..90], &full, AlleleSide::Either, false);
-        let model: Vec<_> = calls.iter().filter(|call| call.sample == 1).cloned().collect();
+        let model: Vec<_> = calls
+            .iter()
+            .filter(|call| call.sample == 1)
+            .cloned()
+            .collect();
         for mut copy in model {
             copy.sample = 0;
             copy.start += 2000;
@@ -2576,18 +2945,37 @@ mod tests {
         }
         assert_eq!(allele_target(&mut calls, &pools, &lengths).target, Some(1));
         assert!(!merge_fragments(&mut calls, &pools, &lengths));
-        let short = calls.iter().find(|call| call.protein == pools.protein.iter()
-            .position(|sequence| sequence == &full[..90]).unwrap() as u32).unwrap();
+        let short = calls
+            .iter()
+            .find(|call| {
+                call.protein
+                    == pools
+                        .protein
+                        .iter()
+                        .position(|sequence| sequence == &full[..90])
+                        .unwrap() as u32
+            })
+            .unwrap();
         assert_eq!(short.cluster, 0);
         // The source group is not combined even though its only sequence host is clear.
-        assert!(calls.iter().filter(|call| call.protein == pools.protein.iter()
-            .position(|sequence| sequence == &full).unwrap() as u32).all(|call| call.cluster == 1));
+        assert!(calls
+            .iter()
+            .filter(|call| call.protein
+                == pools
+                    .protein
+                    .iter()
+                    .position(|sequence| sequence == &full)
+                    .unwrap() as u32)
+            .all(|call| call.cluster == 1));
     }
 
     #[test]
     fn shortened_matching_keeps_full_query_identity_and_rejects_domains_and_unknowns() {
         let full = intact_protein(120, 42);
-        assert_eq!(shortened_identity(&full[..60], &full, AlleleSide::Either), Some(1.0));
+        assert_eq!(
+            shortened_identity(&full[..60], &full, AlleleSide::Either),
+            Some(1.0)
+        );
         assert!(shortened_identity(&full[..59], &full, AlleleSide::Either).is_none());
         assert!(shortened_identity(&full, &full, AlleleSide::Either).is_none());
         assert!(shortened_identity(&full[..29], &full[..40], AlleleSide::Either).is_none());
@@ -2597,22 +2985,39 @@ mod tests {
         unknown[10] = b'*';
         assert!(shortened_identity(&unknown, &full, AlleleSide::Either).is_none());
         let interior = &full[10..100];
-        assert!(shortened_identity(interior, &full, AlleleSide::Either).unwrap() < TERMINAL_IDENTITY);
+        assert!(
+            shortened_identity(interior, &full, AlleleSide::Either).unwrap() < TERMINAL_IDENTITY
+        );
         let mut deleted = full[..45].to_vec();
         deleted.extend_from_slice(&full[75..]);
-        assert!(shortened_identity(&deleted, &full, AlleleSide::Either).unwrap() < TERMINAL_IDENTITY);
+        assert!(
+            shortened_identity(&deleted, &full, AlleleSide::Either).unwrap() < TERMINAL_IDENTITY
+        );
         let mut variant = full[..100].to_vec();
         for index in [10, 30] {
             variant[index] = if variant[index] == b'A' { b'C' } else { b'A' };
         }
-        assert_eq!(shortened_identity(&variant, &full, AlleleSide::Either), Some(0.98));
+        assert_eq!(
+            shortened_identity(&variant, &full, AlleleSide::Either),
+            Some(0.98)
+        );
         variant[50] = if variant[50] == b'A' { b'C' } else { b'A' };
-        assert!(shortened_identity(&variant, &full, AlleleSide::Either).unwrap() < TERMINAL_IDENTITY);
+        assert!(
+            shortened_identity(&variant, &full, AlleleSide::Either).unwrap() < TERMINAL_IDENTITY
+        );
     }
 
     fn cluster_of(calls: &[Call], pools: &Pools, sequence: &[u8]) -> u32 {
-        let protein = pools.protein.iter().position(|stored| stored == sequence).unwrap() as u32;
-        calls.iter().find(|call| call.protein == protein).unwrap().cluster
+        let protein = pools
+            .protein
+            .iter()
+            .position(|stored| stored == sequence)
+            .unwrap() as u32;
+        calls
+            .iter()
+            .find(|call| call.protein == protein)
+            .unwrap()
+            .cluster
     }
 
     #[test]
@@ -2631,7 +3036,10 @@ mod tests {
         }
         let lengths = vec![vec![8000], vec![8000]];
         assert!(merge_fragments(&mut calls, &pools, &lengths));
-        assert_eq!(cluster_of(&calls, &pools, piece), cluster_of(&calls, &pools, &full));
+        assert_eq!(
+            cluster_of(&calls, &pools, piece),
+            cluster_of(&calls, &pools, &full)
+        );
     }
 
     #[test]
@@ -2648,7 +3056,10 @@ mod tests {
         }
         let lengths = vec![vec![8000], vec![8000]];
         assert!(!merge_fragments(&mut calls, &pools, &lengths));
-        assert_ne!(cluster_of(&calls, &pools, piece), cluster_of(&calls, &pools, &full));
+        assert_ne!(
+            cluster_of(&calls, &pools, piece),
+            cluster_of(&calls, &pools, &full)
+        );
     }
 
     #[test]
@@ -2662,7 +3073,10 @@ mod tests {
         ];
         let lengths = vec![vec![8000], vec![8000]];
         assert!(merge_fragments(&mut calls, &pools, &lengths));
-        assert_eq!(cluster_of(&calls, &pools, piece), cluster_of(&calls, &pools, &full));
+        assert_eq!(
+            cluster_of(&calls, &pools, piece),
+            cluster_of(&calls, &pools, &full)
+        );
     }
 
     #[test]
@@ -2684,9 +3098,7 @@ mod tests {
     fn legacy_fragment_merges_keep_one_flank_and_containment_rules() {
         let full = protein(100, 42);
         let members = HashMap::from([(0, HashSet::from([0])), (1, HashSet::from([1]))]);
-        let flanks = HashMap::from([
-            (0, (Some(10), None)), (1, (Some(10), Some(11))),
-        ]);
+        let flanks = HashMap::from([(0, (Some(10), None)), (1, (Some(10), Some(11)))]);
         for short in [full[..80].to_vec(), full[20..80].to_vec()] {
             let reps = HashMap::from([(0, short), (1, full.clone())]);
             let chosen = target(&reps, &members, &flanks).expect("legacy fragment");
@@ -2698,12 +3110,21 @@ mod tests {
     fn call(sample: u32, cluster: u32, position: u32, sequence: &[u8], pools: &mut Pools) -> Call {
         let dna = crate::genetic_code::back_translate(sequence);
         Call {
-            sample, contig: 0, start: position,
-            end: position + dna.len() as u32 - 1, strand: 1,
+            sample,
+            contig: 0,
+            start: position,
+            end: position + dna.len() as u32 - 1,
+            strand: 1,
             dna: pools.intern_dna(dna),
-            protein: pools.intern_protein(sequence.to_vec()), cluster, context: cluster, locus: None,
-            source: None, fusion_piece: false,
-            symbol: String::new(), product: String::new(),
+            protein: pools.intern_protein(sequence.to_vec()),
+            cluster,
+            context: cluster,
+            locus: None,
+            source: None,
+            refound: false,
+            fusion_piece: false,
+            symbol: String::new(),
+            product: String::new(),
         }
     }
 
@@ -2746,8 +3167,10 @@ mod tests {
         }
         let decision = allele_target(&mut calls, &pools, &[vec![1000], vec![1000]]);
         assert!(decision.target.is_none());
-        assert!(!decision.ambiguous,
-            "one intact witness must preserve eligibility for the original terminal rule");
+        assert!(
+            !decision.ambiguous,
+            "one intact witness must preserve eligibility for the original terminal rule"
+        );
         assert!(merge(&mut calls, &pools));
         let middle: Vec<_> = calls.iter().filter(|call| call.start == 200).collect();
         assert_eq!(middle[0].cluster, middle[1].cluster);
@@ -2758,17 +3181,36 @@ mod tests {
         records: &[(u32, (Option<u32>, Option<u32>))],
     ) -> (Vec<Vec<usize>>, usize) {
         let mut pools = Pools::default();
-        let calls: Vec<_> = records.iter().enumerate().map(|(index, &(sample, _))| {
-            call(sample, 0, 1000 * index as u32 + 1, b"ACDEFGHIKL", &mut pools)
-        }).collect();
-        let loci: Vec<_> = calls.iter().enumerate().map(|(index, call)| {
-            Locus { first: index, last: index, end: call.end }
-        }).collect();
+        let calls: Vec<_> = records
+            .iter()
+            .enumerate()
+            .map(|(index, &(sample, _))| {
+                call(
+                    sample,
+                    0,
+                    1000 * index as u32 + 1,
+                    b"ACDEFGHIKL",
+                    &mut pools,
+                )
+            })
+            .collect();
+        let loci: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| Locus {
+                first: index,
+                last: index,
+                end: call.end,
+            })
+            .collect();
         let contexts: Vec<_> = records.iter().map(|&(_, context)| context).collect();
         let indexes: Vec<_> = (0..records.len()).collect();
         let plan = paralog_split_groups(&indexes, &calls, &loci, &contexts);
         let assigned: HashSet<_> = plan.groups.iter().flatten().copied().collect();
-        let retained = indexes.into_iter().filter(|index| !assigned.contains(index)).collect();
+        let retained = indexes
+            .into_iter()
+            .filter(|index| !assigned.contains(index))
+            .collect();
         let mut groups = plan.groups;
         groups.push(retained);
         groups.sort();
@@ -2778,8 +3220,10 @@ mod tests {
     #[test]
     fn flank_variants_of_two_paralogs_produce_two_groups_not_four() {
         let records = [
-            (0, (Some(10), Some(11))), (0, (Some(20), Some(21))),
-            (1, (Some(10), Some(12))), (1, (Some(20), Some(22))),
+            (0, (Some(10), Some(11))),
+            (0, (Some(20), Some(21))),
+            (1, (Some(10), Some(12))),
+            (1, (Some(20), Some(22))),
             (2, (Some(10), None)),
         ];
         let (groups, unresolved) = planned_partition(&records);
@@ -2790,8 +3234,11 @@ mod tests {
     #[test]
     fn ambiguous_single_flank_is_not_assigned_to_an_arbitrary_paralog() {
         let records = [
-            (0, (Some(10), Some(11))), (0, (Some(10), Some(12))),
-            (1, (Some(10), None)), (2, (None, None)), (3, (None, None)),
+            (0, (Some(10), Some(11))),
+            (0, (Some(10), Some(12))),
+            (1, (Some(10), None)),
+            (2, (None, None)),
+            (3, (None, None)),
         ];
         let (groups, unresolved) = planned_partition(&records);
         assert_eq!(groups, vec![vec![0], vec![1], vec![2, 3, 4]]);
@@ -2801,17 +3248,21 @@ mod tests {
     #[test]
     fn context_bridge_cannot_combine_cooccurring_paralogs() {
         let records = [
-            (0, (Some(10), Some(11))), (1, (Some(10), Some(12))),
+            (0, (Some(10), Some(11))),
+            (1, (Some(10), Some(12))),
             (0, (Some(20), Some(12))),
         ];
         let (groups, _) = planned_partition(&records);
-        assert!(!groups.iter().any(|group| group.contains(&0) && group.contains(&2)));
+        assert!(!groups
+            .iter()
+            .any(|group| group.contains(&0) && group.contains(&2)));
     }
 
     #[test]
     fn unrelated_single_copy_contexts_are_not_split() {
         let records = [
-            (0, (Some(10), Some(11))), (1, (Some(20), Some(21))),
+            (0, (Some(10), Some(11))),
+            (1, (Some(20), Some(21))),
             (2, (None, None)),
         ];
         assert_eq!(planned_partition(&records), (vec![vec![0, 1, 2]], 0));
@@ -2819,9 +3270,7 @@ mod tests {
 
     #[test]
     fn identical_multicopy_contexts_are_reported_as_unresolved() {
-        let records = [
-            (0, (Some(10), Some(11))), (0, (Some(10), Some(11))),
-        ];
+        let records = [(0, (Some(10), Some(11))), (0, (Some(10), Some(11)))];
         assert_eq!(planned_partition(&records), (vec![vec![0, 1]], 1));
     }
 
@@ -2839,7 +3288,10 @@ mod tests {
         let loci = physical_loci(&calls, &pools);
         assert_eq!(loci.len(), 3);
         assert_eq!((loci[1].first, loci[1].last), (1, 2));
-        assert_eq!(locus_contexts(&calls, &loci, |call| call.cluster)[1], (Some(10), Some(11)));
+        assert_eq!(
+            locus_contexts(&calls, &loci, |call| call.cluster)[1],
+            (Some(10), Some(11))
+        );
         assert_eq!(modal_flanks(&calls, &pools)[&0], (Some(10), Some(11)));
         assert_eq!(split_paralogs(&mut calls, &pools), 0);
     }
@@ -2947,8 +3399,12 @@ mod tests {
     }
 
     fn bracketed(
-        calls: &mut Vec<Call>, pools: &mut Pools, sample: u32, position: u32,
-        flanks: (u32, u32), parts: &[(u32, &[u8])],
+        calls: &mut Vec<Call>,
+        pools: &mut Pools,
+        sample: u32,
+        position: u32,
+        flanks: (u32, u32),
+        parts: &[(u32, &[u8])],
     ) {
         calls.push(call(sample, flanks.0, position, b"MKTLLYVWAACD", pools));
         let mut start = position + 100;
@@ -2957,7 +3413,13 @@ mod tests {
             start = part.end + 1;
             calls.push(part);
         }
-        calls.push(call(sample, flanks.1, position + 600, b"ACDEFGHIKLMNP", pools));
+        calls.push(call(
+            sample,
+            flanks.1,
+            position + 600,
+            b"ACDEFGHIKLMNP",
+            pools,
+        ));
     }
 
     #[test]
@@ -2971,14 +3433,21 @@ mod tests {
             bracketed(&mut calls, &mut pools, sample, 1001, (10, 11), parts);
         }
         freeze_contexts(&mut calls, &pools);
-        assert_eq!(split_paralogs(&mut calls, &pools), 2, "only the flanks split");
+        assert_eq!(
+            split_paralogs(&mut calls, &pools),
+            2,
+            "only the flanks split"
+        );
         let loci = physical_loci(&calls, &pools);
         let current = locus_contexts(&calls, &loci, |call| call.cluster);
         let stable = locus_contexts(&calls, &loci, |call| call.context);
         let core_contexts = |contexts: &[(Option<u32>, Option<u32>)]| {
-            loci.iter().zip(contexts).filter_map(|(locus, &context)| {
-                (pools.protein[calls[locus.first].protein as usize] == full).then_some(context)
-            }).collect::<HashSet<_>>()
+            loci.iter()
+                .zip(contexts)
+                .filter_map(|(locus, &context)| {
+                    (pools.protein[calls[locus.first].protein as usize] == full).then_some(context)
+                })
+                .collect::<HashSet<_>>()
         };
         assert_eq!(core_contexts(&current).len(), 2);
         assert_eq!(core_contexts(&stable).len(), 1);
@@ -2986,10 +3455,17 @@ mod tests {
             assert_eq!(split_paralogs(&mut calls, &pools), 0);
             compress_clusters(&mut calls);
         }
-        let groups: HashSet<_> = calls.iter().filter_map(|call| {
-            (pools.protein[call.protein as usize] == full).then_some(call.cluster)
-        }).collect();
-        assert_eq!(groups.len(), 1, "identical contexts must remain explicitly unresolved");
+        let groups: HashSet<_> = calls
+            .iter()
+            .filter_map(|call| {
+                (pools.protein[call.protein as usize] == full).then_some(call.cluster)
+            })
+            .collect();
+        assert_eq!(
+            groups.len(),
+            1,
+            "identical contexts must remain explicitly unresolved"
+        );
     }
 
     #[test]
@@ -3008,13 +3484,25 @@ mod tests {
         assert_eq!(split_paralogs(&mut calls, &pools), 1);
         for _ in 0..4 {
             let loci = physical_loci(&calls, &pools);
-            assert_eq!(loci.iter().filter(|locus| {
-                pools.protein[calls[locus.first].protein as usize].len() >= 40
-            }).count(), 4, "each fragmented copy is still one locus");
+            assert_eq!(
+                loci.iter()
+                    .filter(|locus| {
+                        pools.protein[calls[locus.first].protein as usize].len() >= 40
+                    })
+                    .count(),
+                4,
+                "each fragmented copy is still one locus"
+            );
             assert_eq!(split_paralogs(&mut calls, &pools), 0);
         }
-        let a = calls.iter().find(|call| call.sample == 0 && call.start == 101).unwrap();
-        let b = calls.iter().find(|call| call.sample == 0 && call.start == 1101).unwrap();
+        let a = calls
+            .iter()
+            .find(|call| call.sample == 0 && call.start == 101)
+            .unwrap();
+        let b = calls
+            .iter()
+            .find(|call| call.sample == 0 && call.start == 1101)
+            .unwrap();
         assert_ne!(a.cluster, b.cluster);
     }
 
@@ -3030,9 +3518,15 @@ mod tests {
         freeze_contexts(&mut calls, &pools);
         calls[2].cluster = 12;
         let members = sample_sets(&calls);
-        assert_eq!(apply_adoptions(&mut calls, &pools, members, &[], &[(10, 11)], &[]), (1, 1, 0));
+        assert_eq!(
+            apply_adoptions(&mut calls, &pools, members, &[], &[(10, 11)], &[]),
+            (1, 1, 0)
+        );
         assert_eq!(calls[0].cluster, calls[1].cluster);
-        assert_ne!(calls[0].cluster, calls[2].cluster, "anchors are not ortholog assignments");
+        assert_ne!(
+            calls[0].cluster, calls[2].cluster,
+            "anchors are not ortholog assignments"
+        );
         assert!(calls.iter().all(|call| call.context == 10));
         compress_clusters(&mut calls);
         assert!(calls.iter().all(|call| call.context == 10));
@@ -3045,13 +3539,31 @@ mod tests {
         let b = protein(80, 123);
         let mut calls = Vec::new();
         for (sample, offset) in [(0, 0), (1, 20)] {
-            bracketed(&mut calls, &mut pools, sample, 1, (10 + offset, 11 + offset), &[(0, &a)]);
-            bracketed(&mut calls, &mut pools, sample, 1001, (12 + offset, 13 + offset), &[(0, &b)]);
+            bracketed(
+                &mut calls,
+                &mut pools,
+                sample,
+                1,
+                (10 + offset, 11 + offset),
+                &[(0, &a)],
+            );
+            bracketed(
+                &mut calls,
+                &mut pools,
+                sample,
+                1001,
+                (12 + offset, 13 + offset),
+                &[(0, &b)],
+            );
         }
         freeze_contexts(&mut calls, &pools);
         assert_eq!(split_paralogs(&mut calls, &pools), 1);
         let cluster_at = |sample, position| {
-            calls.iter().find(|call| call.sample == sample && call.start == position).unwrap().cluster
+            calls
+                .iter()
+                .find(|call| call.sample == sample && call.start == position)
+                .unwrap()
+                .cluster
         };
         assert_eq!(cluster_at(0, 101), cluster_at(1, 101));
         assert_eq!(cluster_at(0, 1101), cluster_at(1, 1101));
@@ -3065,15 +3577,36 @@ mod tests {
         let full = protein(80, 42);
         let mut calls = Vec::new();
         for (sample, offset) in [(0, 0), (1, 20)] {
-            bracketed(&mut calls, &mut pools, sample, 1, (10 + offset, 11 + offset), &[(0, &full)]);
-            bracketed(&mut calls, &mut pools, sample, 1001, (12 + offset, 13 + offset), &[(0, &full)]);
+            bracketed(
+                &mut calls,
+                &mut pools,
+                sample,
+                1,
+                (10 + offset, 11 + offset),
+                &[(0, &full)],
+            );
+            bracketed(
+                &mut calls,
+                &mut pools,
+                sample,
+                1001,
+                (12 + offset, 13 + offset),
+                &[(0, &full)],
+            );
         }
         freeze_contexts(&mut calls, &pools);
         assert_eq!(split_paralogs(&mut calls, &pools), 3);
-        let groups: HashSet<_> = calls.iter().filter_map(|call| {
-            (pools.protein[call.protein as usize] == full).then_some(call.cluster)
-        }).collect();
-        assert_eq!(groups.len(), 4, "ambiguous cross-sample copies must not be assigned by order");
+        let groups: HashSet<_> = calls
+            .iter()
+            .filter_map(|call| {
+                (pools.protein[call.protein as usize] == full).then_some(call.cluster)
+            })
+            .collect();
+        assert_eq!(
+            groups.len(),
+            4,
+            "ambiguous cross-sample copies must not be assigned by order"
+        );
         assert_eq!(split_paralogs(&mut calls, &pools), 0);
     }
 
@@ -3086,13 +3619,31 @@ mod tests {
         let b = protein(80, 123);
         let mut calls = Vec::new();
         for (sample, offset, allele) in [(0, 0, a.as_slice()), (1, 20, variant.as_slice())] {
-            bracketed(&mut calls, &mut pools, sample, 1, (10 + offset, 11 + offset), &[(0, allele)]);
-            bracketed(&mut calls, &mut pools, sample, 1001, (12 + offset, 13 + offset), &[(0, &b)]);
+            bracketed(
+                &mut calls,
+                &mut pools,
+                sample,
+                1,
+                (10 + offset, 11 + offset),
+                &[(0, allele)],
+            );
+            bracketed(
+                &mut calls,
+                &mut pools,
+                sample,
+                1001,
+                (12 + offset, 13 + offset),
+                &[(0, &b)],
+            );
         }
         freeze_contexts(&mut calls, &pools);
         assert_eq!(split_paralogs(&mut calls, &pools), 2);
         let cluster_at = |sample, position| {
-            calls.iter().find(|call| call.sample == sample && call.start == position).unwrap().cluster
+            calls
+                .iter()
+                .find(|call| call.sample == sample && call.start == position)
+                .unwrap()
+                .cluster
         };
         assert_ne!(cluster_at(0, 101), cluster_at(1, 101));
         assert_eq!(cluster_at(0, 1101), cluster_at(1, 1101));
@@ -3105,13 +3656,26 @@ mod tests {
         let tail = b"CCCCCCCCCCCCCCCCCCCC";
         let full = protein(40, 42);
         let mut calls = Vec::new();
-        bracketed(&mut calls, &mut pools, 0, 1, (10, 11), &[(0, head), (0, tail)]);
+        bracketed(
+            &mut calls,
+            &mut pools,
+            0,
+            1,
+            (10, 11),
+            &[(0, head), (0, tail)],
+        );
         bracketed(&mut calls, &mut pools, 0, 1001, (20, 21), &[(0, &full)]);
         bracketed(&mut calls, &mut pools, 1, 1, (30, 31), &[(0, head)]);
         freeze_contexts(&mut calls, &pools);
         assert_eq!(split_paralogs(&mut calls, &pools), 2);
-        let a = calls.iter().find(|call| call.sample == 0 && call.start == 101).unwrap();
-        let b = calls.iter().find(|call| call.sample == 1 && call.start == 101).unwrap();
+        let a = calls
+            .iter()
+            .find(|call| call.sample == 0 && call.start == 101)
+            .unwrap();
+        let b = calls
+            .iter()
+            .find(|call| call.sample == 1 && call.start == 101)
+            .unwrap();
         assert_ne!(a.cluster, b.cluster);
     }
 
@@ -3127,28 +3691,51 @@ mod tests {
             };
             let mut pools = Pools::default();
             let mut contexts = Vec::new();
-            let calls: Vec<_> = (0..30).map(|index| {
-                let sample = (next() % 6) as u32;
-                let left = (next() % 5) as u32;
-                let right = (next() % 5) as u32;
-                contexts.push(((left != 0).then_some(left), (right != 0).then_some(right)));
-                let allele = if next() % 2 == 0 { b"ACDEFGHIKL" } else { b"MNPQRSTVWY" };
-                call(sample, 0, index * 1000 + 1, allele, &mut pools)
-            }).collect();
-            let loci: Vec<_> = calls.iter().enumerate().map(|(index, call)| {
-                Locus { first: index, last: index, end: call.end }
-            }).collect();
+            let calls: Vec<_> = (0..30)
+                .map(|index| {
+                    let sample = (next() % 6) as u32;
+                    let left = (next() % 5) as u32;
+                    let right = (next() % 5) as u32;
+                    contexts.push(((left != 0).then_some(left), (right != 0).then_some(right)));
+                    let allele = if next() % 2 == 0 {
+                        b"ACDEFGHIKL"
+                    } else {
+                        b"MNPQRSTVWY"
+                    };
+                    call(sample, 0, index * 1000 + 1, allele, &mut pools)
+                })
+                .collect();
+            let loci: Vec<_> = calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| Locus {
+                    first: index,
+                    last: index,
+                    end: call.end,
+                })
+                .collect();
             let indexes: Vec<_> = (0..calls.len()).collect();
             let plan = paralog_split_groups(&indexes, &calls, &loci, &contexts);
             let assigned: HashSet<_> = plan.groups.iter().flatten().copied().collect();
-            let retained: Vec<_> = indexes.into_iter().filter(|index| !assigned.contains(index)).collect();
+            let retained: Vec<_> = indexes
+                .into_iter()
+                .filter(|index| !assigned.contains(index))
+                .collect();
             let groups = plan.groups.into_iter().chain(std::iter::once(retained));
             for group in groups {
-                assert!(paralog_split_groups(&group, &calls, &loci, &contexts).groups.is_empty(), "seed {seed}");
+                assert!(
+                    paralog_split_groups(&group, &calls, &loci, &contexts)
+                        .groups
+                        .is_empty(),
+                    "seed {seed}"
+                );
                 for (position, &a) in group.iter().enumerate() {
                     for &b in &group[position + 1..] {
                         if calls[a].sample == calls[b].sample {
-                            assert_eq!(contexts[a], contexts[b], "co-occurring contexts joined for seed {seed}");
+                            assert_eq!(
+                                contexts[a], contexts[b],
+                                "co-occurring contexts joined for seed {seed}"
+                            );
                         }
                     }
                 }
@@ -3174,10 +3761,21 @@ mod tests {
         assert_eq!(split_paralogs(&mut calls, &pools), 1);
         assert!(merge(&mut calls, &pools));
         compress_clusters(&mut calls);
-        let at_a = calls.iter().find(|call| call.sample == 1 && call.start == 101).unwrap().cluster;
-        let at_b = calls.iter().find(|call| call.sample == 1 && call.start == 1101).unwrap().cluster;
+        let at_a = calls
+            .iter()
+            .find(|call| call.sample == 1 && call.start == 101)
+            .unwrap()
+            .cluster;
+        let at_b = calls
+            .iter()
+            .find(|call| call.sample == 1 && call.start == 1101)
+            .unwrap()
+            .cluster;
         assert_ne!(at_a, at_b);
-        for call in calls.iter().filter(|call| call.sample == 2 && (101..500).contains(&call.start)) {
+        for call in calls
+            .iter()
+            .filter(|call| call.sample == 2 && (101..500).contains(&call.start))
+        {
             assert_eq!(call.cluster, at_a);
         }
         for _ in 0..3 {
@@ -3201,7 +3799,10 @@ mod tests {
         assert_eq!(split_paralogs(&mut calls, &pools), 1);
         assert_eq!(split_paralogs(&mut reversed, &pools), 1);
         let labels = |calls: &[Call]| {
-            calls.iter().map(|call| (call.sample, call.start, call.cluster)).collect::<Vec<_>>()
+            calls
+                .iter()
+                .map(|call| (call.sample, call.start, call.cluster))
+                .collect::<Vec<_>>()
         };
         assert_eq!(labels(&calls), labels(&reversed));
     }

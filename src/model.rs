@@ -15,6 +15,8 @@ pub struct Call {
     /// Previously supported physical bundle, independent of the current representative.
     pub locus: Option<u32>,
     pub source: Option<u32>,
+    /// Found in a gap. Annotated calls stay false even when no audit id is stored.
+    pub refound: bool,
     pub fusion_piece: bool,
     pub symbol: String,
     pub product: String,

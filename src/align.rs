@@ -62,7 +62,9 @@ pub(crate) fn terminal_identity_parts(left: &[u8], right: &[u8], long: &[u8]) ->
     (0..=prefix_end)
         .chain(suffix_start..=gap)
         .map(|offset| {
-            let matches = left.iter().chain(right)
+            let matches = left
+                .iter()
+                .chain(right)
                 .zip(&long[offset..offset + length])
                 .filter(|(a, b)| a == b)
                 .count();
@@ -89,7 +91,11 @@ pub fn global_identity(a: &[u8], b: &[u8]) -> Option<f64> {
     let work = short.len().saturating_mul(band.saturating_mul(2) + 1);
     if work > BANDED_WORK_CAP {
         let fit = fit_short_in_long(short, long)?;
-        return if fit.coverage < 0.8 { None } else { Some(fit.identity) };
+        return if fit.coverage < 0.8 {
+            None
+        } else {
+            Some(fit.identity)
+        };
     }
     let matches = banded_matches(short, long, band)?;
     Some(matches as f64 / short.len() as f64)
@@ -157,7 +163,13 @@ impl BandScratch {
                 let diag = if j == 0 {
                     (NEG, 0)
                 } else {
-                    let (ps, pm) = band_cell(prev_lo, prev_hi, &self.prev_score, &self.prev_matches, j - 1);
+                    let (ps, pm) = band_cell(
+                        prev_lo,
+                        prev_hi,
+                        &self.prev_score,
+                        &self.prev_matches,
+                        j - 1,
+                    );
                     if ps <= NEG {
                         (NEG, 0)
                     } else {
@@ -169,7 +181,8 @@ impl BandScratch {
                     }
                 };
                 let up = {
-                    let (ps, pm) = band_cell(prev_lo, prev_hi, &self.prev_score, &self.prev_matches, j);
+                    let (ps, pm) =
+                        band_cell(prev_lo, prev_hi, &self.prev_score, &self.prev_matches, j);
                     if ps <= NEG {
                         (NEG, 0)
                     } else {

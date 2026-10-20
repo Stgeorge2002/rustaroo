@@ -127,7 +127,11 @@ pub fn translate_bytes(bytes: &[u8]) -> Vec<u8> {
             b'M'
         } else {
             first = false;
-            match (base_index(codon[0]), base_index(codon[1]), base_index(codon[2])) {
+            match (
+                base_index(codon[0]),
+                base_index(codon[1]),
+                base_index(codon[2]),
+            ) {
                 (Some(a), Some(b), Some(c)) => AA[a * 16 + b * 4 + c],
                 _ => b'X',
             }

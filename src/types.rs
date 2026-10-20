@@ -11,6 +11,9 @@ use crate::error::{Error, Result};
 /// one gene fold even when they match each other. A fragment that matches two
 /// different longer genes stays, and so does a paralogue below 90% identity
 /// at nearly the same length. The reference stays the longer finished allele.
+/// `strict` then drops a rare gene whose copies do not share a neighborhood.
+/// A gene in at least 95% of genomes, a rarer gene between the same neighbors,
+/// and a gene found only in a gap all stay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Quality {
     Standard,
@@ -56,13 +59,9 @@ impl Default for Params {
 impl Params {
     pub fn validate(&self) -> Result<()> {
         if !(0.0 < self.family_identity && self.family_identity <= 1.0) {
-            return Err(Error::new(
-                "family identity must be between 0 and 1",
-            ));
+            return Err(Error::new("family identity must be between 0 and 1"));
         }
-        if !(self.family_identity <= self.precluster_identity
-            && self.precluster_identity <= 1.0)
-        {
+        if !(self.family_identity <= self.precluster_identity && self.precluster_identity <= 1.0) {
             return Err(Error::new(
                 "precluster identity must be between the family identity and 1",
             ));
@@ -135,6 +134,14 @@ pub struct Gene {
     pub modal_end_samples: u32,
     /// Samples carrying an intact allele longer than the finished end.
     pub extension_samples: u32,
+    /// `core`, `accessory`, `unsupported`, or `refound`.
+    ///
+    /// `core` is present in at least 95% of genomes. `accessory` is rarer and
+    /// the copies that exist share one neighborhood. `unsupported` is rarer
+    /// and the neighborhoods do not agree. `refound` was not annotated; it
+    /// was found in a gap. The label is a column. Only `strict` drops
+    /// `unsupported`.
+    pub support: &'static str,
 }
 
 #[derive(Debug, Clone)]

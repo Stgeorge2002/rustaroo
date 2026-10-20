@@ -21,9 +21,8 @@ pub fn parse_gff_file(path: &Path) -> Result<ParsedSample> {
     let text = read_maybe_gzip(path)?;
     let name = sample_name(path);
     let sibling = sibling_fasta(path).and_then(|fasta| read_maybe_gzip(&fasta).ok());
-    parse_gff(&name, &text, sibling.as_deref()).map_err(|error| {
-        Error::new(format!("{}: {error}", path.display()))
-    })
+    parse_gff(&name, &text, sibling.as_deref())
+        .map_err(|error| Error::new(format!("{}: {error}", path.display())))
 }
 
 pub fn sample_name(path: &Path) -> String {
@@ -50,9 +49,7 @@ pub fn sample_name(path: &Path) -> String {
 pub fn parse_gff(name: &str, text: &str, sibling_fasta: Option<&str>) -> Result<ParsedSample> {
     let (features, embedded) = split_fasta(text);
     let fasta_text = embedded.or(sibling_fasta).ok_or_else(|| {
-        Error::new(
-            "no contig FASTA. Expected a ##FASTA section or a sibling .fa/.fna/.fasta file",
-        )
+        Error::new("no contig FASTA. Expected a ##FASTA section or a sibling .fa/.fna/.fasta file")
     })?;
     let contigs = parse_fasta(fasta_text);
     if contigs.is_empty() {
@@ -191,7 +188,11 @@ fn gene_from_parts(contigs: &[Contig], parts: &[CdsPart]) -> Option<ParsedGene> 
         return None;
     }
     let first = ordered[0];
-    let start = parts.iter().map(|part| part.start).min().unwrap_or(first.start);
+    let start = parts
+        .iter()
+        .map(|part| part.start)
+        .min()
+        .unwrap_or(first.start);
     let end = parts.iter().map(|part| part.end).max().unwrap_or(first.end);
     let symbol = parts
         .iter()
@@ -262,7 +263,10 @@ fn split_fasta(text: &str) -> (&str, Option<&str>) {
         }
     }
     if text.starts_with("##FASTA") || text.starts_with("##fasta") {
-        let rest = text.find('\n').map(|index| &text[index + 1..]).unwrap_or("");
+        let rest = text
+            .find('\n')
+            .map(|index| &text[index + 1..])
+            .unwrap_or("");
         return ("", Some(rest));
     }
     (text, None)
@@ -289,7 +293,11 @@ fn parse_fasta(text: &str) -> Vec<Contig> {
         }
         if let Some(header) = line.strip_prefix('>') {
             flush(&mut name, &mut sequence, &mut contigs);
-            name = header.split_whitespace().next().unwrap_or("contig").to_string();
+            name = header
+                .split_whitespace()
+                .next()
+                .unwrap_or("contig")
+                .to_string();
         } else if !name.is_empty() {
             sequence.push_str(line);
         }
@@ -377,9 +385,20 @@ ctg\tBakta\tCDS\t7\t12\t.\t+\t0\tID=cds%3A1\n\
 ctg\tBakta\tCDS\t13\t24\t.\t+\t0\tgene=unnamed\n\
 ##FASTA\n>ctg\nATGAAAAAATAAATGAAAAAATAA\n";
         let parsed = parse_gff("one", gff, None).unwrap();
-        let multipart = parsed.genes.iter().find(|gene| gene.annotation_id == "cds:1").unwrap();
+        let multipart = parsed
+            .genes
+            .iter()
+            .find(|gene| gene.annotation_id == "cds:1")
+            .unwrap();
         assert_eq!((multipart.start, multipart.end), (1, 12));
         assert_eq!(multipart.dna, "ATGAAAAAATAA");
-        assert_eq!(parsed.genes.iter().filter(|gene| gene.annotation_id.is_empty()).count(), 1);
+        assert_eq!(
+            parsed
+                .genes
+                .iter()
+                .filter(|gene| gene.annotation_id.is_empty())
+                .count(),
+            1
+        );
     }
 }

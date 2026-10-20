@@ -148,9 +148,7 @@ fn greedy(
     let total = order.len();
     let step = (total / 20).max(1);
     if total >= 100 {
-        progress!(
-            "rustroo: {identity:.2} identity pass, {total} proteins, word size {kmer_size}"
-        );
+        progress!("rustroo: {identity:.2} identity pass, {total} proteins, word size {kmer_size}");
     }
     let mut cursor = 0usize;
     let mut width = if chunked { 32usize } else { 1 };

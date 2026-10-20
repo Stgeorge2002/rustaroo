@@ -21,14 +21,18 @@ pub fn write_pangenome(pangenome: &Pangenome, directory: &Path) -> Result<()> {
     let lengths_path = directory.join("lengths.tsv");
     let report_path = directory.join("reference_report.tsv");
     let ((fasta, presence), (lengths, report)) = rayon::join(
-        || rayon::join(
-            || write_fasta(&fasta_path, pangenome),
-            || write_presence(&presence_path, pangenome),
-        ),
-        || rayon::join(
-            || write_lengths(&lengths_path, pangenome),
-            || write_report(&report_path, pangenome),
-        ),
+        || {
+            rayon::join(
+                || write_fasta(&fasta_path, pangenome),
+                || write_presence(&presence_path, pangenome),
+            )
+        },
+        || {
+            rayon::join(
+                || write_lengths(&lengths_path, pangenome),
+                || write_report(&report_path, pangenome),
+            )
+        },
     );
     fasta?;
     presence?;
@@ -91,12 +95,12 @@ fn write_report(path: &Path, pangenome: &Pangenome) -> Result<()> {
     let mut out = buffered(path)?;
     writeln!(
         out,
-        "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles"
+        "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tsupport\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles"
     )?;
     for gene in &pangenome.genes {
         writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             gene.id,
             sanitize_field(&gene.product),
             gene.reference_dna.len(),
@@ -104,6 +108,7 @@ fn write_report(path: &Path, pangenome: &Pangenome) -> Result<()> {
             gene.selection,
             gene.samples_present,
             gene.length_evidence,
+            gene.support,
             gene.modal_end_bp,
             gene.modal_end_samples,
             gene.extension_samples,
@@ -126,26 +131,44 @@ fn sanitize_field(value: &str) -> String {
 }
 
 fn write_members(path: &Path, pangenome: &Pangenome) -> Result<()> {
-    let audit = pangenome.membership_audit.as_ref().expect("membership audit requested");
+    let audit = pangenome
+        .membership_audit
+        .as_ref()
+        .expect("membership audit requested");
     let mut out = buffered(path)?;
-    writeln!(out, "gene\tsample\tcontig\tannotation_id\tstart\tend\tstrand\tlocus\torigin\tallele")?;
+    writeln!(
+        out,
+        "gene\tsample\tcontig\tannotation_id\tstart\tend\tstrand\tlocus\torigin\tallele"
+    )?;
     for member in &audit.members {
         let gene = &pangenome.genes[member.gene].id;
         let sample = &pangenome.sample_names[member.sample as usize];
         let contig = &audit.contig_names[member.sample as usize][member.contig as usize];
         for value in [gene, sample, contig, &member.annotation_id] {
-            if value.chars().any(|character| matches!(character, '\t' | '\n' | '\r')) {
+            if value
+                .chars()
+                .any(|character| matches!(character, '\t' | '\n' | '\r'))
+            {
                 return Err(crate::error::Error::new(
                     "membership identifiers contain TSV delimiters; cannot write an unambiguous audit",
                 ));
             }
         }
-        writeln!(out, "{gene}\t{sample}\t{contig}\t{}\t{}\t{}\t{}\t{}\t{}\tdna_{}",
-            member.annotation_id, member.start, member.end, member.strand, member.locus, member.origin,
-            member.dna)?;
+        writeln!(
+            out,
+            "{gene}\t{sample}\t{contig}\t{}\t{}\t{}\t{}\t{}\t{}\tdna_{}",
+            member.annotation_id,
+            member.start,
+            member.end,
+            member.strand,
+            member.locus,
+            member.origin,
+            member.dna
+        )?;
     }
     out.flush()?;
-    let used: std::collections::BTreeSet<_> = audit.members.iter().map(|member| member.dna).collect();
+    let used: std::collections::BTreeSet<_> =
+        audit.members.iter().map(|member| member.dna).collect();
     let mut alleles = buffered(&path.with_file_name("member_alleles.fa"))?;
     for id in used {
         writeln!(alleles, ">dna_{id}")?;
@@ -172,7 +195,9 @@ mod tests {
     impl TemporaryOutput {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "rustroo-members-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
+                "rustroo-members-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
             ));
             fs::create_dir(&path).unwrap();
             Self(path)
@@ -189,17 +214,36 @@ mod tests {
         Pangenome {
             sample_names: vec!["sample".to_string()],
             genes: vec![Gene {
-                id: "gene".to_string(), product: String::new(), reference_dna: "ATGAAATAA".to_string(),
-                intact: true, selection: "intact", presence: vec![true], lengths: vec![9],
-                samples_present: 1, length_evidence: "unconfirmed_short",
-                samples_with_exact_reference: 1, distinct_alleles: 1,
-                intact_alleles: 1, modal_end_bp: 9, modal_end_samples: 1, extension_samples: 0,
+                id: "gene".to_string(),
+                product: String::new(),
+                reference_dna: "ATGAAATAA".to_string(),
+                intact: true,
+                selection: "intact",
+                presence: vec![true],
+                lengths: vec![9],
+                samples_present: 1,
+                length_evidence: "unconfirmed_short",
+                samples_with_exact_reference: 1,
+                distinct_alleles: 1,
+                intact_alleles: 1,
+                modal_end_bp: 9,
+                modal_end_samples: 1,
+                extension_samples: 0,
+                support: "core",
             }],
             membership_audit: Some(MembershipAudit {
                 contig_names: vec![vec!["contig".to_string()]],
                 members: vec![GeneMember {
-                    gene: 0, sample: 0, contig: 0, annotation_id: "cds1".to_string(),
-                    start: 100, end: 108, strand: -1, locus: 7, dna: 0, origin: "annotated",
+                    gene: 0,
+                    sample: 0,
+                    contig: 0,
+                    annotation_id: "cds1".to_string(),
+                    start: 100,
+                    end: 108,
+                    strand: -1,
+                    locus: 7,
+                    dna: 0,
+                    origin: "annotated",
                 }],
                 sequences: vec!["ATGAAATAA".to_string(), "ATGCCCTAA".to_string()],
             }),
@@ -211,13 +255,17 @@ mod tests {
         let directory = TemporaryOutput::new();
         write_pangenome(&example(), &directory.0).unwrap();
         assert_eq!(fs::read_to_string(directory.0.join("reference_report.tsv")).unwrap(),
-            "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles\n\
-gene\t\t9\tyes\tintact\t1\tunconfirmed_short\t9\t1\t0\t1\t1\t1\n");
-        assert_eq!(fs::read_to_string(directory.0.join("members.tsv")).unwrap(),
+            "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tsupport\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles\n\
+gene\t\t9\tyes\tintact\t1\tunconfirmed_short\tcore\t9\t1\t0\t1\t1\t1\n");
+        assert_eq!(
+            fs::read_to_string(directory.0.join("members.tsv")).unwrap(),
             "gene\tsample\tcontig\tannotation_id\tstart\tend\tstrand\tlocus\torigin\tallele\n\
-gene\tsample\tcontig\tcds1\t100\t108\t-1\t7\tannotated\tdna_0\n");
-        assert_eq!(fs::read_to_string(directory.0.join("member_alleles.fa")).unwrap(),
-            ">dna_0\nATGAAATAA\n");
+gene\tsample\tcontig\tcds1\t100\t108\t-1\t7\tannotated\tdna_0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.0.join("member_alleles.fa")).unwrap(),
+            ">dna_0\nATGAAATAA\n"
+        );
     }
 
     #[test]
@@ -237,7 +285,8 @@ gene\tsample\tcontig\tcds1\t100\t108\t-1\t7\tannotated\tdna_0\n");
     fn audit_identifiers_are_not_silently_sanitized() {
         let directory = TemporaryOutput::new();
         let mut pangenome = example();
-        pangenome.membership_audit.as_mut().unwrap().members[0].annotation_id = "ambiguous\tid".to_string();
+        pangenome.membership_audit.as_mut().unwrap().members[0].annotation_id =
+            "ambiguous\tid".to_string();
         let error = write_pangenome(&pangenome, &directory.0).unwrap_err();
         assert!(error.to_string().contains("TSV delimiters"));
     }

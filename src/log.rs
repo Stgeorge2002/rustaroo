@@ -15,7 +15,10 @@ use crate::error::Result;
 static LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
 
 pub fn open(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
     let mut out = BufWriter::new(File::create(path)?);

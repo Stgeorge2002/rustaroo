@@ -16,11 +16,11 @@ use crate::error::{Error, Result};
 use crate::genetic_code::{is_intact, orf_status, translate};
 use crate::log::{self, progress};
 use crate::model::{Call, Pools};
-use crate::reference::{join_fragments, Allele, choose_reference};
+use crate::reference::{choose_reference, join_fragments, Allele};
 use crate::synteny::{
-    compress_clusters, families_bounded_by_neighbors, freeze_contexts, length_evidence, membership_loci,
-    merge_fragments, refind, screen_unsupported_families, split_fusions, split_paralogs, ALLELE_EDGE_BP,
-    UNCONFIRMED_SHORT,
+    cluster_facts, compress_clusters, families_bounded_by_neighbors, freeze_contexts,
+    length_evidence, membership_loci, merge_fragments, refind, screen_unsupported_families,
+    split_fusions, split_paralogs, ClusterFacts, ALLELE_EDGE_BP, UNCONFIRMED_SHORT,
 };
 use crate::types::{Gene, GeneMember, MembershipAudit, Pangenome, Params, ParsedSample, Quality};
 
@@ -80,6 +80,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
                 context: 0,
                 locus: None,
                 source,
+                refound: false,
                 fusion_piece: false,
                 symbol: gene.symbol,
                 product: gene.product,
@@ -87,9 +88,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
         }
     }
     if calls.is_empty() {
-        return Err(Error::new(
-            "no coding sequences passed the minimum length",
-        ));
+        return Err(Error::new("no coding sequences passed the minimum length"));
     }
     if log::enabled() {
         for (sample, &(contig_count, gene_count)) in samples.iter().zip(&logged_counts) {
@@ -122,17 +121,26 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
         call.cluster = families[call.protein as usize];
     }
     compress_clusters(&mut calls);
-    let family_count = calls.iter().map(|call| call.cluster).max().map_or(0, |id| id + 1);
+    let family_count = calls
+        .iter()
+        .map(|call| call.cluster)
+        .max()
+        .map_or(0, |id| id + 1);
     progress!("rustroo: {family_count} families after homology");
 
     progress!("rustroo: splitting fusions");
     let fusions = split_fusions(&mut calls, &mut pools);
     progress!("rustroo: split {fusions} fusion annotations");
     compress_clusters(&mut calls);
-    progress!("rustroo: {} groups after fusion repair", dense_family_count(&calls));
+    progress!(
+        "rustroo: {} groups after fusion repair",
+        dense_family_count(&calls)
+    );
     freeze_contexts(&mut calls, &pools);
-    let contig_lengths: Vec<Vec<usize>> = contigs.iter()
-        .map(|sample| sample.iter().map(String::len).collect()).collect();
+    let contig_lengths: Vec<Vec<usize>> = contigs
+        .iter()
+        .map(|sample| sample.iter().map(String::len).collect())
+        .collect();
     for round in 1..=4 {
         progress!("rustroo: synteny round {round}");
         let before = dense_family_count(&calls);
@@ -151,7 +159,9 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             break;
         }
         if round == 4 {
-            progress!("rustroo: synteny reached the 4-round limit while groups were still changing");
+            progress!(
+                "rustroo: synteny reached the 4-round limit while groups were still changing"
+            );
         }
     }
     if params.refind {
@@ -190,12 +200,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     let locus_ids = membership_loci(&calls, &pools);
     let mut genes = Vec::with_capacity(groups.len());
     let mut ids: Vec<u32> = groups.keys().copied().collect();
-    ids.sort_by(|&a, &b| {
-        groups[&b]
-            .len()
-            .cmp(&groups[&a].len())
-            .then(a.cmp(&b))
-    });
+    ids.sort_by(|&a, &b| groups[&b].len().cmp(&groups[&a].len()).then(a.cmp(&b)));
     let total = ids.len();
     progress!("rustroo: choosing references for {total} groups");
     // Everything about one group's reference - its alleles, the fusion/
@@ -250,6 +255,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             extension_samples: partial.extension_samples,
             presence: partial.presence,
             lengths: partial.lengths,
+            support: SUPPORT_ACCESSORY,
         });
     }
     genes.sort_by(|a, b| {
@@ -259,7 +265,9 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     });
     let mut loci: HashMap<String, Vec<Locus>> = HashMap::new();
     for call in &calls {
-        let Some(name) = name_of_cluster.get(&call.cluster) else { continue };
+        let Some(name) = name_of_cluster.get(&call.cluster) else {
+            continue;
+        };
         loci.entry(name.clone()).or_default().push(Locus {
             sample: call.sample,
             contig: call.contig,
@@ -268,41 +276,76 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             strand: call.strand,
         });
     }
-    let removed = apply_quality(&mut genes, params.quality, &loci);
+    let mut removed = apply_quality(&mut genes, params.quality, &loci);
+    let cluster_of_gene: HashMap<String, u32> = name_of_cluster
+        .iter()
+        .map(|(&cluster, id)| (id.clone(), cluster))
+        .collect();
+    assign_support(
+        &mut genes,
+        &cluster_of_gene,
+        &cluster_facts(&calls, &pools),
+        sample_names.len(),
+    );
+    if params.quality == Quality::Strict {
+        removed += drop_unsupported(&mut genes);
+    }
     if params.quality != Quality::Standard {
-        progress!("rustroo: quality {label} removed {removed} genes", label = quality_label(params.quality));
+        progress!(
+            "rustroo: quality {label} removed {removed} genes",
+            label = quality_label(params.quality)
+        );
         if genes.is_empty() {
-            return Err(Error::new(
-                "no gene remained after the quality filter",
-            ));
+            return Err(Error::new("no gene remained after the quality filter"));
         }
     }
     let membership_audit = if params.audit_members {
-        let gene_indexes: HashMap<&str, usize> = genes.iter().enumerate()
-            .map(|(index, gene)| (gene.id.as_str(), index)).collect();
+        let gene_indexes: HashMap<&str, usize> = genes
+            .iter()
+            .enumerate()
+            .map(|(index, gene)| (gene.id.as_str(), index))
+            .collect();
         let mut members = Vec::with_capacity(calls.len());
         for (call, &locus) in calls.iter().zip(&locus_ids) {
-            let Some(name) = name_of_cluster.get(&call.cluster) else { continue };
-            let Some(&gene_index) = gene_indexes.get(name.as_str()) else { continue };
+            let Some(name) = name_of_cluster.get(&call.cluster) else {
+                continue;
+            };
+            let Some(&gene_index) = gene_indexes.get(name.as_str()) else {
+                continue;
+            };
             members.push(GeneMember {
                 gene: gene_index,
                 sample: call.sample,
                 contig: call.contig,
-                annotation_id: call.source.map(|id| annotation_ids[id as usize].clone())
+                annotation_id: call
+                    .source
+                    .map(|id| annotation_ids[id as usize].clone())
                     .unwrap_or_default(),
                 start: call.start,
                 end: call.end,
                 strand: call.strand,
                 locus,
                 dna: call.dna,
-                origin: if call.source.is_none() { "refound" }
-                    else if call.fusion_piece { "fusion_piece" } else { "annotated" },
+                origin: if call.refound {
+                    "refound"
+                } else if call.fusion_piece {
+                    "fusion_piece"
+                } else {
+                    "annotated"
+                },
             });
         }
         Some(MembershipAudit {
-            contig_names: samples.iter().map(|sample| {
-                sample.contigs.iter().map(|contig| contig.name.clone()).collect()
-            }).collect(),
+            contig_names: samples
+                .iter()
+                .map(|sample| {
+                    sample
+                        .contigs
+                        .iter()
+                        .map(|contig| contig.name.clone())
+                        .collect()
+                })
+                .collect(),
             members,
             sequences: pools.dna,
         })
@@ -311,10 +354,10 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     };
     progress!("rustroo: {} genes", genes.len());
     if log::enabled() {
-        log::record("gene\tid\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles");
+        log::record("gene\tid\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tsupport\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles");
         for gene in &genes {
             log::record(&format!(
-                "gene\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "gene\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 gene.id,
                 log_field(&gene.product),
                 gene.reference_dna.len(),
@@ -322,6 +365,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
                 gene.selection,
                 gene.samples_present,
                 gene.length_evidence,
+                gene.support,
                 gene.modal_end_bp,
                 gene.modal_end_samples,
                 gene.extension_samples,
@@ -338,6 +382,15 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
         labels.sort_unstable();
         for (label, count) in labels {
             log::record(&format!("summary\tselection\t{label}\t{count}"));
+        }
+        let mut support_tally: HashMap<&str, usize> = HashMap::new();
+        for gene in &genes {
+            *support_tally.entry(gene.support).or_default() += 1;
+        }
+        let mut support_labels: Vec<_> = support_tally.into_iter().collect();
+        support_labels.sort_unstable();
+        for (label, count) in support_labels {
+            log::record(&format!("summary\tsupport\t{label}\t{count}"));
         }
         log::flush();
     }
@@ -363,7 +416,8 @@ fn quality_label(quality: Quality) -> &'static str {
 /// copy at 90%. A repeat offset does not keep the second copy. The same allele
 /// in other genomes is folded into the longer gene so those genomes stay
 /// present. The reference stays the longer finished allele. A paralogue below
-/// 90% identity at nearly the same length stays.
+/// 90% identity at nearly the same length stays. Support labels are applied
+/// afterwards. `strict` then drops only `unsupported`.
 fn apply_quality(
     genes: &mut Vec<Gene>,
     quality: Quality,
@@ -398,6 +452,68 @@ fn apply_quality(
     before - genes.len()
 }
 
+const SUPPORT_CORE: &str = "core";
+const SUPPORT_ACCESSORY: &str = "accessory";
+const SUPPORT_UNSUPPORTED: &str = "unsupported";
+const SUPPORT_REFOUND: &str = "refound";
+
+/// A gene in at least 95% of genomes is core, whether or not it was annotated.
+/// Below that, a gene with no annotated call is refound. An annotated gene
+/// whose copies share one neighborhood is accessory. Anything else is
+/// unsupported.
+fn support_label(
+    samples_present: u32,
+    n_samples: usize,
+    annotated: bool,
+    neighbors_agree: bool,
+) -> &'static str {
+    if n_samples > 0 && u64::from(samples_present) * 20 >= n_samples as u64 * 19 {
+        return SUPPORT_CORE;
+    }
+    if !annotated {
+        return SUPPORT_REFOUND;
+    }
+    if neighbors_agree {
+        SUPPORT_ACCESSORY
+    } else {
+        SUPPORT_UNSUPPORTED
+    }
+}
+
+fn assign_support(
+    genes: &mut [Gene],
+    cluster_of_gene: &HashMap<String, u32>,
+    facts: &HashMap<u32, ClusterFacts>,
+    n_samples: usize,
+) {
+    for gene in genes {
+        let fact = cluster_of_gene
+            .get(&gene.id)
+            .and_then(|cluster| facts.get(cluster))
+            .copied();
+        let (annotated, neighbors_agree) = match fact {
+            Some(fact) => (fact.annotated, fact.neighbors_agree),
+            None => (true, false),
+        };
+        gene.support = support_label(gene.samples_present, n_samples, annotated, neighbors_agree);
+    }
+}
+
+fn drop_unsupported(genes: &mut Vec<Gene>) -> usize {
+    let before = genes.len();
+    genes.retain(|gene| {
+        let reject = gene.support == SUPPORT_UNSUPPORTED;
+        if reject && log::enabled() {
+            log::record(&format!(
+                "quality\tstrict\tdrop\t{}\tsupport\t{SUPPORT_UNSUPPORTED}",
+                gene.id,
+            ));
+        }
+        !reject
+    });
+    before - genes.len()
+}
+
 struct Locus {
     sample: u32,
     contig: u32,
@@ -423,7 +539,10 @@ const NEAR_COPY_IDENTITY: f64 = 0.90;
 /// Indexes of genes that add no presence. The copy present in fewer genomes
 /// is the one removed. Equal support keeps the earlier gene.
 fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -> HashSet<usize> {
-    let proteins: Vec<Vec<u8>> = genes.iter().map(|gene| translate(&gene.reference_dna)).collect();
+    let proteins: Vec<Vec<u8>> = genes
+        .iter()
+        .map(|gene| translate(&gene.reference_dna))
+        .collect();
     // Five residues is specific enough to connect a fragment with its long
     // copy. A tetrapeptide shared by dozens of unrelated genes is not.
     let mut postings: HashMap<[u8; 5], Vec<usize>> = HashMap::new();
@@ -452,13 +571,22 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
             proteins[right]
                 .len()
                 .cmp(&proteins[left].len())
-                .then(genes[right].samples_present.cmp(&genes[left].samples_present))
+                .then(
+                    genes[right]
+                        .samples_present
+                        .cmp(&genes[left].samples_present),
+                )
                 .then(left.cmp(&right))
         });
         hits.truncate(256);
     }
     let mut order: Vec<usize> = (0..genes.len()).collect();
-    order.sort_by(|&left, &right| proteins[left].len().cmp(&proteins[right].len()).then(left.cmp(&right)));
+    order.sort_by(|&left, &right| {
+        proteins[left]
+            .len()
+            .cmp(&proteins[right].len())
+            .then(left.cmp(&right))
+    });
     let mut redundant = HashSet::new();
     for short in order {
         let needed = kmer_counts[short];
@@ -541,9 +669,9 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
         } else if let Some(long) = equal_subset {
             Some(long)
         } else {
-            equal_exclusive.into_iter().min_by_key(|&index| {
-                (std::cmp::Reverse(genes[index].samples_present), index)
-            })
+            equal_exclusive
+                .into_iter()
+                .min_by_key(|&index| (std::cmp::Reverse(genes[index].samples_present), index))
         };
         if let Some(long) = parent {
             if log::enabled() {
@@ -562,9 +690,10 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
 /// The longest of `parents` when every parent is that same reference.
 /// Two parents that fail the duplicate test are different genes.
 fn one_gene(proteins: &[Vec<u8>], parents: &[usize]) -> Option<usize> {
-    let best = parents.iter().copied().min_by_key(|&index| {
-        (std::cmp::Reverse(proteins[index].len()), index)
-    })?;
+    let best = parents
+        .iter()
+        .copied()
+        .min_by_key(|&index| (std::cmp::Reverse(proteins[index].len()), index))?;
     let same = parents.iter().copied().all(|other| {
         if other == best {
             return true;
@@ -602,9 +731,7 @@ fn absorb(keeper: &mut Gene, extra: &Gene) {
     for index in 0..keeper.presence.len() {
         if extra.presence[index] && !keeper.presence[index] {
             keeper.presence[index] = true;
-            if index < keeper.lengths.len()
-                && keeper.lengths.len() == extra.lengths.len()
-            {
+            if index < keeper.lengths.len() && keeper.lengths.len() == extra.lengths.len() {
                 keeper.lengths[index] = extra.lengths[index];
             }
         }
@@ -639,7 +766,10 @@ fn calls_nested(loci: &HashMap<String, Vec<Locus>>, short_id: &str, long_id: &st
     };
     let mut shared = false;
     for short_call in short {
-        let same_sample: Vec<&Locus> = long.iter().filter(|call| call.sample == short_call.sample).collect();
+        let same_sample: Vec<&Locus> = long
+            .iter()
+            .filter(|call| call.sample == short_call.sample)
+            .collect();
         if same_sample.is_empty() {
             continue;
         }
@@ -692,7 +822,10 @@ fn exclusive_allele(fit: &crate::align::Fit, long_len: usize) -> bool {
 
 fn presence_covered(short: &[bool], long: &[bool]) -> bool {
     short.len() == long.len()
-        && short.iter().zip(long).all(|(&has_short, &has_long)| !has_short || has_long)
+        && short
+            .iter()
+            .zip(long)
+            .all(|(&has_short, &has_long)| !has_short || has_long)
 }
 
 fn log_field(value: &str) -> String {
@@ -706,7 +839,11 @@ fn log_field(value: &str) -> String {
 }
 
 fn dense_family_count(calls: &[Call]) -> usize {
-    calls.iter().map(|call| call.cluster as usize).max().map_or(0, |id| id + 1)
+    calls
+        .iter()
+        .map(|call| call.cluster as usize)
+        .max()
+        .map_or(0, |id| id + 1)
 }
 
 /// Everything about one group's chosen reference except its final, unique
@@ -824,7 +961,10 @@ fn alleles_of(
     let mut closed: HashMap<u32, bool> = HashMap::new();
     for &index in indexes {
         let call = &calls[index];
-        samples_for_dna.entry(call.dna).or_default().insert(call.sample);
+        samples_for_dna
+            .entry(call.dna)
+            .or_default()
+            .insert(call.sample);
         let closed = *closed.entry(call.dna).or_insert_with(|| {
             let status = orf_status(&pools.dna[call.dna as usize]);
             status.is_intact() && status.terminal_stop
@@ -833,7 +973,10 @@ fn alleles_of(
         // One internal whole copy is enough for that sample to vouch for the
         // end. A second copy parked on a contig break does not cancel it.
         if closed && whole && !contig_clipped(call, contig_lengths) {
-            finished_for_dna.entry(call.dna).or_default().insert(call.sample);
+            finished_for_dna
+                .entry(call.dna)
+                .or_default()
+                .insert(call.sample);
         }
     }
     let mut alleles: Vec<Allele> = samples_for_dna
@@ -842,7 +985,10 @@ fn alleles_of(
             dna: pools.dna[dna as usize].clone(),
             count: samples.len() as u32,
             synthetic: false,
-            finished: finished_for_dna.get(&dna).map(|samples| samples.len() as u32).unwrap_or(0),
+            finished: finished_for_dna
+                .get(&dna)
+                .map(|samples| samples.len() as u32)
+                .unwrap_or(0),
         })
         .collect();
     alleles.sort_by(|a, b| b.count.cmp(&a.count).then(a.dna.cmp(&b.dna)));
@@ -863,11 +1009,19 @@ fn contig_clipped(call: &Call, contig_lengths: &[Vec<usize>]) -> bool {
         || length.saturating_sub(call.end as usize) <= ALLELE_EDGE_BP
 }
 
-fn joined_allele(indexes: &[usize], calls: &[Call], pools: &Pools, locus_ids: &[u32]) -> Option<String> {
+fn joined_allele(
+    indexes: &[usize],
+    calls: &[Call],
+    pools: &Pools,
+    locus_ids: &[u32],
+) -> Option<String> {
     let mut by_locus: HashMap<(u32, u32, u32), Vec<usize>> = HashMap::new();
     for &index in indexes {
         let call = &calls[index];
-        by_locus.entry((call.sample, call.contig, locus_ids[index])).or_default().push(index);
+        by_locus
+            .entry((call.sample, call.contig, locus_ids[index]))
+            .or_default()
+            .push(index);
     }
     let mut joins: HashMap<String, u32> = HashMap::new();
     for group in by_locus.values() {
@@ -1100,7 +1254,11 @@ mod tests {
             product: String::new(),
             reference_dna: "ATGAAATAA".to_string(),
             intact,
-            selection: if intact { "intact_longest" } else { "no_intact_copy" },
+            selection: if intact {
+                "intact_longest"
+            } else {
+                "no_intact_copy"
+            },
             presence: vec![true],
             lengths: vec![9],
             samples_present: 1,
@@ -1111,6 +1269,7 @@ mod tests {
             modal_end_bp: 9,
             modal_end_samples: 1,
             extension_samples: 0,
+            support: SUPPORT_ACCESSORY,
         }
     }
 
@@ -1123,12 +1282,105 @@ mod tests {
     }
 
     #[test]
+    fn support_label_is_core_then_refound_then_neighborhood() {
+        assert_eq!(support_label(19, 20, false, false), SUPPORT_CORE);
+        assert_eq!(support_label(18, 20, false, true), SUPPORT_REFOUND);
+        assert_eq!(support_label(18, 20, true, true), SUPPORT_ACCESSORY);
+        assert_eq!(support_label(18, 20, true, false), SUPPORT_UNSUPPORTED);
+        assert_eq!(support_label(1, 1, true, false), SUPPORT_CORE);
+    }
+
+    #[test]
+    fn strict_drops_only_an_unsupported_gene() {
+        let left = random_protein(90, 1);
+        let middle = random_protein(90, 2);
+        let right = random_protein(90, 3);
+        let private = random_protein(90, 11);
+        let wander = random_protein(90, 17);
+        let mut inputs = Vec::new();
+        for index in 0..60 {
+            inputs.push(sample(
+                &format!("g{index:02}"),
+                vec![
+                    coding(&left, 0, 1_000, "left"),
+                    coding(&middle, 0, 2_000, "middle"),
+                    coding(&right, 0, 3_000, "right"),
+                ],
+            ));
+        }
+        inputs.push(sample(
+            "acc",
+            vec![
+                coding(&left, 0, 1_000, "left"),
+                coding(&private, 0, 2_000, "private"),
+                coding(&right, 0, 3_000, "right"),
+            ],
+        ));
+        inputs.push(sample(
+            "u1",
+            vec![
+                coding(&left, 0, 1_000, "left"),
+                coding(&wander, 0, 2_000, "wander"),
+                coding(&middle, 0, 3_000, "middle"),
+            ],
+        ));
+        inputs.push(sample(
+            "u2",
+            vec![
+                coding(&middle, 0, 1_000, "middle"),
+                coding(&wander, 0, 2_000, "wander"),
+                coding(&right, 0, 3_000, "right"),
+            ],
+        ));
+        let labelled = |genes: &[Gene], id: &str| {
+            genes
+                .iter()
+                .find(|gene| gene.id == id)
+                .map(|gene| gene.support)
+        };
+        let standard = build(inputs.clone(), &params()).unwrap();
+        assert_eq!(labelled(&standard.genes, "middle"), Some(SUPPORT_CORE));
+        assert_eq!(
+            labelled(&standard.genes, "private"),
+            Some(SUPPORT_ACCESSORY)
+        );
+        assert_eq!(
+            labelled(&standard.genes, "wander"),
+            Some(SUPPORT_UNSUPPORTED)
+        );
+        let mut high = params();
+        high.quality = Quality::High;
+        let high = build(inputs.clone(), &high).unwrap();
+        assert_eq!(labelled(&high.genes, "wander"), Some(SUPPORT_UNSUPPORTED));
+        assert_eq!(high.genes.len(), standard.genes.len());
+        let mut strict = params();
+        strict.quality = Quality::Strict;
+        let strict = build(inputs, &strict).unwrap();
+        assert_eq!(labelled(&strict.genes, "wander"), None);
+        assert_eq!(labelled(&strict.genes, "middle"), Some(SUPPORT_CORE));
+        assert_eq!(labelled(&strict.genes, "private"), Some(SUPPORT_ACCESSORY));
+        assert_eq!(strict.genes.len() + 1, standard.genes.len());
+    }
+
+    #[test]
     fn membership_audit_does_not_change_references_or_grouping() {
         let protein = diverse(40, 4);
         let other = diverse(40, 7);
         let inputs = vec![
-            sample("b", vec![coding(&other, 0, 100, "extra"), coding(&protein, 0, 300, "gene")]),
-            sample("a", vec![coding(&other, 0, 100, "extra"), coding(&protein, 0, 400, "gene")]),
+            sample(
+                "b",
+                vec![
+                    coding(&other, 0, 100, "extra"),
+                    coding(&protein, 0, 300, "gene"),
+                ],
+            ),
+            sample(
+                "a",
+                vec![
+                    coding(&other, 0, 100, "extra"),
+                    coding(&protein, 0, 400, "gene"),
+                ],
+            ),
         ];
         let normal = build(inputs.clone(), &params()).unwrap();
         assert!(normal.membership_audit.is_none());
@@ -1148,23 +1400,37 @@ mod tests {
         assert_eq!(audit.members.len(), 4);
         for member in &audit.members {
             let extra = member.start == 100;
-            assert_eq!(audited.genes[member.gene].id, if extra { "extra" } else { "gene" });
-            let expected = if extra { 100 }
-                else if audited.sample_names[member.sample as usize] == "a" { 400 } else { 300 };
+            assert_eq!(
+                audited.genes[member.gene].id,
+                if extra { "extra" } else { "gene" }
+            );
+            let expected = if extra {
+                100
+            } else if audited.sample_names[member.sample as usize] == "a" {
+                400
+            } else {
+                300
+            };
             assert_eq!(member.start, expected);
             assert_eq!(member.annotation_id, format!("cds_0_{expected}"));
             assert_eq!(member.origin, "annotated");
-            assert_eq!(audit.sequences[member.dna as usize], back_translate(if extra { &other } else { &protein }));
+            assert_eq!(
+                audit.sequences[member.dna as usize],
+                back_translate(if extra { &other } else { &protein })
+            );
         }
         assert_ne!(audit.members[0].locus, audit.members[1].locus);
     }
 
     fn shared_triplet(name: &str, left: &[u8], middle: &[u8], right: &[u8]) -> ParsedSample {
-        sample(name, vec![
-            coding(left, 0, 1, "flkL"),
-            coding(middle, 0, 400, "core"),
-            coding(right, 0, 900, "flkR"),
-        ])
+        sample(
+            name,
+            vec![
+                coding(left, 0, 1, "flkL"),
+                coding(middle, 0, 400, "core"),
+                coding(right, 0, 900, "flkR"),
+            ],
+        )
     }
 
     #[test]
@@ -1179,18 +1445,28 @@ mod tests {
             .collect();
         let mut with_tail = shared_triplet("tail", &left, &core, &right);
         let flank_end = with_tail.genes[2].end;
-        with_tail.genes.push(coding(&tail, 0, flank_end + 40, "tail"));
+        with_tail
+            .genes
+            .push(coding(&tail, 0, flank_end + 40, "tail"));
         with_tail.contigs[0].sequence = "N".repeat(with_tail.genes[3].end as usize + 20);
         samples.push(with_tail);
         let mut with_insert = shared_triplet("insert", &left, &core, &right);
-        with_insert.genes.insert(1, coding(&embedded, 0, 200, "rare"));
+        with_insert
+            .genes
+            .insert(1, coding(&embedded, 0, 200, "rare"));
         samples.push(with_insert);
 
         let built = build(samples, &params()).unwrap();
         let ids: Vec<_> = built.genes.iter().map(|gene| gene.id.as_str()).collect();
         assert!(ids.contains(&"core") && ids.contains(&"flkL") && ids.contains(&"flkR"));
-        assert!(ids.contains(&"rare"), "a gene between two neighbors is evidence, not a tail");
-        assert!(!ids.contains(&"tail"), "a private gene at a contig end is not a family");
+        assert!(
+            ids.contains(&"rare"),
+            "a gene between two neighbors is evidence, not a tail"
+        );
+        assert!(
+            !ids.contains(&"tail"),
+            "a private gene at a contig end is not a family"
+        );
         let rare = built.genes.iter().find(|gene| gene.id == "rare").unwrap();
         assert_eq!(rare.samples_present, 1);
         assert!(rare.intact);
@@ -1207,13 +1483,19 @@ mod tests {
         let mut samples: Vec<_> = (0..4)
             .map(|index| shared_triplet(&format!("s{index}"), &left, &core, &right))
             .collect();
-        samples.push(sample("island", vec![
-            coding(&diverse(36, 31), 0, 1, "c1"),
-            coding(&diverse(36, 32), 0, 400, "c2"),
-            coding(&diverse(36, 33), 0, 800, "c3"),
-        ]));
+        samples.push(sample(
+            "island",
+            vec![
+                coding(&diverse(36, 31), 0, 1, "c1"),
+                coding(&diverse(36, 32), 0, 400, "c2"),
+                coding(&diverse(36, 33), 0, 800, "c3"),
+            ],
+        ));
         let built = build(samples, &params()).unwrap();
-        assert!(built.genes.iter().all(|gene| !matches!(gene.id.as_str(), "c1" | "c2" | "c3")));
+        assert!(built
+            .genes
+            .iter()
+            .all(|gene| !matches!(gene.id.as_str(), "c1" | "c2" | "c3")));
         assert_eq!(built.genes.len(), 3);
     }
 
@@ -1226,14 +1508,21 @@ mod tests {
         let mut samples: Vec<_> = (0..4)
             .map(|index| shared_triplet(&format!("s{index}"), &left, &core, &right))
             .collect();
-        samples.push(sample("middle", vec![
-            coding(&left, 0, 1, "flkL"),
-            coding(&core, 0, 400, "core"),
-            coding(&isolated, 0, 20_000, "island"),
-            coding(&right, 0, 40_000, "flkR"),
-        ]));
+        samples.push(sample(
+            "middle",
+            vec![
+                coding(&left, 0, 1, "flkL"),
+                coding(&core, 0, 400, "core"),
+                coding(&isolated, 0, 20_000, "island"),
+                coding(&right, 0, 40_000, "flkR"),
+            ],
+        ));
         let built = build(samples.clone(), &params()).unwrap();
-        let gene = built.genes.iter().find(|gene| gene.id == "island").expect("gap-isolated gene");
+        let gene = built
+            .genes
+            .iter()
+            .find(|gene| gene.id == "island")
+            .expect("gap-isolated gene");
         assert_eq!(gene.samples_present, 1);
         assert_eq!(gene.length_evidence, crate::synteny::UNCONFIRMED_SHORT);
         let mut high = params();
@@ -1256,7 +1545,10 @@ mod tests {
             labelled("broken", false, LENGTH_SUFFICIENT),
         ];
         let loci = std::collections::HashMap::new();
-        assert_eq!(super::apply_quality(&mut genes.clone(), Quality::Standard, &loci), 0);
+        assert_eq!(
+            super::apply_quality(&mut genes.clone(), Quality::Standard, &loci),
+            0
+        );
         assert_eq!(super::apply_quality(&mut genes, Quality::High, &loci), 2);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["core", "short_ok"]);
@@ -1326,9 +1618,14 @@ mod tests {
         band.reference_dna = back_translate(&band_aa);
         band.presence = vec![true, false, false];
         band.samples_present = 1;
-        let mut genes = vec![long, piece, alone, near, copy, twin, paralog, close, deep, band];
+        let mut genes = vec![
+            long, piece, alone, near, copy, twin, paralog, close, deep, band,
+        ];
         let loci = std::collections::HashMap::new();
-        assert_eq!(super::apply_quality(&mut genes.clone(), Quality::High, &loci), 0);
+        assert_eq!(
+            super::apply_quality(&mut genes.clone(), Quality::High, &loci),
+            0
+        );
         assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 7);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         // `alone` is an exact piece of `long` and also of the diverged paralogue,
@@ -1433,7 +1730,10 @@ mod tests {
         shared.presence = vec![false, false, true];
         shared.samples_present = 1;
         let mut ambiguous = vec![left, right, shared];
-        assert_eq!(super::apply_quality(&mut ambiguous, Quality::Strict, &loci), 0);
+        assert_eq!(
+            super::apply_quality(&mut ambiguous, Quality::Strict, &loci),
+            0
+        );
         let ids: Vec<_> = ambiguous.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["left", "right", "shared"]);
 
@@ -1510,24 +1810,63 @@ mod tests {
         beside.presence = vec![true, false];
         beside.samples_present = 1;
         let mut loci: HashMap<String, Vec<super::Locus>> = HashMap::new();
-        loci.insert("long".to_string(), vec![super::Locus {
-            sample: 0, contig: 0, start: 100, end: 900, strand: 1,
-        }, super::Locus {
-            sample: 1, contig: 0, start: 100, end: 900, strand: 1,
-        }]);
-        loci.insert("nested".to_string(), vec![super::Locus {
-            sample: 0, contig: 0, start: 200, end: 400, strand: 1,
-        }]);
-        loci.insert("weak".to_string(), vec![super::Locus {
-            sample: 0, contig: 0, start: 200, end: 400, strand: 1,
-        }]);
-        loci.insert("beside".to_string(), vec![super::Locus {
-            sample: 0, contig: 0, start: 1_000, end: 1_200, strand: 1,
-        }]);
+        loci.insert(
+            "long".to_string(),
+            vec![
+                super::Locus {
+                    sample: 0,
+                    contig: 0,
+                    start: 100,
+                    end: 900,
+                    strand: 1,
+                },
+                super::Locus {
+                    sample: 1,
+                    contig: 0,
+                    start: 100,
+                    end: 900,
+                    strand: 1,
+                },
+            ],
+        );
+        loci.insert(
+            "nested".to_string(),
+            vec![super::Locus {
+                sample: 0,
+                contig: 0,
+                start: 200,
+                end: 400,
+                strand: 1,
+            }],
+        );
+        loci.insert(
+            "weak".to_string(),
+            vec![super::Locus {
+                sample: 0,
+                contig: 0,
+                start: 200,
+                end: 400,
+                strand: 1,
+            }],
+        );
+        loci.insert(
+            "beside".to_string(),
+            vec![super::Locus {
+                sample: 0,
+                contig: 0,
+                start: 1_000,
+                end: 1_200,
+                strand: 1,
+            }],
+        );
         let split_aa = long_aa.clone();
         let mut diverged_aa = long_aa.clone();
         for site in [4, 12, 20, 28, 36, 44, 52, 60, 68, 76] {
-            diverged_aa[site] = if diverged_aa[site] == b'A' { b'L' } else { b'A' };
+            diverged_aa[site] = if diverged_aa[site] == b'A' {
+                b'L'
+            } else {
+                b'A'
+            };
         }
         let mut split = labelled("split", true, LENGTH_SUFFICIENT);
         split.reference_dna = back_translate(&split_aa);
@@ -1557,28 +1896,36 @@ mod tests {
         let junk = random_protein(36, 505);
         let mut samples = Vec::new();
         for index in 0..6 {
-            samples.push(sample(&format!("s{index}"), vec![
+            samples.push(sample(
+                &format!("s{index}"),
+                vec![
+                    coding(&left_a, 0, 1, "leftA"),
+                    coding(&dup, 0, 300, "dup"),
+                    coding(&right_a, 0, 600, "rightA"),
+                    coding(&left_b, 0, 900, "leftB"),
+                    coding(&dup, 0, 1200, "dup"),
+                    coding(&right_b, 0, 1500, "rightB"),
+                ],
+            ));
+        }
+        samples.push(sample(
+            "odd",
+            vec![
                 coding(&left_a, 0, 1, "leftA"),
                 coding(&dup, 0, 300, "dup"),
                 coding(&right_a, 0, 600, "rightA"),
                 coding(&left_b, 0, 900, "leftB"),
                 coding(&dup, 0, 1200, "dup"),
                 coding(&right_b, 0, 1500, "rightB"),
-            ]));
-        }
-        samples.push(sample("odd", vec![
-            coding(&left_a, 0, 1, "leftA"),
-            coding(&dup, 0, 300, "dup"),
-            coding(&right_a, 0, 600, "rightA"),
-            coding(&left_b, 0, 900, "leftB"),
-            coding(&dup, 0, 1200, "dup"),
-            coding(&right_b, 0, 1500, "rightB"),
-            coding(&left_b, 0, 1800, "leftB"),
-            coding(&dup, 0, 2100, "dup"),
-            coding(&junk, 0, 2400, "junk"),
-        ]));
+                coding(&left_b, 0, 1800, "leftB"),
+                coding(&dup, 0, 2100, "dup"),
+                coding(&junk, 0, 2400, "junk"),
+            ],
+        ));
         let built = build(samples, &params()).unwrap();
-        let copies: Vec<_> = built.genes.iter()
+        let copies: Vec<_> = built
+            .genes
+            .iter()
             .filter(|gene| gene.reference_dna == back_translate(&dup))
             .collect();
         assert_eq!(copies.len(), 2, "the private neighbor is not a third copy");
@@ -1599,18 +1946,24 @@ mod tests {
             gene.dna = dna.to_string();
             gene.protein = protein.to_vec();
             gene.end = gene.start + gene.dna.len() as u32 - 1;
-            let mut sample = sample(name, vec![
-                coding(&left, 0, 1, "flkL"),
-                gene,
-                coding(&right, 0, 900, "flkR"),
-            ]);
+            let mut sample = sample(
+                name,
+                vec![
+                    coding(&left, 0, 1, "flkL"),
+                    gene,
+                    coding(&right, 0, 900, "flkR"),
+                ],
+            );
             sample.contigs[0].sequence = "N".repeat(1000);
             sample
         };
         let only_broken = build(
-            (0..4).map(|index| pseudo(&format!("b{index}"), &broken, &broken_protein)).collect(),
+            (0..4)
+                .map(|index| pseudo(&format!("b{index}"), &broken, &broken_protein))
+                .collect(),
             &params(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(only_broken.genes.iter().all(|gene| gene.id != "pseudo"));
         assert_eq!(only_broken.genes.len(), 2);
 
@@ -1627,13 +1980,27 @@ mod tests {
 
     #[test]
     fn one_sample_collection_is_not_eaten_from_the_contig_ends() {
-        let built = build(vec![sample("only", vec![
-            coding(&diverse(36, 1), 0, 1, "left"),
-            coding(&diverse(40, 2), 0, 400, "middle"),
-            coding(&diverse(36, 3), 0, 800, "right"),
-        ])], &params()).unwrap();
+        let built = build(
+            vec![sample(
+                "only",
+                vec![
+                    coding(&diverse(36, 1), 0, 1, "left"),
+                    coding(&diverse(40, 2), 0, 400, "middle"),
+                    coding(&diverse(36, 3), 0, 800, "right"),
+                ],
+            )],
+            &params(),
+        )
+        .unwrap();
         assert_eq!(built.genes.len(), 3);
-        let evidence = |id: &str| built.genes.iter().find(|gene| gene.id == id).unwrap().length_evidence;
+        let evidence = |id: &str| {
+            built
+                .genes
+                .iter()
+                .find(|gene| gene.id == id)
+                .unwrap()
+                .length_evidence
+        };
         assert_eq!(evidence("middle"), crate::synteny::CONSERVED_SHORT);
         assert_eq!(evidence("left"), crate::synteny::UNCONFIRMED_SHORT);
         assert_eq!(evidence("right"), crate::synteny::UNCONFIRMED_SHORT);
@@ -1689,8 +2056,17 @@ mod tests {
         for index in 0..10 {
             let reverse = index % 2 == 1;
             let complete = index < 2;
-            let protein = if complete { full.as_slice() } else { &full[30..] };
-            let mut middle = coding(protein, 0, if !complete && !reverse { 19 } else { 400 }, "gene");
+            let protein = if complete {
+                full.as_slice()
+            } else {
+                &full[30..]
+            };
+            let mut middle = coding(
+                protein,
+                0,
+                if !complete && !reverse { 19 } else { 400 },
+                "gene",
+            );
             if !complete {
                 middle.dna.replace_range(0..3, "ATG");
                 middle.protein = translate(&middle.dna);
@@ -1699,8 +2075,18 @@ mod tests {
             expected_lengths.push(middle.dna.len() as u32);
             let mut genes = Vec::new();
             if complete {
-                genes.push(coding(if reverse { &downstream } else { &upstream }, 0, 100, "flank"));
-                genes.push(coding(if reverse { &upstream } else { &downstream }, 0, 1100, "flank"));
+                genes.push(coding(
+                    if reverse { &downstream } else { &upstream },
+                    0,
+                    100,
+                    "flank",
+                ));
+                genes.push(coding(
+                    if reverse { &upstream } else { &downstream },
+                    0,
+                    1100,
+                    "flank",
+                ));
             } else if reverse {
                 genes.push(coding(&downstream, 0, 100, "flank"));
             } else {
@@ -1715,26 +2101,58 @@ mod tests {
         assert_eq!(built.genes.len(), 3);
         let gene = built.genes.iter().find(|gene| gene.id == "gene").unwrap();
         assert!(gene.intact);
-        assert_eq!(gene.reference_dna, back_translate(&full), "common truncations must not define the reference");
+        assert_eq!(
+            gene.reference_dna,
+            back_translate(&full),
+            "common truncations must not define the reference"
+        );
         assert_eq!(gene.presence, vec![true; 10]);
         assert_eq!(gene.lengths, expected_lengths);
         assert_eq!(gene.samples_with_exact_reference, 2);
         let audit = built.membership_audit.as_ref().unwrap();
-        let members: Vec<_> = audit.members.iter().filter(|member| built.genes[member.gene].id == "gene").collect();
+        let members: Vec<_> = audit
+            .members
+            .iter()
+            .filter(|member| built.genes[member.gene].id == "gene")
+            .collect();
         assert_eq!(members.len(), 10);
-        assert!(members.iter().all(|member| !member.annotation_id.is_empty() && member.origin == "annotated"));
-        assert_eq!(members.iter().map(|member| member.locus).collect::<HashSet<_>>().len(), 10);
+        assert!(members
+            .iter()
+            .all(|member| !member.annotation_id.is_empty() && member.origin == "annotated"));
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.locus)
+                .collect::<HashSet<_>>()
+                .len(),
+            10
+        );
     }
 
     fn pooled_test_call(
-        pools: &mut Pools, protein: &[u8], contig: u32, start: u32, strand: i8,
+        pools: &mut Pools,
+        protein: &[u8],
+        contig: u32,
+        start: u32,
+        strand: i8,
     ) -> Call {
         let dna = back_translate(protein);
         Call {
-            sample: 0, contig, start, end: start + dna.len() as u32 - 1, strand,
-            protein: pools.intern_protein(translate(&dna)), dna: pools.intern_dna(dna),
-            cluster: 0, context: 0, locus: None, source: Some(0), fusion_piece: false,
-            symbol: String::new(), product: String::new(),
+            sample: 0,
+            contig,
+            start,
+            end: start + dna.len() as u32 - 1,
+            strand,
+            protein: pools.intern_protein(translate(&dna)),
+            dna: pools.intern_dna(dna),
+            cluster: 0,
+            context: 0,
+            locus: None,
+            source: Some(0),
+            refound: false,
+            fusion_piece: false,
+            symbol: String::new(),
+            product: String::new(),
         }
     }
 
@@ -1751,7 +2169,10 @@ mod tests {
             let calls = vec![a, b];
             let loci = membership_loci(&calls, &pools);
             assert_eq!(loci[0], loci[1]);
-            assert_eq!(joined_allele(&[0, 1], &calls, &pools, &loci), Some(back_translate(&full)));
+            assert_eq!(
+                joined_allele(&[0, 1], &calls, &pools, &loci),
+                Some(back_translate(&full))
+            );
         }
     }
 
@@ -1761,21 +2182,35 @@ mod tests {
         for other_contig in [false, true] {
             let mut pools = Pools::default();
             let a = pooled_test_call(&mut pools, &full[..40], 0, 100, 1);
-            let b = pooled_test_call(&mut pools, &full[40..], u32::from(other_contig), a.end + 1, 1);
+            let b = pooled_test_call(
+                &mut pools,
+                &full[40..],
+                u32::from(other_contig),
+                a.end + 1,
+                1,
+            );
             let calls = vec![a, b];
             if other_contig {
                 let loci = membership_loci(&calls, &pools);
                 assert_ne!(loci[0], loci[1]);
                 assert!(joined_allele(&[0, 1], &calls, &pools, &loci).is_none());
             } else {
-                assert!(joined_allele(&[0, 1], &calls, &pools, &[0, 1]).is_none(),
-                    "abutting coordinates alone cannot license a join");
+                assert!(
+                    joined_allele(&[0, 1], &calls, &pools, &[0, 1]).is_none(),
+                    "abutting coordinates alone cannot license a join"
+                );
             }
         }
         for overlap in [false, true] {
             let mut pools = Pools::default();
             let a = pooled_test_call(&mut pools, &full, 0, 100, 1);
-            let b = pooled_test_call(&mut pools, &full, 0, if overlap { 101 } else { a.end + 1 }, 1);
+            let b = pooled_test_call(
+                &mut pools,
+                &full,
+                0,
+                if overlap { 101 } else { a.end + 1 },
+                1,
+            );
             let calls = vec![a, b];
             let loci = membership_loci(&calls, &pools);
             assert!(joined_allele(&[0, 1], &calls, &pools, &loci).is_none());
@@ -1790,15 +2225,22 @@ mod tests {
         let bp = first.dna.len() as u32;
         let input = ParsedSample {
             name: "one".to_string(),
-            contigs: (0..2).map(|index| Contig {
-                name: format!("contig{index}"), sequence: "N".repeat(1000),
-            }).collect(),
+            contigs: (0..2)
+                .map(|index| Contig {
+                    name: format!("contig{index}"),
+                    sequence: "N".repeat(1000),
+                })
+                .collect(),
             genes: vec![first, second],
         };
         let mut params = params();
         params.audit_members = true;
         let built = build(vec![input], &params).unwrap();
-        assert_eq!(built.genes.len(), 1, "indistinguishable copies stay explicitly unresolved");
+        assert_eq!(
+            built.genes.len(),
+            1,
+            "indistinguishable copies stay explicitly unresolved"
+        );
         assert_eq!(built.genes[0].reference_dna, back_translate(&protein));
         assert_eq!(built.genes[0].lengths, vec![bp * 2]);
         let members = &built.membership_audit.as_ref().unwrap().members;
@@ -1813,26 +2255,38 @@ mod tests {
         let flank_l = diverse(36, 8);
         let flank_r = diverse(36, 15);
         let make_sample = |name: &str, protein: &[u8]| {
-            sample(name, vec![
-                coding(&flank_l, 0, 1, "flkL"),
-                coding(protein, 0, 400, "coreA"),
-                coding(&flank_r, 0, 900, "flkR"),
-            ])
+            sample(
+                name,
+                vec![
+                    coding(&flank_l, 0, 1, "flkL"),
+                    coding(protein, 0, 400, "coreA"),
+                    coding(&flank_r, 0, 900, "flkR"),
+                ],
+            )
         };
         let built = build(
             vec![make_sample("intact", &full), make_sample("short", &short)],
             &params(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(built.genes.len(), 3);
-        let gene = built.genes.iter().find(|gene| gene.id == "coreA").expect("coreA");
+        let gene = built
+            .genes
+            .iter()
+            .find(|gene| gene.id == "coreA")
+            .expect("coreA");
         assert_eq!(gene.reference_dna, back_translate(&full));
         assert!(gene.intact);
         assert_eq!(gene.length_evidence, crate::synteny::LENGTH_SUFFICIENT);
         assert_eq!(gene.presence, vec![true, true]);
         assert_eq!(gene.samples_with_exact_reference, 1);
-        assert_eq!(gene.lengths, vec![
-            back_translate(&full).len() as u32, back_translate(&short).len() as u32,
-        ]);
+        assert_eq!(
+            gene.lengths,
+            vec![
+                back_translate(&full).len() as u32,
+                back_translate(&short).len() as u32,
+            ]
+        );
     }
 
     #[test]
@@ -1906,17 +2360,29 @@ mod tests {
         let protein = diverse(40, 4);
         let first = coding(&protein, 0, 300, "dup");
         let second = coding(&protein, 0, first.end + 1, "dup");
-        let built = build(vec![sample("one", vec![
-            coding(&diverse(36, 6), 0, 1, "left"),
-            first,
-            second,
-            coding(&diverse(36, 12), 0, 1000, "right"),
-        ])], &params()).unwrap();
-        let copies: Vec<_> = built.genes.iter()
-            .filter(|gene| gene.reference_dna == back_translate(&protein)).collect();
+        let built = build(
+            vec![sample(
+                "one",
+                vec![
+                    coding(&diverse(36, 6), 0, 1, "left"),
+                    first,
+                    second,
+                    coding(&diverse(36, 12), 0, 1000, "right"),
+                ],
+            )],
+            &params(),
+        )
+        .unwrap();
+        let copies: Vec<_> = built
+            .genes
+            .iter()
+            .filter(|gene| gene.reference_dna == back_translate(&protein))
+            .collect();
         assert_eq!(copies.len(), 2);
         assert!(copies.iter().all(|gene| gene.samples_present == 1));
-        assert!(copies.iter().all(|gene| gene.lengths == vec![back_translate(&protein).len() as u32]));
+        assert!(copies
+            .iter()
+            .all(|gene| gene.lengths == vec![back_translate(&protein).len() as u32]));
     }
 
     #[test]
@@ -1946,10 +2412,15 @@ mod tests {
         }
         let built = build(samples, &params()).unwrap();
         assert_eq!(built.genes.len(), 6);
-        let copies: Vec<_> = built.genes.iter()
-            .filter(|gene| gene.reference_dna == back_translate(&full)).collect();
+        let copies: Vec<_> = built
+            .genes
+            .iter()
+            .filter(|gene| gene.reference_dna == back_translate(&full))
+            .collect();
         assert_eq!(copies.len(), 2);
-        assert!(copies.iter().all(|gene| gene.intact && gene.presence == vec![true; 3]));
+        assert!(copies
+            .iter()
+            .all(|gene| gene.intact && gene.presence == vec![true; 3]));
         let lengths: Vec<_> = copies.iter().map(|gene| gene.lengths.clone()).collect();
         let full_bp = back_translate(&full).len() as u32;
         assert!(lengths.contains(&vec![full_bp; 3]));
@@ -2001,11 +2472,18 @@ mod tests {
             .genes
             .iter()
             .all(|gene| gene.reference_dna != back_translate(&fusion)));
-        let fusion_members: Vec<_> = built.membership_audit.as_ref().unwrap().members.iter()
+        let fusion_members: Vec<_> = built
+            .membership_audit
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
             .filter(|member| member.sample as usize == fused && member.origin == "fusion_piece")
             .collect();
         assert_eq!(fusion_members.len(), 2);
-        assert!(fusion_members.iter().all(|member| member.annotation_id == "cds_0_400"));
+        assert!(fusion_members
+            .iter()
+            .all(|member| member.annotation_id == "cds_0_400"));
         assert_ne!(fusion_members[0].gene, fusion_members[1].gene);
     }
 
@@ -2030,12 +2508,7 @@ mod tests {
         // pair that brackets it in the other samples, which is the only
         // evidence refind is allowed to use.
         let gene_start = left.end + 41;
-        let right = coding(
-            &flank_r,
-            0,
-            gene_start + gene_dna.len() as u32 + 48,
-            "flkR",
-        );
+        let right = coding(&flank_r, 0, gene_start + gene_dna.len() as u32 + 48, "flkR");
         let mut sequence = vec![b'N'; right.end as usize + 10];
         paint(&mut sequence, &left);
         let at = (gene_start - 1) as usize;
@@ -2070,8 +2543,14 @@ mod tests {
         assert_eq!(row.lengths[gap_sample], gene_dna.len() as u32);
         assert_eq!(row.reference_dna, gene_dna);
         assert_eq!(row.samples_present, 3);
-        let found: Vec<_> = built.membership_audit.as_ref().unwrap().members.iter()
-            .filter(|member| member.origin == "refound").collect();
+        let found: Vec<_> = built
+            .membership_audit
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .filter(|member| member.origin == "refound")
+            .collect();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].sample as usize, gap_sample);
         assert!(found[0].annotation_id.is_empty());
