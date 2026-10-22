@@ -328,7 +328,7 @@ def reported_rustroo_minutes(log_path):
     }
 
 
-def rustroo_argv(binary, gffs, output, threads, quality="standard"):
+def rustroo_argv(binary, gffs, output, threads, quality="strict"):
     return [str(binary), "-i"] + [str(path) for path in gffs] + [
         "-o", str(output), "--threads", str(threads), "--quality", quality,
     ]
@@ -618,7 +618,7 @@ def parse_args(argv):
     parser.add_argument("--panaroo-sif", type=Path, required=True)
     parser.add_argument("--threads", type=int, required=True)
     parser.add_argument("--seed", type=int, default=1729)
-    parser.add_argument("--quality", default="standard", choices=("standard", "high", "strict"))
+    parser.add_argument("--quality", default="strict", choices=("standard", "high", "strict"))
     parser.add_argument("--n", default=None, help="one sample count, or full, on this node")
     parser.add_argument("--task", type=int, default=None, help="one curve step, counting from 0")
     return parser.parse_args(argv)

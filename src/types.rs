@@ -37,6 +37,8 @@ pub struct Params {
     pub threads: usize,
     /// Emit original annotation memberships for an external concordance audit.
     pub audit_members: bool,
+    /// `strict` drops weak and duplicate references. `standard` keeps every
+    /// repaired family. The command-line default is `strict`.
     pub quality: Quality,
 }
 
@@ -50,7 +52,7 @@ impl Default for Params {
             refind: true,
             threads: 0,
             audit_members: false,
-            quality: Quality::Standard,
+            quality: Quality::Strict,
         }
     }
 }

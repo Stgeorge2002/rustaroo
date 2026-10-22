@@ -59,9 +59,10 @@ struct Cli {
     #[arg(long)]
     audit_members: bool,
 
-    /// `high` drops a gene with no intact copy and an unconfirmed short gene.
-    /// `strict` also drops a duplicate reference already represented by another gene.
-    #[arg(long, value_enum, default_value = "standard")]
+    /// `strict` (the default) drops a gene with no intact copy, an unconfirmed
+    /// short gene, and a duplicate reference already represented by another gene.
+    /// `high` drops only the first two. `standard` keeps every repaired family.
+    #[arg(long, value_enum, default_value = "strict")]
     quality: Quality,
 }
 
@@ -364,7 +365,7 @@ mod tests {
         assert_eq!(cli.output_dir, Some(PathBuf::from("out")));
         assert_eq!(cli.family_identity, 0.70);
         assert!(cli.audit_members);
-        assert_eq!(cli.quality, Quality::Standard);
+        assert_eq!(cli.quality, Quality::Strict);
         assert_eq!(
             Cli::try_parse_from(["rustroo", "-i", "gff", "-o", "out", "--quality", "high"])
                 .unwrap()

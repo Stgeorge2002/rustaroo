@@ -24,7 +24,7 @@ INPUT="${RUSTROO_INPUT:-$MACS/monocle_gff}"
 OUTPUT="${RUSTROO_OUTPUT:-$MACS/runs/curve_${SLURM_JOB_ID}}"
 SCRIPT="${RUSTROO_CURVE:-$MACS/rustaroo/benchmarks/macs_curve.py}"
 THREADS="${SLURM_CPUS_PER_TASK:?Submit with --cpus-per-task}"
-QUALITY="${RUSTROO_QUALITY:-standard}"
+QUALITY="${RUSTROO_QUALITY:-strict}"
 # An array task is one sample size. Rustroo and Panaroo still share that node,
 # one after the other, so each keeps all of its CPUs and memory.
 TASK=""

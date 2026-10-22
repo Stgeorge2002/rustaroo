@@ -276,7 +276,10 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             strand: call.strand,
         });
     }
-    let removed = apply_quality(&mut genes, params.quality, &loci);
+    // A folded gene is gone, but its calls are still members of the survivor.
+    // Presence was copied onto that gene and its reference sequence was not.
+    let mut folded_into = HashMap::new();
+    let removed = apply_quality(&mut genes, params.quality, &loci, &mut folded_into);
     let cluster_of_gene: HashMap<String, u32> = name_of_cluster
         .iter()
         .map(|(&cluster, id)| (id.clone(), cluster))
@@ -307,7 +310,8 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             let Some(name) = name_of_cluster.get(&call.cluster) else {
                 continue;
             };
-            let Some(&gene_index) = gene_indexes.get(name.as_str()) else {
+            let name = survivor_name(name, &folded_into);
+            let Some(&gene_index) = gene_indexes.get(name) else {
                 continue;
             };
             members.push(GeneMember {
@@ -414,11 +418,13 @@ fn quality_label(quality: Quality) -> &'static str {
 /// in other genomes is folded into the longer gene so those genomes stay
 /// present. The reference stays the longer finished allele. A paralogue below
 /// 90% identity at nearly the same length stays. Support labels are applied
-/// afterwards and every labelled gene is kept.
+/// afterwards and every labelled gene is kept. `folded_into` maps a removed
+/// gene id to the survivor that kept its presence, so those calls stay members.
 fn apply_quality(
     genes: &mut Vec<Gene>,
     quality: Quality,
     loci: &HashMap<String, Vec<Locus>>,
+    folded_into: &mut HashMap<String, String>,
 ) -> usize {
     if quality == Quality::Standard {
         return 0;
@@ -438,7 +444,7 @@ fn apply_quality(
         !reject
     });
     if quality == Quality::Strict {
-        let redundant = redundant_fragments(genes, loci);
+        let redundant = redundant_fragments(genes, loci, folded_into);
         let mut index = 0;
         genes.retain(|_| {
             let reject = redundant.contains(&index);
@@ -475,6 +481,18 @@ fn support_label(
     } else {
         SUPPORT_UNSUPPORTED
     }
+}
+
+/// Follow a chain of folds to the gene that is still published.
+fn survivor_name<'a>(name: &'a str, folded_into: &'a HashMap<String, String>) -> &'a str {
+    let mut current = name;
+    for _ in 0..folded_into.len() {
+        match folded_into.get(current) {
+            Some(next) => current = next.as_str(),
+            None => break,
+        }
+    }
+    current
 }
 
 fn assign_support(
@@ -520,7 +538,11 @@ const NEAR_COPY_IDENTITY: f64 = 0.90;
 
 /// Indexes of genes that add no presence. The copy present in fewer genomes
 /// is the one removed. Equal support keeps the earlier gene.
-fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -> HashSet<usize> {
+fn redundant_fragments(
+    genes: &mut [Gene],
+    loci: &HashMap<String, Vec<Locus>>,
+    folded_into: &mut HashMap<String, String>,
+) -> HashSet<usize> {
     let proteins: Vec<Vec<u8>> = genes
         .iter()
         .map(|gene| translate(&gene.reference_dna))
@@ -662,7 +684,13 @@ fn redundant_fragments(genes: &mut [Gene], loci: &HashMap<String, Vec<Locus>>) -
                     genes[short].id, genes[long].id,
                 ));
             }
-            absorb_at(genes, long, short);
+            let short_id = genes[short].id.clone();
+            let long_id = genes[long].id.clone();
+            // The survivor keeps its own sequence. The removed gene's calls
+            // still have to be members of that survivor.
+            if absorb_at(genes, long, short) {
+                folded_into.insert(short_id, long_id);
+            }
             redundant.insert(short);
         }
     }
@@ -691,22 +719,22 @@ fn one_gene(proteins: &[Vec<u8>], parents: &[usize]) -> Option<usize> {
     same.then_some(best)
 }
 
-fn absorb_at(genes: &mut [Gene], long: usize, short: usize) {
+fn absorb_at(genes: &mut [Gene], long: usize, short: usize) -> bool {
     if long == short {
-        return;
+        return false;
     }
     if long < short {
         let (head, tail) = genes.split_at_mut(short);
-        absorb(&mut head[long], &tail[0]);
+        absorb(&mut head[long], &tail[0])
     } else {
         let (head, tail) = genes.split_at_mut(long);
-        absorb(&mut tail[0], &head[short]);
+        absorb(&mut tail[0], &head[short])
     }
 }
 
-fn absorb(keeper: &mut Gene, extra: &Gene) {
+fn absorb(keeper: &mut Gene, extra: &Gene) -> bool {
     if keeper.presence.len() != extra.presence.len() {
-        return;
+        return false;
     }
     // Presence moves onto the keeper. Its sequence stays: the shorter allele
     // fails coverage of a longer reference of the same gene.
@@ -719,6 +747,7 @@ fn absorb(keeper: &mut Gene, extra: &Gene) {
         }
     }
     keeper.samples_present = keeper.presence.iter().filter(|&&present| present).count() as u32;
+    true
 }
 
 /// `long` already explains `short`: it is a longer protein, or the same length
@@ -1255,10 +1284,22 @@ mod tests {
         }
     }
 
+    fn apply(
+        genes: &mut Vec<Gene>,
+        quality: Quality,
+        loci: &std::collections::HashMap<String, Vec<Locus>>,
+    ) -> usize {
+        let mut folded = std::collections::HashMap::new();
+        super::apply_quality(genes, quality, loci, &mut folded)
+    }
+
     fn params() -> Params {
         Params {
             min_cds_bp: 30,
             refind: false,
+            // These tests exercise repair and support on the unfiltered
+            // pangenome. The program default is strict.
+            quality: Quality::Standard,
             ..Params::default()
         }
     }
@@ -1527,11 +1568,8 @@ mod tests {
             labelled("broken", false, LENGTH_SUFFICIENT),
         ];
         let loci = std::collections::HashMap::new();
-        assert_eq!(
-            super::apply_quality(&mut genes.clone(), Quality::Standard, &loci),
-            0
-        );
-        assert_eq!(super::apply_quality(&mut genes, Quality::High, &loci), 2);
+        assert_eq!(apply(&mut genes.clone(), Quality::Standard, &loci), 0);
+        assert_eq!(apply(&mut genes, Quality::High, &loci), 2);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["core", "short_ok"]);
     }
@@ -1604,11 +1642,8 @@ mod tests {
             long, piece, alone, near, copy, twin, paralog, close, deep, band,
         ];
         let loci = std::collections::HashMap::new();
-        assert_eq!(
-            super::apply_quality(&mut genes.clone(), Quality::High, &loci),
-            0
-        );
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 7);
+        assert_eq!(apply(&mut genes.clone(), Quality::High, &loci), 0);
+        assert_eq!(apply(&mut genes, Quality::Strict, &loci), 7);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         // `alone` is an exact piece of `long` and also of the diverged paralogue,
         // so it is not assigned to either gene.
@@ -1659,7 +1694,7 @@ mod tests {
         split.samples_present = 1;
         let mut genes = vec![long, piece, paralog, host, split];
         let loci = std::collections::HashMap::new();
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 1);
+        assert_eq!(apply(&mut genes, Quality::Strict, &loci), 1);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["long", "paralog", "host", "split"]);
         assert_eq!(genes[0].presence, vec![true, true, false, false]);
@@ -1689,7 +1724,7 @@ mod tests {
             genes.push(copy);
         }
         let loci = std::collections::HashMap::new();
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 70);
+        assert_eq!(apply(&mut genes, Quality::Strict, &loci), 70);
         assert_eq!(genes.len(), 1);
         assert_eq!(genes[0].id, "long");
         assert_eq!(genes[0].samples_present, 71);
@@ -1712,10 +1747,7 @@ mod tests {
         shared.presence = vec![false, false, true];
         shared.samples_present = 1;
         let mut ambiguous = vec![left, right, shared];
-        assert_eq!(
-            super::apply_quality(&mut ambiguous, Quality::Strict, &loci),
-            0
-        );
+        assert_eq!(apply(&mut ambiguous, Quality::Strict, &loci), 0);
         let ids: Vec<_> = ambiguous.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["left", "right", "shared"]);
 
@@ -1729,7 +1761,7 @@ mod tests {
             gene.samples_present = 1;
             same.push(gene);
         }
-        assert_eq!(super::apply_quality(&mut same, Quality::Strict, &loci), 4);
+        assert_eq!(apply(&mut same, Quality::Strict, &loci), 4);
         assert_eq!(same[0].id, "same0");
         assert_eq!(same[0].samples_present, 5);
         assert_eq!(same[0].reference_dna, back_translate(&long_aa));
@@ -1753,11 +1785,91 @@ mod tests {
         short.samples_with_exact_reference = 2;
         let mut genes = vec![long, short];
         let loci = std::collections::HashMap::new();
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 1);
+        assert_eq!(apply(&mut genes, Quality::Strict, &loci), 1);
         assert_eq!(genes[0].id, "long");
         assert_eq!(genes[0].reference_dna, back_translate(&long_aa));
         assert_eq!(genes[0].presence, vec![true, true, true]);
         assert_eq!(genes[0].selection, "intact_longest");
+    }
+
+    #[test]
+    fn strict_fold_keeps_the_folded_samples_membership_on_the_survivor() {
+        let long_aa = random_protein(160, 31);
+        let mut short_aa = long_aa[..100].to_vec();
+        // About 85% identity: synteny still requires 90% to join a fragment,
+        // and strict folds a piece from 80%. The length ratio keeps them apart.
+        for site in (1..short_aa.len()).step_by(7) {
+            short_aa[site] = if short_aa[site] == b'A' { b'L' } else { b'A' };
+        }
+        let long_dna = back_translate(&long_aa);
+        let short_dna = back_translate(&short_aa);
+        let short_start = 2_500u32;
+        let mut inputs = vec![
+            sample(
+                "long_host",
+                vec![
+                    coding(&random_protein(40, 3), 0, 100, "left"),
+                    coding(&long_aa, 0, 2_000, "pol"),
+                    coding(&random_protein(40, 4), 0, 4_000, "right"),
+                ],
+            ),
+            sample(
+                "short_host",
+                vec![
+                    coding(&random_protein(40, 5), 0, 100, "oleft"),
+                    coding(&short_aa, 0, short_start, "pol"),
+                    coding(&random_protein(40, 6), 0, 4_000, "oright"),
+                ],
+            ),
+        ];
+        let mut strict = params();
+        strict.quality = Quality::Strict;
+        strict.audit_members = true;
+        let built = build(inputs.clone(), &strict).unwrap();
+        let survivor = built
+            .genes
+            .iter()
+            .position(|gene| gene.reference_dna == long_dna)
+            .expect("longer reference");
+        assert_eq!(built.genes[survivor].presence, vec![true, true]);
+        assert_eq!(built.genes[survivor].reference_dna, long_dna);
+        assert_eq!(
+            built
+                .genes
+                .iter()
+                .filter(|gene| gene.reference_dna == short_dna)
+                .count(),
+            0
+        );
+        let audit = built.membership_audit.as_ref().unwrap();
+        let folded: Vec<_> = audit
+            .members
+            .iter()
+            .filter(|member| member.gene == survivor && member.sample == 1)
+            .collect();
+        assert_eq!(folded.len(), 1);
+        assert_eq!(audit.sequences[folded[0].dna as usize], short_dna);
+        assert_eq!(folded[0].start, short_start);
+        assert_eq!(folded[0].end, short_start + short_dna.len() as u32 - 1);
+        assert_eq!(folded[0].strand, 1);
+        let long_member = audit
+            .members
+            .iter()
+            .find(|member| member.gene == survivor && member.sample == 0)
+            .expect("long allele");
+        assert_ne!(folded[0].locus, long_member.locus);
+        assert_eq!(audit.sequences[long_member.dna as usize], long_dna);
+
+        inputs.swap(0, 1);
+        let mut plain = params();
+        plain.audit_members = true;
+        let unfolder = build(inputs, &plain).unwrap();
+        let separate = unfolder
+            .genes
+            .iter()
+            .filter(|gene| gene.reference_dna == long_dna || gene.reference_dna == short_dna)
+            .count();
+        assert_eq!(separate, 2);
     }
 
     #[test]
@@ -1861,7 +1973,7 @@ mod tests {
         diverged.presence = vec![false, true];
         diverged.samples_present = 1;
         let mut genes = vec![long, nested, weak, beside, split, diverged];
-        assert_eq!(super::apply_quality(&mut genes, Quality::Strict, &loci), 3);
+        assert_eq!(apply(&mut genes, Quality::Strict, &loci), 3);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["long", "weak", "diverged"]);
         assert_eq!(genes[0].presence, vec![true, true]);
