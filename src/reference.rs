@@ -16,7 +16,9 @@
 //! length polymorphism. Frequency only breaks ties between intact sequences
 //! of one length. The sequence that is written is one that was observed, or
 //! a head-to-tail join of observed fragments when no sample still carries
-//! the gene in one piece. A join cannot outvote a finished end.
+//! the gene in one piece. A join of two finished genes is refused: stripping
+//! the stop between them invents a sequence no genome carries. A join cannot
+//! outvote a finished end.
 
 use std::collections::HashMap;
 
@@ -615,8 +617,23 @@ fn codon_distance(dna: &str, majority: &str) -> usize {
 
 /// Join adjacent fragment CDS, dropping the stop between them, so a gene that
 /// no sample still carries in one piece has an intact model to map against.
+///
+/// Two parts that each already end on their own stop are two genes. Stripping
+/// those stops is how metN+metP and rpsC+rplP became one reference that no
+/// genome carries. A broken gene still joins: only one of its pieces is a
+/// finished ORF.
 pub fn join_fragments(parts: &[&str]) -> Option<String> {
     if parts.len() < 2 {
+        return None;
+    }
+    let finished = parts
+        .iter()
+        .filter(|part| {
+            let status = orf_status(part);
+            status.is_intact() && status.terminal_stop
+        })
+        .count();
+    if finished >= 2 {
         return None;
     }
     let mut dna = String::new();
@@ -640,7 +657,7 @@ pub fn join_fragments(parts: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::genetic_code::back_translate;
+    use crate::genetic_code::{back_translate, is_intact, orf_status};
 
     fn allele(dna: &str, count: u32) -> Allele {
         Allele {
@@ -738,6 +755,22 @@ mod tests {
         assert_eq!(choice.dna, back_translate(&common));
         assert_eq!(choice.selection, "intact_conserved_end");
         assert_eq!(choice.extension_samples, 1);
+    }
+
+    #[test]
+    fn two_finished_genes_are_not_concatenated() {
+        let met = back_translate(&protein(40, 1));
+        let next = back_translate(&protein(50, 8));
+        assert!(orf_status(&met).terminal_stop && orf_status(&next).terminal_stop);
+        assert!(join_fragments(&[&met, &next]).is_none());
+        assert!(join_fragments(&[&met, &next, &back_translate(&protein(30, 4))]).is_none());
+
+        let mut fragment = next.clone();
+        fragment.replace_range(0..3, "GCT");
+        assert!(!is_intact(&fragment));
+        let joined = join_fragments(&[&met, &fragment]).expect("a real fragment still joins");
+        assert!(is_intact(&joined));
+        assert!(joined.len() > met.len());
     }
 
     #[test]

@@ -477,7 +477,7 @@ pub fn merge_fragments(calls: &mut [Call], pools: &Pools, contig_lengths: &[Vec<
     if rescues > 0 {
         progress!("rustroo: proposed {rescues} strand-aware shortened-allele adoptions; unions remain sample-guarded");
     }
-    legacy.extend(abutting_pieces(calls, &reps, &members));
+    legacy.extend(abutting_pieces(calls, pools, &reps, &members));
     let contained = contained_adoptions(calls, pools, &reps, &members, &kmers);
     let (merged, terminal_merged, blocked) =
         apply_adoptions(calls, pools, members, &legacy, &terminal, &contained);
@@ -1166,6 +1166,7 @@ fn terminal_identity(short: &[u8], long: &[u8]) -> Option<f64> {
 
 fn abutting_pieces(
     calls: &[Call],
+    pools: &Pools,
     reps: &HashMap<u32, Vec<u8>>,
     members: &HashMap<u32, HashSet<u32>>,
 ) -> Vec<(u32, u32)> {
@@ -1188,7 +1189,17 @@ fn abutting_pieces(
     // actual check can still run in parallel.
     let mut keys: Vec<(u32, u32)> = gaps.keys().copied().collect();
     keys.sort_unstable();
-    keys.par_iter()
+    // One intact allele means the cluster is already a gene. Two of those
+    // are an operon (metN then metP, rpsC then rplP), not the two halves of
+    // a broken CDS. A fragment has no intact allele and may still complete
+    // the one gene it sits against.
+    let intact: HashSet<u32> = calls
+        .iter()
+        .filter(|call| is_intact(&pools.dna[call.dna as usize]))
+        .map(|call| call.cluster)
+        .collect();
+    let pairs: Vec<(u32, u32)> = keys
+        .par_iter()
         .filter_map(|&(left, right)| {
             let gap_list = &gaps[&(left, right)];
             if left == right || gap_list.len() < 2 {
@@ -1211,6 +1222,9 @@ fn abutting_pieces(
             if identity >= 0.4 {
                 return None;
             }
+            if intact.contains(&left) && intact.contains(&right) {
+                return None;
+            }
             // Keep the longer piece's id so the reference sees both alleles.
             let child = if left_prot.len() <= right_prot.len() {
                 left
@@ -1220,7 +1234,36 @@ fn abutting_pieces(
             let parent = if child == left { right } else { left };
             Some((child, parent))
         })
-        .collect()
+        .collect();
+    // A scrap between two genes would otherwise be a bridge: each edge is
+    // legal (fragment plus one gene) and the union would still glue the
+    // two genes into one reference.
+    separate_finished_genes(pairs, &intact)
+}
+
+/// Keep fragment joins. Drop an edge that would put two intact genes in one
+/// component, including through a chain of fragments.
+fn separate_finished_genes(pairs: Vec<(u32, u32)>, intact: &HashSet<u32>) -> Vec<(u32, u32)> {
+    let mut parent: HashMap<u32, u32> = HashMap::new();
+    let mut finished: HashMap<u32, bool> = HashMap::new();
+    let mut kept = Vec::with_capacity(pairs.len());
+    for (child, parent_id) in pairs {
+        let left = find(&mut parent, child);
+        let right = find(&mut parent, parent_id);
+        if left == right {
+            continue;
+        }
+        let left_finished = *finished.entry(left).or_insert(intact.contains(&child));
+        let right_finished = *finished.entry(right).or_insert(intact.contains(&parent_id));
+        if left_finished && right_finished {
+            continue;
+        }
+        parent.insert(left, right);
+        finished.insert(right, left_finished || right_finished);
+        finished.remove(&left);
+        kept.push((child, parent_id));
+    }
+    kept
 }
 
 pub fn refind(calls: &mut Vec<Call>, pools: &mut Pools, contigs: &[Vec<String>]) -> usize {
@@ -3805,6 +3848,94 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(labels(&calls), labels(&reversed));
+    }
+
+    #[test]
+    fn adjacent_intact_genes_stay_separate() {
+        let left = block(b"ACDEFGHIKL", 80);
+        let right = block(b"NPQRSTVWY", 90);
+        let identity = crate::align::global_identity(&left, &right).expect("comparable proteins");
+        assert!(identity < 0.4, "{identity}");
+        let mut pools = Pools::default();
+        let mut calls = Vec::new();
+        for sample in 0..2 {
+            let first = call(sample, 1, 100, &left, &mut pools);
+            let second = call(sample, 2, first.end + 1, &right, &mut pools);
+            calls.push(first);
+            calls.push(second);
+        }
+        let lengths = vec![vec![5000], vec![5000]];
+        merge_fragments(&mut calls, &pools, &lengths);
+        let clusters: HashSet<u32> = calls.iter().map(|call| call.cluster).collect();
+        assert_eq!(clusters.len(), 2, "{clusters:?}");
+    }
+
+    #[test]
+    fn a_fragment_still_joins_the_one_gene_it_belongs_to() {
+        let gene = block(b"ACDEFGHIKL", 80);
+        let fragment = unfinished(b"NPQRSTWY", 40);
+        let identity = crate::align::global_identity(&gene, &fragment).expect("comparable");
+        assert!(identity < 0.4, "{identity}");
+        let mut pools = Pools::default();
+        let mut calls = Vec::new();
+        for sample in 0..2 {
+            let first = call(sample, 1, 100, &gene, &mut pools);
+            calls.push(call(sample, 2, first.end + 1, &fragment, &mut pools));
+            calls.push(first);
+        }
+        let lengths = vec![vec![5000], vec![5000]];
+        assert!(merge_fragments(&mut calls, &pools, &lengths));
+        let clusters: HashSet<u32> = calls.iter().map(|call| call.cluster).collect();
+        assert_eq!(clusters.len(), 1, "{clusters:?}");
+    }
+
+    #[test]
+    fn a_fragment_between_two_genes_does_not_bridge_them() {
+        let left = block(b"ACDEFGHIKL", 80);
+        let middle = unfinished(b"Q", 30);
+        let right = block(b"NPRSTWY", 70);
+        for (one, other) in [(&left, &middle), (&middle, &right), (&left, &right)] {
+            let identity = crate::align::global_identity(one, other).expect("comparable");
+            assert!(identity < 0.4, "{identity}");
+        }
+        let mut pools = Pools::default();
+        let mut calls = Vec::new();
+        for sample in 0..2 {
+            let first = call(sample, 1, 100, &left, &mut pools);
+            let mid = call(sample, 2, first.end + 1, &middle, &mut pools);
+            calls.push(call(sample, 3, mid.end + 1, &right, &mut pools));
+            calls.push(first);
+            calls.push(mid);
+        }
+        let lengths = vec![vec![5000], vec![5000]];
+        merge_fragments(&mut calls, &pools, &lengths);
+        let cluster = |sequence: &[u8]| cluster_of(&calls, &pools, sequence);
+        assert_ne!(cluster(&left), cluster(&right));
+    }
+
+    fn unfinished(residues: &[u8], length: usize) -> Vec<u8> {
+        let mut sequence = Vec::with_capacity(length);
+        for index in 0..length {
+            let residue = residues[index % residues.len()];
+            // M and V back-translate to start codons, which would make this
+            // piece a finished gene and refuse the join.
+            sequence.push(if residue == b'M' || residue == b'V' {
+                b'A'
+            } else {
+                residue
+            });
+        }
+        sequence
+    }
+
+    fn block(residues: &[u8], length: usize) -> Vec<u8> {
+        let mut sequence = Vec::with_capacity(length);
+        sequence.push(b'M');
+        for index in 1..length {
+            let residue = residues[index % residues.len()];
+            sequence.push(if residue == b'M' { b'L' } else { residue });
+        }
+        sequence
     }
 
     #[test]
