@@ -2,9 +2,10 @@
 """Look each reference's gene name up in UniProt and compare lengths.
 
 The sequence is not sent and not translated. The FASTA header is the query.
-UniProt returns an amino-acid length; the base-pair length is that number
-times 3, plus 3 where the reference counts the stop codon. A name UniProt
-does not know is left out of the match rate.
+Only a name present in both FASTA files is looked up. UniProt returns an
+amino-acid length; the base-pair length is that number times 3, plus 3 where
+the reference counts the stop codon. A name UniProt does not know is left
+out of the match rate.
 """
 
 import argparse
@@ -51,7 +52,9 @@ def request(url, retries=5):
             if error.code not in (429, 500, 502, 503, 504) or attempt + 1 == retries:
                 detail = error.read().decode(errors="replace")[:300]
                 raise RuntimeError("HTTP %s: %s" % (error.code, detail))
-        except urllib.error.URLError:
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            # urlopen raises TimeoutError when the body read stalls. That is
+            # not a URLError, so without this clause one slow reply aborts the run.
             if attempt + 1 == retries:
                 raise
         time.sleep(2 ** attempt)
@@ -113,9 +116,13 @@ def main():
     args = parser.parse_args()
 
     records = []
+    present = {}
     for tool, path in (("rustroo", args.rustroo), ("panaroo", args.panaroo)):
         for name, bp in read_lengths(path):
             records.append((tool, name, bp))
+            present.setdefault(tool, set()).add(name)
+    shared = present.get("rustroo", set()) & present.get("panaroo", set())
+    records = [row for row in records if row[1] in shared]
     names = []
     seen = set()
     for _tool, name, _bp in records:
@@ -125,6 +132,34 @@ def main():
     if args.limit:
         names = names[:args.limit]
     wanted = set(names)
+    records = [row for row in records if row[1] in wanted]
+    print("shared names %s" % len(names), flush=True)
+
+    by_name = {}
+    for tool, name, bp in records:
+        by_name.setdefault(name, []).append((tool, bp))
+    counts = {"rustroo": Counter(), "panaroo": Counter()}
+
+    def add_name(name):
+        row = found[name]
+        amino = row.get("uniprot_aa")
+        status = row.get("status", "absent")
+        for tool, bp in by_name[name]:
+            bucket = counts[tool]
+            bucket["references"] += 1
+            bucket[status] += 1
+            bucket["match"] += int(status == "found" and agrees(bp, amino))
+
+    def progress(index, name):
+        # Printed per name so a long UniProt run shows the rate moving, and a
+        # timeout still leaves the last complete rate on screen.
+        parts = ["%s/%s %s" % (index, len(names), name)]
+        for tool in ("rustroo", "panaroo"):
+            bucket = counts[tool]
+            known = bucket["found"]
+            percent = 100.0 * bucket["match"] / known if known else 0.0
+            parts.append("%s %s/%s (%.1f%%)" % (tool, bucket["match"], known, percent))
+        print("  ".join(parts), flush=True)
 
     cache_dir = args.output / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -134,14 +169,14 @@ def main():
         path = cache_dir / (safe_cache_name(name) + ".json")
         if path.is_file():
             found[name] = json.loads(path.read_text())
-            continue
-        found[name] = lookup(name, args.taxon)
-        path.write_text(json.dumps(found[name]))
-        pending += 1
-        if pending % 50 == 0:
-            print("looked up %s/%s" % (index, len(names)))
-        time.sleep(0.2)
-    print("names %s, new lookups %s" % (len(names), pending))
+        else:
+            found[name] = lookup(name, args.taxon)
+            path.write_text(json.dumps(found[name]))
+            pending += 1
+            time.sleep(0.2)
+        add_name(name)
+        progress(index, name)
+    print("names %s, new lookups %s" % (len(names), pending), flush=True)
 
     report = args.output / "lengths.tsv"
     counts = {}

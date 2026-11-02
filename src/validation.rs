@@ -102,7 +102,14 @@ struct Input {
     members: Vec<Member>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn fasta(path: &Path) -> Result<Vec<Sequence>> {
+    fasta_in(path, None)
+}
+
+/// `fasta`, with the per-record decoding map run on `pool` when given (the
+/// validation pool, so it honours --threads). Parsing stays on the caller.
+fn fasta_in(path: &Path, pool: Option<&rayon::ThreadPool>) -> Result<Vec<Sequence>> {
     let mut records = BTreeMap::new();
     let mut id: Option<String> = None;
     let mut dna = String::new();
@@ -160,10 +167,16 @@ fn fasta(path: &Path) -> Result<Vec<Sequence>> {
         return Err(Error::new(format!("{}: no FASTA records", path.display())));
     }
     let records: Vec<_> = records.into_iter().collect();
-    Ok(records
-        .into_par_iter()
-        .map(|(id, dna)| Sequence::new(id, dna))
-        .collect())
+    let decode = move || -> Vec<Sequence> {
+        records
+            .into_par_iter()
+            .map(|(id, dna)| Sequence::new(id, dna))
+            .collect()
+    };
+    Ok(match pool {
+        Some(pool) => pool.install(decode),
+        None => decode(),
+    })
 }
 
 fn number<T: std::str::FromStr>(value: &str, field: &str, line: usize) -> Result<T> {
@@ -172,8 +185,13 @@ fn number<T: std::str::FromStr>(value: &str, field: &str, line: usize) -> Result
         .map_err(|_| Error::new(format!("members.tsv:{line}: invalid {field}: {value}")))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn load(directory: &Path) -> Result<Input> {
-    let families: Vec<_> = fasta(&directory.join("genes.fa"))?
+    load_in(directory, None)
+}
+
+fn load_in(directory: &Path, pool: Option<&rayon::ThreadPool>) -> Result<Input> {
+    let families: Vec<_> = fasta_in(&directory.join("genes.fa"), pool)?
         .into_iter()
         .map(|reference| Family {
             reference,
@@ -189,7 +207,7 @@ fn load(directory: &Path) -> Result<Input> {
     let mut alleles: Vec<Sequence> = Vec::new();
     let mut aliases = BTreeMap::new();
     let mut dna_of: HashMap<u64, Vec<usize>> = HashMap::new();
-    for sequence in fasta(&directory.join("member_alleles.fa"))? {
+    for sequence in fasta_in(&directory.join("member_alleles.fa"), pool)? {
         let hash = crate::model::content_hash(sequence.dna.as_bytes());
         if let Some(bucket) = dna_of.get(&hash) {
             if let Some(&index) = bucket
@@ -1419,7 +1437,13 @@ pub fn validate(
         }
         fingerprints.push((name, fingerprint(&path)?));
     }
-    let input = load(directory)?;
+    // The pool is built before loading so FASTA decoding (a parallel map)
+    // honours --threads instead of the global Rayon pool. Same records, same
+    // order; only the worker count changes.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(options.threads)
+        .build()?;
+    let input = load_in(directory, Some(&pool))?;
     let loci = loci(&input)?;
     if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
@@ -1431,9 +1455,6 @@ pub fn validate(
     let _log_guard = LogGuard;
     progress!("rustroo validate: reading pooled alleles and sample-scoped memberships");
     let uncertain = write_loci(&input, &loci, output)?;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(options.threads)
-        .build()?;
     progress!("rustroo validate: aligning every distinct member DNA allele to its family reference on {} threads", pool.current_num_threads());
     let done_count = AtomicUsize::new(0);
     let reports: Vec<_> = pool.install(|| {

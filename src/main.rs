@@ -3,11 +3,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
-use rayon::prelude::*;
 
 use rustroo::log;
 use rustroo::{
-    build, is_gff, parse_gff_file, validate, write_pangenome, Error, Params, Quality, Result,
+    build_from_paths, is_gff, validate, write_pangenome, Error, Params, Quality, Result,
     TreeMode, ValidationOptions,
 };
 
@@ -101,6 +100,8 @@ struct ValidateCli {
 }
 
 fn main() {
+    #[cfg(feature = "prof")]
+    let guard = std::env::var("RUSTROO_PPROF").ok().map(|path| (path, pprof::ProfilerGuardBuilder::default().frequency(250).blocklist(&["libc", "libgcc", "pthread", "vdso"]).build().unwrap()));
     let timer = RunTimer::start();
     if let Err(error) = run() {
         log::record(&format!("rustroo: {error}"));
@@ -111,6 +112,23 @@ fn main() {
     }
     timer.report();
     log::close();
+    #[cfg(feature = "prof")]
+    if let Some((path, guard)) = guard {
+        let report = guard.report().build().unwrap();
+        let file = std::fs::File::create(format!("{path}.svg")).unwrap();
+        report.flamegraph(file).unwrap();
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(format!("{path}.folded")).unwrap());
+        for (frames, count) in report.data.iter() {
+            let mut names: Vec<String> = Vec::new();
+            for frame in frames.frames.iter().rev() {
+                for symbol in frame.iter().rev() {
+                    names.push(symbol.name().replace(';', ":"));
+                }
+            }
+            writeln!(out, "{} {}", names.join(";"), count).unwrap();
+        }
+    }
 }
 
 /// Wall clock and CPU minutes for one command.
@@ -261,12 +279,13 @@ fn run() -> Result<()> {
         paths.len()
     ));
     let compute = || -> Result<_> {
-        let samples = paths
-            .par_iter()
-            .map(|path| parse_gff_file(path))
-            .collect::<Result<Vec<_>>>()?;
-        let pangenome = build(samples, &params)?;
+        log::stage("start");
+        // Parses and interns a few files at a time in sample order; same
+        // result as parsing everything and calling `build`.
+        let pangenome = build_from_paths(&paths, &params)?;
+        log::stage("build_tail(log/audit)");
         write_pangenome(&pangenome, output_dir)?;
+        log::stage("write_pangenome");
         Ok(pangenome)
     };
     let pangenome = if params.threads == 0 {

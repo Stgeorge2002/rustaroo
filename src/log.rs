@@ -71,3 +71,28 @@ macro_rules! progress {
 }
 
 pub(crate) use progress;
+
+/// PERF-INSTRUMENTATION (rustaroo_perf copy only): stage wall time + RSS.
+pub fn stages_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTROO_STAGES").is_some())
+}
+
+pub fn stage(label: &str) {
+    if !stages_enabled() {
+        return;
+    }
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<std::sync::Mutex<(Instant, Instant)>> = OnceLock::new();
+    let cell = START.get_or_init(|| std::sync::Mutex::new((Instant::now(), Instant::now())));
+    let mut guard = cell.lock().unwrap();
+    let now = Instant::now();
+    let since_last = now.duration_since(guard.1).as_secs_f64();
+    let total = now.duration_since(guard.0).as_secs_f64();
+    guard.1 = now;
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| status.lines().find(|l| l.starts_with(name)).map(|l| l.split_whitespace().nth(1).unwrap_or("0").parse::<u64>().unwrap_or(0)).unwrap_or(0);
+    let cpu = std::fs::read_to_string("/proc/self/stat").ok().and_then(|t| { let r = t.rsplit_once(')')?.1.to_string(); let f: Vec<&str> = r.split_whitespace().collect(); Some((f[11].parse::<f64>().ok()? + f[12].parse::<f64>().ok()?) / 100.0) }).unwrap_or(0.0);
+    eprintln!("STAGE\t{label}\t{since_last:.3}\t{total:.3}\tcpu_total={cpu:.2}\trss_mb={}\thwm_mb={}", field("VmRSS:") / 1024, field("VmHWM:") / 1024);
+}

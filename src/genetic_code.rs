@@ -89,6 +89,7 @@ const fn base(b: u8) -> usize {
     }
 }
 
+#[cfg(test)]
 fn base_index(b: u8) -> Option<usize> {
     match b {
         b'A' | b'a' => Some(0),
@@ -116,6 +117,50 @@ pub fn translate(dna: &str) -> Vec<u8> {
 
 /// Same translation as `translate`, reading bytes that are not yet a `String`.
 pub fn translate_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut protein = Vec::with_capacity(bytes.len() / 3);
+    let mut chunks = bytes.chunks_exact(3);
+    if let Some(codon) = chunks.next() {
+        protein.push(if is_start(codon) { b'M' } else { codon_residue(codon) });
+    }
+    for codon in chunks {
+        protein.push(codon_residue(codon));
+    }
+    if protein.last() == Some(&b'*') {
+        protein.pop();
+    }
+    protein
+}
+
+/// `base_index` as a table; 4 marks a non-base.
+const BASE_INDEX: [u8; 256] = {
+    let mut table = [4u8; 256];
+    table[b'A' as usize] = 0;
+    table[b'a' as usize] = 0;
+    table[b'C' as usize] = 1;
+    table[b'c' as usize] = 1;
+    table[b'G' as usize] = 2;
+    table[b'g' as usize] = 2;
+    table[b'T' as usize] = 3;
+    table[b't' as usize] = 3;
+    table[b'U' as usize] = 3;
+    table[b'u' as usize] = 3;
+    table
+};
+
+#[inline]
+fn codon_residue(codon: &[u8]) -> u8 {
+    let a = BASE_INDEX[codon[0] as usize];
+    let b = BASE_INDEX[codon[1] as usize];
+    let c = BASE_INDEX[codon[2] as usize];
+    if (a | b | c) & 4 != 0 {
+        b'X'
+    } else {
+        AA[a as usize * 16 + b as usize * 4 + c as usize]
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn translate_bytes_reference(bytes: &[u8]) -> Vec<u8> {
     let mut protein = Vec::with_capacity(bytes.len() / 3);
     let mut index = 0;
     let mut first = true;
@@ -198,7 +243,62 @@ pub fn is_intact(dna: &str) -> bool {
     status.is_intact() && dna.len() >= 6
 }
 
+const UPPER: [u8; 256] = {
+    let mut table = [b'N'; 256];
+    table[b'a' as usize] = b'A';
+    table[b'c' as usize] = b'C';
+    table[b'g' as usize] = b'G';
+    table[b't' as usize] = b'T';
+    table[b'u' as usize] = b'T';
+    table[b'A' as usize] = b'A';
+    table[b'C' as usize] = b'C';
+    table[b'G' as usize] = b'G';
+    table[b'T' as usize] = b'T';
+    table[b'N' as usize] = b'N';
+    table
+};
+
+const COMPLEMENT: [u8; 256] = {
+    let mut table = [b'N'; 256];
+    table[b'A' as usize] = b'T';
+    table[b'a' as usize] = b'T';
+    table[b'T' as usize] = b'A';
+    table[b't' as usize] = b'A';
+    table[b'U' as usize] = b'A';
+    table[b'u' as usize] = b'A';
+    table[b'G' as usize] = b'C';
+    table[b'g' as usize] = b'C';
+    table[b'C' as usize] = b'G';
+    table[b'c' as usize] = b'G';
+    table
+};
+
+/// `uppercase_dna` for one byte (a lookup of the same match arms).
+#[inline]
+pub fn uppercase_dna_byte(base: u8) -> u8 {
+    UPPER[base as usize]
+}
+
 pub fn uppercase_dna(sequence: &str) -> String {
+    let bytes: Vec<u8> = sequence.bytes().map(uppercase_dna_byte).collect();
+    String::from_utf8(bytes).expect("table output is ASCII")
+}
+
+/// Append the reverse complement of `piece`, minus its first `skip` output
+/// bases (the phase offset applied after complementing).
+pub fn extend_reverse_complement(out: &mut Vec<u8>, piece: &[u8], skip: usize) {
+    let keep = piece.len().saturating_sub(skip);
+    out.extend(piece[..keep].iter().rev().map(|&base| COMPLEMENT[base as usize]));
+}
+
+pub fn reverse_complement(sequence: &str) -> String {
+    let mut bytes = Vec::with_capacity(sequence.len());
+    extend_reverse_complement(&mut bytes, sequence.as_bytes(), 0);
+    String::from_utf8(bytes).expect("table output is ASCII")
+}
+
+#[cfg(test)]
+pub(crate) fn uppercase_dna_reference(sequence: &str) -> String {
     sequence
         .bytes()
         .map(|base| match base {
@@ -214,7 +314,8 @@ pub fn uppercase_dna(sequence: &str) -> String {
         .collect()
 }
 
-pub fn reverse_complement(sequence: &str) -> String {
+#[cfg(test)]
+pub(crate) fn reverse_complement_reference(sequence: &str) -> String {
     sequence
         .bytes()
         .rev()
@@ -303,5 +404,42 @@ mod tests {
         let protein = b"MKTLLYVWAACD";
         assert_eq!(translate(&back_translate(protein)), protein);
         assert!(is_intact(&back_translate(protein)));
+    }
+
+    #[test]
+    fn perf_table_driven_dna_ops_match_reference() {
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Every single byte, every codon over a mixed alphabet, random strings.
+        for byte in 0..=255u8 {
+            let text = String::from_utf8_lossy(&[byte]).into_owned();
+            assert_eq!(uppercase_dna(&text), uppercase_dna_reference(&text));
+            assert_eq!(reverse_complement(&text), reverse_complement_reference(&text));
+        }
+        let alphabet = b"ACGTUacgtuNnRX*";
+        for a in alphabet {
+            for b in alphabet {
+                for c in alphabet {
+                    let codon = [*a, *b, *c];
+                    assert_eq!(translate_bytes(&codon), translate_bytes_reference(&codon));
+                    let six = [*a, *b, *c, *c, *b, *a];
+                    assert_eq!(translate_bytes(&six), translate_bytes_reference(&six));
+                }
+            }
+        }
+        for _ in 0..5000 {
+            let len = (next() % 90) as usize;
+            let text: String = (0..len)
+                .map(|_| ['A', 'C', 'G', 'T', 'a', 'u', 'N', 'é', 'x', 'U'][(next() % 10) as usize])
+                .collect();
+            assert_eq!(uppercase_dna(&text), uppercase_dna_reference(&text));
+            assert_eq!(reverse_complement(&text), reverse_complement_reference(&text));
+            assert_eq!(translate_bytes(text.as_bytes()), translate_bytes_reference(text.as_bytes()));
+        }
     }
 }

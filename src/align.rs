@@ -103,6 +103,79 @@ pub fn global_identity(a: &[u8], b: &[u8]) -> Option<f64> {
 
 const BANDED_WORK_CAP: usize = 20_000_000;
 
+/// PERF PROTOTYPE: same value as `global_identity` whenever that value could
+/// satisfy `id + f64::EPSILON >= min_identity`; otherwise `None`. Callers that
+/// discard below-threshold identities (cluster `choose_representative`) see
+/// identical decisions. Uses (1) an exact residue-composition upper bound on
+/// the number of identical aligned pairs and (2) an exact per-row upper bound
+/// inside the banded DP (best matches so far in the row + remaining rows).
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+static CALLS: AtomicU64 = AtomicU64::new(0);
+static COMP_PRUNED: AtomicU64 = AtomicU64::new(0);
+static DP_RUN: AtomicU64 = AtomicU64::new(0);
+static DP_ABORT: AtomicU64 = AtomicU64::new(0);
+static CELLS_FULL: AtomicU64 = AtomicU64::new(0);
+static CELLS_DONE: AtomicU64 = AtomicU64::new(0);
+pub fn report_counters(label: &str) {
+    if !crate::log::stages_enabled() {
+        return;
+    }
+    eprintln!("COUNTERS\t{label}\tcalls={}\tcomp_pruned={}\tdp_run={}\tdp_abort={}\tcells_full={}\tcells_done={}",
+        CALLS.swap(0, AtomicOrdering::Relaxed), COMP_PRUNED.swap(0, AtomicOrdering::Relaxed), DP_RUN.swap(0, AtomicOrdering::Relaxed),
+        DP_ABORT.swap(0, AtomicOrdering::Relaxed), CELLS_FULL.swap(0, AtomicOrdering::Relaxed), CELLS_DONE.swap(0, AtomicOrdering::Relaxed));
+}
+pub fn global_identity_at_least(a: &[u8], b: &[u8], min_identity: f64) -> Option<f64> {
+    #[cfg(feature = "counters")]
+    CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    if a == b {
+        return Some(1.0);
+    }
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let band = band_width(short.len(), long.len());
+    let work = short.len().saturating_mul(band.saturating_mul(2) + 1);
+    if work > BANDED_WORK_CAP {
+        // Unbounded fallback path is kept exactly as before.
+        return global_identity(a, b);
+    }
+    let n = short.len();
+    let passes = |matches: usize| matches as f64 / n as f64 + f64::EPSILON >= min_identity;
+    // Smallest match count that could still pass; predicate is monotone in k.
+    let mut needed = n + 1;
+    {
+        let (mut lo, mut hi) = (0usize, n + 1);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if mid <= n && passes(mid) { hi = mid; } else { lo = mid + 1; }
+        }
+        if lo <= n { needed = lo; }
+    }
+    if needed > n {
+        return None;
+    }
+    if needed > 0 {
+        let mut counts = [0u32; 256];
+        for &r in short { counts[r as usize] += 1; }
+        let mut other = [0u32; 256];
+        for &r in long { other[r as usize] += 1; }
+        let mut bound = 0usize;
+        for k in 0..256 { bound += counts[k].min(other[k]) as usize; }
+        if bound < needed {
+            #[cfg(feature = "counters")]
+            COMP_PRUNED.fetch_add(1, AtomicOrdering::Relaxed);
+            return None;
+        }
+    }
+    #[cfg(feature = "counters")]
+    DP_RUN.fetch_add(1, AtomicOrdering::Relaxed);
+    #[cfg(feature = "counters")]
+    CELLS_FULL.fetch_add(work as u64, AtomicOrdering::Relaxed);
+    let matches = BAND.with(|cell| cell.borrow_mut().matches_bounded(short, long, band, needed))?;
+    Some(matches as f64 / short.len() as f64)
+}
+
 /// Half-width of the band around the center diagonal: the length gap itself
 /// plus 10% slack either side for indels. Candidates reaching here already
 /// passed the caller's length-ratio filter, so the true optimal alignment
@@ -223,6 +296,99 @@ impl BandScratch {
         }
     }
 
+    /// Same recurrence as `matches`; returns `None` as soon as no path can
+    /// still reach `needed` identical pairs.
+    fn matches_bounded(&mut self, short: &[u8], long: &[u8], band: usize, needed: usize) -> Option<usize> {
+        let n = short.len();
+        let m = long.len();
+        let width = band.saturating_mul(2) + 1;
+        self.ensure(width);
+        self.prev_score[..width].fill(NEG);
+        self.prev_matches[..width].fill(0);
+        self.curr_score[..width].fill(NEG);
+        self.curr_matches[..width].fill(0);
+        let mut prev_lo = 0usize;
+        let mut prev_hi = band.min(m);
+        for j in prev_lo..=prev_hi {
+            self.prev_score[j - prev_lo] = j as i32 * GAP;
+        }
+        // Exact remaining-composition bound: residues still unconsumed in
+        // short[i..] and long[lo..] can contribute at most sum_c min(counts).
+        let mut cs = [0u32; 256];
+        let mut cl = [0u32; 256];
+        for &r in short { cs[r as usize] += 1; }
+        for &r in long { cl[r as usize] += 1; }
+        let mut comp: usize = (0..256).map(|c| cs[c].min(cl[c]) as usize).sum();
+        let mut long_from = 0usize;
+        for i in 1..=n {
+            let center = (i * m) / n;
+            let lo = center.saturating_sub(band);
+            let hi = (center + band).min(m);
+            {
+                let c = short[i - 1] as usize;
+                if cs[c] <= cl[c] { comp -= 1; }
+                cs[c] -= 1;
+                while long_from < lo {
+                    let c = long[long_from] as usize;
+                    if cl[c] <= cs[c] { comp -= 1; }
+                    cl[c] -= 1;
+                    long_from += 1;
+                }
+            }
+            let mut row_best = 0u32;
+            for j in lo..=hi {
+                let diag = if j == 0 {
+                    (NEG, 0)
+                } else {
+                    let (ps, pm) = band_cell(prev_lo, prev_hi, &self.prev_score, &self.prev_matches, j - 1);
+                    if ps <= NEG {
+                        (NEG, 0)
+                    } else {
+                        let is_match = short[i - 1] == long[j - 1];
+                        (ps + if is_match { MATCH } else { MISMATCH }, pm + u32::from(is_match))
+                    }
+                };
+                let up = {
+                    let (ps, pm) = band_cell(prev_lo, prev_hi, &self.prev_score, &self.prev_matches, j);
+                    if ps <= NEG { (NEG, 0) } else { (ps + GAP, pm) }
+                };
+                let left = if j == lo {
+                    (NEG, 0)
+                } else {
+                    let (cs, cm) = (self.curr_score[j - 1 - lo], self.curr_matches[j - 1 - lo]);
+                    if cs <= NEG { (NEG, 0) } else { (cs + GAP, cm) }
+                };
+                let (score, matches) = if diag.0 >= up.0 && diag.0 >= left.0 {
+                    diag
+                } else if up.0 >= left.0 {
+                    up
+                } else {
+                    left
+                };
+                self.curr_score[j - lo] = score;
+                self.curr_matches[j - lo] = matches;
+                if score > NEG && matches > row_best {
+                    row_best = matches;
+                }
+            }
+            std::mem::swap(&mut self.prev_score, &mut self.curr_score);
+            std::mem::swap(&mut self.prev_matches, &mut self.curr_matches);
+            prev_lo = lo;
+            prev_hi = hi;
+            if (row_best as usize) + (n - i).min(comp) < needed {
+                #[cfg(feature = "counters")]
+                DP_ABORT.fetch_add(1, AtomicOrdering::Relaxed);
+                #[cfg(feature = "counters")]
+                CELLS_DONE.fetch_add((i * width) as u64, AtomicOrdering::Relaxed);
+                return None;
+            }
+        }
+        #[cfg(feature = "counters")]
+        CELLS_DONE.fetch_add((n * width) as u64, AtomicOrdering::Relaxed);
+        let (final_score, final_matches) = band_cell(prev_lo, prev_hi, &self.prev_score, &self.prev_matches, m);
+        if final_score <= NEG { None } else { Some(final_matches as usize) }
+    }
+
     fn ensure(&mut self, width: usize) {
         if self.prev_score.len() >= width {
             return;
@@ -257,7 +423,8 @@ thread_local! {
 /// `internal_gap` is set only when that best diagonal still fails to explain
 /// `short` and a second diagonal, more than five residues away, is needed.
 /// A clean truncation of a repetitive gene stays one diagonal.
-pub fn fit_short_in_long(short: &[u8], long: &[u8]) -> Option<Fit> {
+#[allow(dead_code)]
+pub fn fit_short_in_long_reference(short: &[u8], long: &[u8]) -> Option<Fit> {
     if short.is_empty() || long.len() < short.len() || short.len() < KMER {
         return None;
     }
@@ -333,6 +500,165 @@ pub fn fit_short_in_long(short: &[u8], long: &[u8]) -> Option<Fit> {
     Some(fit)
 }
 
+struct FitScratch {
+    keyed: Vec<(u32, u32)>,
+    votes: Vec<u32>,
+    touched: Vec<u32>,
+    ranked: Vec<(isize, u32)>,
+}
+
+thread_local! {
+    static FIT: RefCell<FitScratch> = RefCell::new(FitScratch { keyed: Vec::new(), votes: Vec::new(), touched: Vec::new(), ranked: Vec::new() });
+}
+
+/// The sorted `(4-mer, position)` table of one `long` sequence, built once
+/// and reused for every `short` fitted into it. `None` when `long` has a
+/// window that does not pack, which is exactly when `fit_short_in_long`
+/// returns `None` for every `short` of a valid length.
+pub struct LongIndex {
+    keyed: Option<Vec<(u32, u32)>>,
+}
+
+impl LongIndex {
+    pub fn new(long: &[u8]) -> Self {
+        if long.len() < KMER {
+            return Self { keyed: Some(Vec::new()) };
+        }
+        let mut keyed = Vec::with_capacity(long.len() - KMER + 1);
+        for j in 0..=long.len() - KMER {
+            let Some(key) = pack(&long[j..j + KMER]) else {
+                return Self { keyed: None };
+            };
+            keyed.push((key, j as u32));
+        }
+        keyed.sort_unstable();
+        Self { keyed: Some(keyed) }
+    }
+}
+
+/// PERF PROTOTYPE: identical result to `fit_short_in_long_reference`.
+/// A sorted (k-mer, position) array replaces the per-call `HashMap<u32, Vec>`
+/// and a dense per-diagonal counter replaces the linear `votes.find`. The
+/// final vote order is the same total order (votes desc, diagonal asc).
+pub fn fit_short_in_long(short: &[u8], long: &[u8]) -> Option<Fit> {
+    if short.is_empty() || long.len() < short.len() || short.len() < KMER {
+        return None;
+    }
+    FIT.with(|cell| {
+        let scratch = &mut *cell.borrow_mut();
+        let mut keyed = std::mem::take(&mut scratch.keyed);
+        keyed.clear();
+        let mut packable = true;
+        for j in 0..=long.len() - KMER {
+            let Some(key) = pack(&long[j..j + KMER]) else {
+                packable = false;
+                break;
+            };
+            keyed.push((key, j as u32));
+        }
+        let result = if packable {
+            keyed.sort_unstable();
+            fit_with_keyed(scratch, short, long, &keyed)
+        } else {
+            None
+        };
+        scratch.keyed = keyed;
+        result
+    })
+}
+
+/// `fit_short_in_long(short, long)` with `long`'s table prebuilt; identical
+/// result (the same early checks, then the same vote and placement logic on
+/// the same sorted table).
+pub fn fit_short_in_long_indexed(short: &[u8], long: &[u8], index: &LongIndex) -> Option<Fit> {
+    if short.is_empty() || long.len() < short.len() || short.len() < KMER {
+        return None;
+    }
+    let keyed = index.keyed.as_deref()?;
+    FIT.with(|cell| fit_with_keyed(&mut cell.borrow_mut(), short, long, keyed))
+}
+
+fn fit_with_keyed(
+    scratch: &mut FitScratch,
+    short: &[u8],
+    long: &[u8],
+    keyed: &[(u32, u32)],
+) -> Option<Fit> {
+    {
+        // diagonal = j - i, in [-(short.len()-KMER), long.len()-KMER]
+        let offset = short.len() - KMER;
+        let span = offset + long.len() - KMER + 1;
+        if scratch.votes.len() < span {
+            scratch.votes.resize(span, 0);
+        }
+        scratch.touched.clear();
+        let mut kmers = 0u32;
+        for i in 0..=short.len() - KMER {
+            let Some(key) = pack(&short[i..i + KMER]) else { continue };
+            let start = keyed.partition_point(|&(k, _)| k < key);
+            if start >= keyed.len() || keyed[start].0 != key {
+                continue;
+            }
+            kmers += 1;
+            let mut p = start;
+            while p < keyed.len() && keyed[p].0 == key {
+                let j = keyed[p].1 as usize;
+                let slot = j + offset - i;
+                if scratch.votes[slot] == 0 {
+                    scratch.touched.push(slot as u32);
+                }
+                scratch.votes[slot] += 1;
+                p += 1;
+            }
+        }
+        scratch.ranked.clear();
+        for &slot in &scratch.touched {
+            let slot = slot as usize;
+            scratch.ranked.push((slot as isize - offset as isize, scratch.votes[slot]));
+            scratch.votes[slot] = 0;
+        }
+        if kmers == 0 || scratch.ranked.is_empty() {
+            return None;
+        }
+        let votes = &mut scratch.ranked;
+        votes.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let best_votes = votes[0].1;
+        let mut chosen: Option<(isize, Fit)> = None;
+        // Same contender selection as the reference: filter then take(8).
+        let contenders: Vec<isize> = votes
+            .iter()
+            .filter(|(_, v)| v.saturating_mul(5) >= best_votes)
+            .map(|(d, _)| *d)
+            .take(8)
+            .collect();
+        for diagonal in contenders {
+            let Some(placed) = place(short, long, diagonal) else { continue };
+            let replace = match chosen {
+                None => true,
+                Some((_, previous)) => {
+                    placed.identity > previous.identity + 1e-12
+                        || ((placed.identity - previous.identity).abs() <= 1e-12
+                            && placed.coverage > previous.coverage + 1e-12)
+                }
+            };
+            if replace {
+                chosen = Some((diagonal, placed));
+            }
+        }
+        let (best_diag, mut fit) = chosen?;
+        if fit.identity < 0.95 || fit.coverage < 0.90 {
+            if let Some((second, _)) = votes.iter().find(|(diagonal, v)| {
+                *diagonal != best_diag
+                    && (*diagonal - best_diag).unsigned_abs() > 5
+                    && v.saturating_mul(5) >= best_votes
+            }) {
+                fit.internal_gap = (*second - best_diag).unsigned_abs();
+            }
+        }
+        Some(fit)
+    }
+}
+
 fn place(short: &[u8], long: &[u8], diagonal: isize) -> Option<Fit> {
     let mut matches = 0usize;
     let mut compared = 0usize;
@@ -394,6 +720,63 @@ fn pack(kmer: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed | 1;
+        move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state }
+    }
+
+    fn random_pair(next: &mut impl FnMut() -> u64) -> (Vec<u8>, Vec<u8>) {
+        let alphabet: &[u8] = if next() % 4 == 0 { b"ACDEK" } else { b"ACDEFGHIKLMNPQRSTVWYX*" };
+        let len = 4 + (next() % 200) as usize;
+        let a: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+        let mut b = a.clone();
+        match next() % 4 {
+            0 => { let cut = (next() as usize) % b.len(); b.drain(..cut.min(b.len().saturating_sub(4))); }
+            1 => { for _ in 0..(next() % 40) { let i = (next() as usize) % b.len(); b[i] = alphabet[(next() % alphabet.len() as u64) as usize]; } }
+            2 => { let ins: Vec<u8> = (0..(next() % 30)).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect(); let at = (next() as usize) % b.len(); b.splice(at..at, ins); }
+            _ => { b = (0..(4 + next() % 200) as usize).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect(); }
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn perf_indexed_fit_matches_reference_fit() {
+        let mut next = rng(0x1234_5678);
+        for _ in 0..100_000 {
+            let (a, b) = random_pair(&mut next);
+            let ia = LongIndex::new(&a);
+            let ib = LongIndex::new(&b);
+            assert_eq!(fit_short_in_long_indexed(&a, &b, &ib), fit_short_in_long_reference(&a, &b));
+            assert_eq!(fit_short_in_long_indexed(&b, &a, &ia), fit_short_in_long_reference(&b, &a));
+        }
+    }
+
+    #[test]
+    fn perf_fast_fit_matches_reference_fit() {
+        let mut next = rng(0x9e3779b97f4a7c15);
+        for _ in 0..200_000 {
+            let (a, b) = random_pair(&mut next);
+            assert_eq!(fit_short_in_long(&a, &b), fit_short_in_long_reference(&a, &b), "{a:?} {b:?}");
+            assert_eq!(fit_short_in_long(&b, &a), fit_short_in_long_reference(&b, &a), "{b:?} {a:?}");
+        }
+    }
+
+    #[test]
+    fn perf_bounded_identity_matches_whenever_threshold_reachable() {
+        let mut next = rng(0x1234_5678_9abc_def1);
+        for _ in 0..100_000 {
+            let (a, b) = random_pair(&mut next);
+            let exact = global_identity(&a, &b);
+            for threshold in [0.98, 0.70, 0.40, 0.0] {
+                let bounded = global_identity_at_least(&a, &b, threshold);
+                match exact {
+                    Some(id) if id + f64::EPSILON >= threshold => assert_eq!(bounded, Some(id)),
+                    _ => assert!(bounded.is_none() || bounded == exact, "{a:?} {b:?} {threshold}"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn identical_and_one_mismatch() {

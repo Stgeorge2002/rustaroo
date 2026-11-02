@@ -71,7 +71,7 @@ fn write_presence(path: &Path, pangenome: &Pangenome) -> Result<()> {
     for gene in &pangenome.genes {
         write!(out, "{}", gene.id)?;
         for present in &gene.presence {
-            write!(out, "\t{}", if *present { "1" } else { "0" })?;
+            out.write_all(if *present { b"\t1" } else { b"\t0" })?;
         }
         writeln!(out)?;
     }
@@ -130,6 +130,21 @@ fn sanitize_field(value: &str) -> String {
         .collect()
 }
 
+/// `value` in decimal, the digits `{}` prints for an unsigned integer.
+fn push_decimal(out: &mut Vec<u8>, mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[at..]);
+}
+
 fn write_members(path: &Path, pangenome: &Pangenome) -> Result<()> {
     let audit = pangenome
         .membership_audit
@@ -140,6 +155,7 @@ fn write_members(path: &Path, pangenome: &Pangenome) -> Result<()> {
         out,
         "gene\tsample\tcontig\tannotation_id\tstart\tend\tstrand\tlocus\torigin\tallele"
     )?;
+    let mut line: Vec<u8> = Vec::with_capacity(256);
     for member in &audit.members {
         let gene = &pangenome.genes[member.gene].id;
         let sample = &pangenome.sample_names[member.sample as usize];
@@ -154,17 +170,29 @@ fn write_members(path: &Path, pangenome: &Pangenome) -> Result<()> {
                 ));
             }
         }
-        writeln!(
-            out,
-            "{gene}\t{sample}\t{contig}\t{}\t{}\t{}\t{}\t{}\t{}\tdna_{}",
-            member.annotation_id,
-            member.start,
-            member.end,
-            member.strand,
-            member.locus,
-            member.origin,
-            member.dna
-        )?;
+        // The same bytes `writeln!("{gene}\t{sample}\t...")` produced,
+        // assembled without the formatting machinery.
+        line.clear();
+        for text in [gene.as_str(), sample.as_str(), contig.as_str(), member.annotation_id.as_str()] {
+            line.extend_from_slice(text.as_bytes());
+            line.push(b'\t');
+        }
+        push_decimal(&mut line, u64::from(member.start));
+        line.push(b'\t');
+        push_decimal(&mut line, u64::from(member.end));
+        line.push(b'\t');
+        if member.strand < 0 {
+            line.push(b'-');
+        }
+        push_decimal(&mut line, u64::from(member.strand.unsigned_abs()));
+        line.push(b'\t');
+        push_decimal(&mut line, u64::from(member.locus));
+        line.push(b'\t');
+        line.extend_from_slice(member.origin.as_bytes());
+        line.extend_from_slice(b"\tdna_");
+        push_decimal(&mut line, u64::from(member.dna));
+        line.push(b'\n');
+        out.write_all(&line)?;
     }
     out.flush()?;
     let used: std::collections::BTreeSet<_> =
@@ -289,5 +317,24 @@ gene\tsample\tcontig\tcds1\t100\t108\t-1\t7\tannotated\tdna_0\n"
             "ambiguous\tid".to_string();
         let error = write_pangenome(&pangenome, &directory.0).unwrap_err();
         assert!(error.to_string().contains("TSV delimiters"));
+    }
+
+    #[test]
+    fn perf_push_decimal_matches_format() {
+        let mut values: Vec<u64> = (0..2000).collect();
+        values.extend([9, 10, 99, 100, 65_535, 4_294_967_295, u64::MAX, 1 << 40]);
+        for value in values {
+            let mut out = Vec::new();
+            push_decimal(&mut out, value);
+            assert_eq!(out, value.to_string().into_bytes());
+        }
+        for strand in [-1i8, 0, 1, i8::MIN, i8::MAX] {
+            let mut out = Vec::new();
+            if strand < 0 {
+                out.push(b'-');
+            }
+            push_decimal(&mut out, u64::from(strand.unsigned_abs()));
+            assert_eq!(out, strand.to_string().into_bytes());
+        }
     }
 }

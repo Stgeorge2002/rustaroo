@@ -20,7 +20,7 @@
 //! the stop between them invents a sequence no genome carries. A join cannot
 //! outvote a finished end.
 
-use std::collections::HashMap;
+use crate::fxhash::HashMap;
 
 use crate::align::{fit_short_in_long, length_ratio, terminal_identity_parts};
 use crate::genetic_code::{is_intact, orf_status, strip_terminal_stop, translate};
@@ -337,7 +337,7 @@ impl Census {
             modal_bp: 0,
             modal_samples: 0,
             extension_samples: 0,
-            finished_by_aa: HashMap::new(),
+            finished_by_aa: HashMap::default(),
         }
     }
 }
@@ -361,8 +361,8 @@ struct FinishedEnd {
 /// ends stay in their own classes and fail the support bar on their own.
 fn finished_end(intact: &[&Allele], proteins: &[Vec<u8>], n_samples: usize) -> Option<FinishedEnd> {
     let threshold = end_support(n_samples);
-    let mut classes: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut finished_by_aa: HashMap<usize, u32> = HashMap::new();
+    let mut classes: HashMap<usize, Vec<usize>> = HashMap::default();
+    let mut finished_by_aa: HashMap<usize, u32> = HashMap::default();
     for (index, allele) in intact.iter().enumerate() {
         if allele.finished == 0 || !orf_status(&allele.dna).terminal_stop {
             continue;
@@ -406,7 +406,7 @@ fn finished_end(intact: &[&Allele], proteins: &[Vec<u8>], n_samples: usize) -> O
                 anchor: anchor.clone(),
                 dna_bp: intact[anchor_at].dna.len() as u32,
                 samples,
-                finished_by_aa: HashMap::new(),
+                finished_by_aa: HashMap::default(),
             });
         }
     }
@@ -473,7 +473,7 @@ fn refuse_private_extensions<'a>(
     n_samples: usize,
 ) -> Census {
     let private_below = extension_support(n_samples);
-    let mut extending_copies: HashMap<usize, u32> = HashMap::new();
+    let mut extending_copies: HashMap<usize, u32> = HashMap::default();
     let mut judged: Vec<(&Allele, bool, usize)> = Vec::with_capacity(kept.len());
     for allele in kept.iter().copied() {
         let protein = protein_of(allele, intact, proteins, joined);
@@ -511,9 +511,23 @@ fn matches_other_gene(
     if peptide.len() < FUSION_MIN_AA {
         return false;
     }
+    let peptide_composition = crate::synteny::composition(peptide);
     reps.iter()
         .filter(|(id, _)| **id != own_cluster)
         .any(|(_, other)| {
+            // Exact skip: fit identity is matches / shorter length, and the
+            // matches can never exceed the shared residue composition.
+            let shorter = peptide.len().min(other.len());
+            if shorter > 0
+                && (crate::synteny::composition_bound(
+                    &peptide_composition,
+                    &crate::synteny::composition(other),
+                ) as f64
+                    / shorter as f64)
+                    < FUSION_IDENTITY
+            {
+                return false;
+            }
             let matches_tail = if peptide.len() <= other.len() {
                 fit_short_in_long(peptide, other).is_some_and(|fit| {
                     fit.identity >= FUSION_IDENTITY && fit.coverage >= FUSION_COVERAGE
@@ -591,7 +605,7 @@ fn codon_majority(alleles: &[&Allele]) -> String {
     let mut out = String::with_capacity(length);
     let mut offset = 0;
     while offset + 3 <= length {
-        let mut counts: HashMap<&str, u32> = HashMap::new();
+        let mut counts: HashMap<&str, u32> = HashMap::default();
         for allele in alleles {
             let codon = &allele.dna[offset..offset + 3];
             *counts.entry(codon).or_default() += allele.count.max(1);
@@ -700,7 +714,7 @@ mod tests {
     }
 
     fn no_others() -> HashMap<u32, Vec<u8>> {
-        HashMap::new()
+        HashMap::default()
     }
 
     fn protein(length: usize, phase: usize) -> Vec<u8> {

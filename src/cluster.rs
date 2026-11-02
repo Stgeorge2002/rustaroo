@@ -7,12 +7,12 @@
 //! here; a half-length fragment is the synteny step's problem, not this one's.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fxhash::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use rayon::prelude::*;
 
-use crate::align::{global_identity, length_ratio};
+use crate::align::{global_identity, global_identity_at_least, length_ratio};
 use crate::log::progress;
 
 // Both caps used to bound the cost of the one thing that was expensive:
@@ -28,7 +28,10 @@ const SATURATED_POSTING: usize = 8_000;
 // across threads costs more in dispatch overhead than it saves. Above it,
 // scoring candidates in parallel is worth doing even though the decision
 // that follows - which candidate wins - stays strictly sequential.
+#[cfg_attr(not(test), allow(dead_code))]
 const PARALLEL_CANDIDATE_THRESHOLD: usize = 16;
+// Below this many unscored pairs in a span, one thread is faster.
+const PARALLEL_PAIR_THRESHOLD: usize = 4;
 
 pub fn cluster_families(
     proteins: &[Vec<u8>],
@@ -67,6 +70,8 @@ fn cluster_families_scheduled(
         length_ratio_min,
         chunked,
     );
+    crate::log::stage("cluster_pass_0.98");
+    crate::align::report_counters("0.98");
     let rep_indices: Vec<usize> = pre_reps.iter().map(|&slot| unique[slot]).collect();
     let (families, _) = if rep_indices.len() <= 1 {
         (vec![0u32; rep_indices.len()], Vec::new())
@@ -79,6 +84,8 @@ fn cluster_families_scheduled(
             chunked,
         )
     };
+    crate::log::stage("cluster_pass_0.70");
+    crate::align::report_counters("0.70");
     back.into_iter()
         .map(|unique_slot| {
             let precluster = pre[unique_slot] as usize;
@@ -95,7 +102,7 @@ fn cluster_families_scheduled(
 /// already own the data removes both copies.
 fn unique_proteins(proteins: &[Vec<u8>]) -> (Vec<usize>, Vec<usize>) {
     let mut unique = Vec::new();
-    let mut index_of: HashMap<&[u8], usize> = HashMap::new();
+    let mut index_of: HashMap<&[u8], usize> = HashMap::default();
     let mut back = Vec::with_capacity(proteins.len());
     for (index, protein) in proteins.iter().enumerate() {
         if let Some(&slot) = index_of.get(protein.as_slice()) {
@@ -151,6 +158,7 @@ fn greedy(
         progress!("rustroo: {identity:.2} identity pass, {total} proteins, word size {kmer_size}");
     }
     let mut cursor = 0usize;
+    let mut memo: HashMap<usize, Vec<(u32, Option<f64>)>> = HashMap::default();
     let mut width = if chunked { 32usize } else { 1 };
     while cursor < total {
         let end = if chunked {
@@ -162,40 +170,107 @@ fn greedy(
         // that already exist. The span is thrown away at the first protein
         // that founds a new representative, because a later protein in the
         // same span might have joined it.
-        let chosen: Vec<Option<u32>> = {
+        // PERF PROTOTYPE: a protein whose chunk was discarded keeps the
+        // identities it already computed (they depend only on the pair), so a
+        // re-score only aligns against representatives founded since.
+        // Two-level parallelism with the same decisions: (1) candidate lists
+        // for every protein in the span, (2) every (protein, candidate) pair
+        // that is not memoised yet, as one flat parallel batch. Each identity
+        // is a pure function of the pair, and indexed `collect` keeps order,
+        // so every protein sees exactly the scores the serial walk computes.
+        let chosen_full: Vec<(Option<u32>, Vec<(u32, Option<f64>)>)> = {
             let reps = reps.as_slice();
-            if end - cursor == 1 {
-                let pos = order[cursor];
-                vec![choose_representative(
+            let memo = &memo;
+            let span = &order[cursor..end];
+            let candidate_of = |pos: usize| {
+                candidates_for(
                     &proteins[indices[pos]],
-                    &kmer_lists[pos],
                     reps,
                     indices,
                     proteins,
                     &postings,
-                    identity,
                     length_ratio_min,
-                    true,
-                )]
+                    &kmer_lists[pos],
+                )
+            };
+            let candidate_lists: Vec<Vec<u32>> = if span.len() == 1 {
+                vec![candidate_of(span[0])]
             } else {
-                order[cursor..end]
-                    .par_iter()
-                    .map(|&pos| {
-                        choose_representative(
-                            &proteins[indices[pos]],
-                            &kmer_lists[pos],
-                            reps,
-                            indices,
-                            proteins,
-                            &postings,
-                            identity,
-                            length_ratio_min,
-                            false,
-                        )
+                span.par_iter().map(|&pos| candidate_of(pos)).collect()
+            };
+            let mut values: Vec<Vec<Option<Option<f64>>>> = Vec::with_capacity(span.len());
+            let mut work: Vec<(u32, u32)> = Vec::new();
+            for (offset, (&pos, candidates)) in span.iter().zip(&candidate_lists).enumerate() {
+                let known = memo.get(&pos).map(Vec::as_slice);
+                let row: Vec<Option<Option<f64>>> = candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &rep_slot)| {
+                        let hit = known.and_then(|memo| {
+                            memo.binary_search_by_key(&rep_slot, |item| item.0)
+                                .ok()
+                                .map(|found| memo[found].1)
+                        });
+                        if hit.is_none() {
+                            work.push((offset as u32, at as u32));
+                        }
+                        hit
                     })
-                    .collect()
+                    .collect();
+                values.push(row);
             }
+            let score = |&(offset, at): &(u32, u32)| -> Option<f64> {
+                let pos = span[offset as usize];
+                let rep_slot = candidate_lists[offset as usize][at as usize];
+                global_identity_at_least(
+                    &proteins[indices[pos]],
+                    &proteins[indices[reps[rep_slot as usize]]],
+                    identity,
+                )
+            };
+            let scored: Vec<Option<f64>> = if work.len() >= PARALLEL_PAIR_THRESHOLD {
+                work.par_iter().map(score).collect()
+            } else {
+                work.iter().map(score).collect()
+            };
+            let mut fresh: Vec<Vec<(u32, Option<f64>)>> = vec![Vec::new(); span.len()];
+            for (&(offset, at), value) in work.iter().zip(scored) {
+                let (offset, at) = (offset as usize, at as usize);
+                values[offset][at] = Some(value);
+                fresh[offset].push((candidate_lists[offset][at], value));
+            }
+            candidate_lists
+                .iter()
+                .zip(values)
+                .zip(fresh)
+                .map(|((candidates, row), fresh)| {
+                    let mut best: Option<(u32, f64)> = None;
+                    for (&rep_slot, value) in candidates.iter().zip(row) {
+                        let Some(id) = value.expect("every candidate is scored") else {
+                            continue;
+                        };
+                        if id + f64::EPSILON < identity {
+                            continue;
+                        }
+                        let replace = match best {
+                            None => true,
+                            Some((_, best_id)) => id > best_id + 1e-12,
+                        };
+                        if replace {
+                            best = Some((rep_slot, id));
+                        }
+                    }
+                    (best.map(|(rep_slot, _)| rep_slot), fresh)
+                })
+                .collect()
         };
+        let decided_before = cursor;
+        let mut chosen: Vec<Option<u32>> = Vec::with_capacity(chosen_full.len());
+        let mut fresh: Vec<Vec<(u32, Option<f64>)>> = Vec::with_capacity(chosen_full.len());
+        for (choice, new_scores) in chosen_full {
+            chosen.push(choice);
+            fresh.push(new_scores);
+        }
         let chunk_start = cursor;
         for choice in chosen {
             let pos = order[cursor];
@@ -222,6 +297,17 @@ fn greedy(
                 break;
             }
         }
+        // Positions decided in this chunk drop their memo; the rest keep it.
+        for (offset, new_scores) in fresh.into_iter().enumerate() {
+            let pos = order[decided_before + offset];
+            if decided_before + offset < cursor {
+                memo.remove(&pos);
+            } else if !new_scores.is_empty() {
+                let entry = memo.entry(pos).or_default();
+                entry.extend(new_scores);
+                entry.sort_unstable_by_key(|item| item.0);
+            }
+        }
         if !chunked {
             continue;
         }
@@ -234,6 +320,9 @@ fn greedy(
     (assignment, reps)
 }
 
+/// The original decision for one protein (full identities, no bounds, no
+/// memo). Only the reference greedy in the tests calls it now.
+#[cfg_attr(not(test), allow(dead_code))]
 fn choose_representative(
     protein: &[u8],
     protein_kmers: &[u64],
@@ -276,6 +365,57 @@ fn choose_representative(
         }
     }
     best.map(|(rep_slot, _)| rep_slot)
+}
+
+#[allow(clippy::too_many_arguments, dead_code)]
+fn choose_representative_memo(
+    protein: &[u8],
+    protein_kmers: &[u64],
+    reps: &[usize],
+    indices: &[usize],
+    proteins: &[Vec<u8>],
+    postings: &Postings,
+    identity: f64,
+    length_ratio_min: f64,
+    parallel_scores: bool,
+    memo: Option<&[(u32, Option<f64>)]>,
+) -> (Option<u32>, Vec<(u32, Option<f64>)>) {
+    let candidates = candidates_for(protein, reps, indices, proteins, postings, length_ratio_min, protein_kmers);
+    let known = |rep_slot: u32| -> Option<Option<f64>> {
+        let memo = memo?;
+        memo.binary_search_by_key(&rep_slot, |item| item.0).ok().map(|at| memo[at].1)
+    };
+    let score_one = |&rep_slot: &u32| -> (Option<f64>, bool) {
+        if let Some(value) = known(rep_slot) {
+            return (value, false);
+        }
+        let rep_index = indices[reps[rep_slot as usize]];
+        (global_identity_at_least(protein, &proteins[rep_index], identity), true)
+    };
+    let scored: Vec<(Option<f64>, bool)> = if parallel_scores && candidates.len() >= PARALLEL_CANDIDATE_THRESHOLD {
+        candidates.par_iter().map(score_one).collect()
+    } else {
+        candidates.iter().map(score_one).collect()
+    };
+    let mut best: Option<(u32, f64)> = None;
+    let mut fresh = Vec::new();
+    for (&rep_slot, &(value, computed)) in candidates.iter().zip(&scored) {
+        if computed {
+            fresh.push((rep_slot, value));
+        }
+        let Some(id) = value else { continue };
+        if id + f64::EPSILON < identity {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some((_, best_id)) => id > best_id + 1e-12,
+        };
+        if replace {
+            best = Some((rep_slot, id));
+        }
+    }
+    (best.map(|(rep_slot, _)| rep_slot), fresh)
 }
 
 fn candidates_for(
@@ -371,7 +511,7 @@ thread_local! {
 /// `KmerHasher` instead of the default hasher.
 struct Postings {
     dense: Vec<Vec<u32>>,
-    sparse: HashMap<u64, Vec<u32>, BuildHasherDefault<KmerHasher>>,
+    sparse: std::collections::HashMap<u64, Vec<u32>, BuildHasherDefault<KmerHasher>>,
 }
 
 impl Postings {
@@ -383,7 +523,7 @@ impl Postings {
         };
         Self {
             dense,
-            sparse: HashMap::with_hasher(BuildHasherDefault::default()),
+            sparse: std::collections::HashMap::with_hasher(BuildHasherDefault::default()),
         }
     }
 
@@ -432,6 +572,7 @@ impl Hasher for KmerHasher {
 /// them concurrently cannot change any result, only how long it takes. The
 /// caller still walks this output strictly in order to decide a winner,
 /// which is what keeps a near-tie resolving the same way every run.
+#[cfg_attr(not(test), allow(dead_code))]
 fn score_candidates(
     protein: &[u8],
     candidates: &[u32],
@@ -447,6 +588,30 @@ fn score_candidates(
     // A query that is already one task of a parallel chunk scores its own
     // candidates here. Nesting another parallel iterator on a short list
     // only pays the scheduler.
+    if parallel && candidates.len() >= PARALLEL_CANDIDATE_THRESHOLD {
+        candidates.par_iter().map(score_one).collect()
+    } else {
+        candidates.iter().map(score_one).collect()
+    }
+}
+
+/// PERF PROTOTYPE: like `score_candidates`, but a candidate that provably
+/// cannot reach `identity` is reported as `None`, which `choose_representative`
+/// already skips, so the winner is unchanged.
+#[allow(dead_code)]
+fn score_candidates_at_least(
+    protein: &[u8],
+    candidates: &[u32],
+    reps: &[usize],
+    indices: &[usize],
+    proteins: &[Vec<u8>],
+    parallel: bool,
+    identity: f64,
+) -> Vec<Option<(u32, f64)>> {
+    let score_one = |&rep_slot: &u32| -> Option<(u32, f64)> {
+        let rep_index = indices[reps[rep_slot as usize]];
+        global_identity_at_least(protein, &proteins[rep_index], identity).map(|id| (rep_slot, id))
+    };
     if parallel && candidates.len() >= PARALLEL_CANDIDATE_THRESHOLD {
         candidates.par_iter().map(score_one).collect()
     } else {
@@ -623,5 +788,97 @@ mod tests {
         assert!(id >= 0.7 && id < 0.98, "{id}");
         let ids = cluster_families(&[full, near], 0.98, 0.7, 0.95);
         assert_eq!(ids[0], ids[1]);
+    }
+
+    /// The original greedy, one protein at a time with full identities, as
+    /// a reference for the bounded, memoised, pair-parallel scheduler.
+    fn greedy_reference(
+        indices: &[usize],
+        proteins: &[Vec<u8>],
+        identity: f64,
+        length_ratio_min: f64,
+    ) -> (Vec<u32>, Vec<usize>) {
+        let mut order: Vec<usize> = (0..indices.len()).collect();
+        order.sort_by(|&a, &b| {
+            let pa = &proteins[indices[a]];
+            let pb = &proteins[indices[b]];
+            pb.len().cmp(&pa.len()).then_with(|| pa.cmp(pb)).then(a.cmp(&b))
+        });
+        let kmer_size = if identity >= 0.90 { 5 } else { 3 };
+        let kmer_lists: Vec<Vec<u64>> =
+            (0..indices.len()).map(|pos| kmers(&proteins[indices[pos]], kmer_size)).collect();
+        let mut assignment = vec![0u32; indices.len()];
+        let mut reps: Vec<usize> = Vec::new();
+        let mut postings = Postings::new(kmer_size);
+        for &pos in &order {
+            let choice = choose_representative(
+                &proteins[indices[pos]],
+                &kmer_lists[pos],
+                &reps,
+                indices,
+                proteins,
+                &postings,
+                identity,
+                length_ratio_min,
+                false,
+            );
+            if let Some(rep_slot) = choice {
+                assignment[pos] = assignment[reps[rep_slot as usize]];
+            } else {
+                let rep_slot = reps.len() as u32;
+                assignment[pos] = rep_slot;
+                reps.push(pos);
+                for &kmer in &kmer_lists[pos] {
+                    postings.push(kmer, rep_slot);
+                }
+            }
+        }
+        (assignment, reps)
+    }
+
+    #[test]
+    fn perf_scheduler_matches_reference_greedy() {
+        let mut state = 0x2545f4914f6cdd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet = b"ACDEFGHIKLMNPQRSTVWY";
+        for trial in 0..6 {
+            let mut proteins: Vec<Vec<u8>> = Vec::new();
+            for _family in 0..25 {
+                let length = 60 + (next() % 240) as usize;
+                let root: Vec<u8> =
+                    (0..length).map(|_| alphabet[(next() % 20) as usize]).collect();
+                for _member in 0..(3 + next() % 12) {
+                    let rate = [1u64, 3, 8, 15, 25, 35][(next() % 6) as usize];
+                    let mut copy: Vec<u8> = Vec::new();
+                    for &residue in &root {
+                        let roll = next() % 100;
+                        if roll < rate {
+                            copy.push(alphabet[(next() % 20) as usize]);
+                        } else if roll < rate + 1 {
+                            continue;
+                        } else {
+                            copy.push(residue);
+                        }
+                        if next() % 400 == 0 {
+                            copy.push(alphabet[(next() % 20) as usize]);
+                        }
+                    }
+                    proteins.push(copy);
+                }
+            }
+            let indices: Vec<usize> = (0..proteins.len()).collect();
+            for &(identity, ratio) in &[(0.98, 0.95), (0.70, 0.95), (0.50, 0.80), (0.90, 0.0)] {
+                let expected = greedy_reference(&indices, &proteins, identity, ratio);
+                for chunked in [true, false] {
+                    let got = greedy(&indices, &proteins, identity, ratio, chunked);
+                    assert_eq!(got, expected, "trial {trial} identity {identity} chunked {chunked}");
+                }
+            }
+        }
     }
 }

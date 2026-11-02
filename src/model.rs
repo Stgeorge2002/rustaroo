@@ -18,9 +18,13 @@ pub struct Call {
     /// Found in a gap. Annotated calls stay false even when no audit id is stored.
     pub refound: bool,
     pub fusion_piece: bool,
-    pub symbol: String,
-    pub product: String,
+    pub symbol: Label,
+    pub product: Label,
 }
+
+/// Annotation text shared by every call that carries the same string; a
+/// cheap clone instead of a heap copy per call.
+pub type Label = std::sync::Arc<str>;
 
 #[derive(Debug, Default)]
 pub struct Pools {
@@ -29,14 +33,25 @@ pub struct Pools {
     /// FNV-1a of the stored sequence. A bucket holds every id with that hash;
     /// equality, not the hash, decides a hit. The sequence itself is stored
     /// only in `dna` / `protein`.
-    dna_index: std::collections::HashMap<u64, Vec<u32>>,
-    protein_index: std::collections::HashMap<u64, Vec<u32>>,
+    dna_index: crate::fxhash::HashMap<u64, Vec<u32>>,
+    protein_index: crate::fxhash::HashMap<u64, Vec<u32>>,
 }
 
 impl Pools {
     pub fn intern_dna(&mut self, sequence: String) -> u32 {
         let hash = content_hash(sequence.as_bytes());
         intern_at(&mut self.dna, &mut self.dna_index, hash, sequence)
+    }
+
+    /// `intern_dna` with the FNV hash already computed (same id).
+    pub fn intern_dna_hashed(&mut self, sequence: String, hash: u64) -> u32 {
+        debug_assert_eq!(hash, content_hash(sequence.as_bytes()));
+        intern_at(&mut self.dna, &mut self.dna_index, hash, sequence)
+    }
+
+    pub fn intern_protein_hashed(&mut self, sequence: Vec<u8>, hash: u64) -> u32 {
+        debug_assert_eq!(hash, content_hash(&sequence));
+        intern_at(&mut self.protein, &mut self.protein_index, hash, sequence)
     }
 
     pub fn intern_protein(&mut self, sequence: Vec<u8>) -> u32 {
@@ -56,7 +71,7 @@ pub(crate) fn content_hash(bytes: &[u8]) -> u64 {
 
 fn intern_at<T: PartialEq>(
     items: &mut Vec<T>,
-    index: &mut std::collections::HashMap<u64, Vec<u32>>,
+    index: &mut crate::fxhash::HashMap<u64, Vec<u32>>,
     hash: u64,
     sequence: T,
 ) -> u32 {

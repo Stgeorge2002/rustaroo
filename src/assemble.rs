@@ -5,7 +5,7 @@
 //! genes. The reference for each finished group is chosen only after that, so
 //! a fragment cannot outvote the intact copy it was broken off from.
 
-use std::collections::{HashMap, HashSet};
+use crate::fxhash::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
@@ -15,14 +15,17 @@ use crate::cluster::cluster_families;
 use crate::error::{Error, Result};
 use crate::genetic_code::{is_intact, orf_status, translate};
 use crate::log::{self, progress};
-use crate::model::{Call, Pools};
+use crate::model::{content_hash, Call, Label, Pools};
+use crate::packed::PackedSeq;
 use crate::reference::{choose_reference, join_fragments, Allele};
 use crate::synteny::{
     cluster_facts, compress_clusters, families_bounded_by_neighbors, freeze_contexts,
     length_evidence, membership_loci, merge_fragments, refind, screen_unsupported_families,
     split_fusions, split_paralogs, ClusterFacts, ALLELE_EDGE_BP, UNCONFIRMED_SHORT,
 };
-use crate::types::{Gene, GeneMember, MembershipAudit, Pangenome, Params, ParsedSample, Quality};
+use crate::types::{
+    Gene, GeneMember, MembershipAudit, Pangenome, Params, ParsedGene, ParsedSample, Quality,
+};
 
 pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenome> {
     params.validate()?;
@@ -38,63 +41,178 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             )));
         }
     }
+    let prepared: Vec<PreparedSample> = samples.into_par_iter().map(prepare_sample).collect();
+    let mut interned = Interned::with_capacity(prepared.len());
+    for sample in prepared {
+        interned.add(sample, params);
+    }
+    build_interned(interned, params)
+}
 
-    let sample_names: Vec<String> = samples.iter().map(|sample| sample.name.clone()).collect();
-    let mut pools = Pools::default();
-    let mut calls = Vec::new();
-    let mut annotation_ids = Vec::new();
-    let mut contigs = Vec::with_capacity(samples.len());
-    let mut logged_counts = Vec::with_capacity(samples.len());
-    for (sample_index, sample) in samples.iter_mut().enumerate() {
-        logged_counts.push((sample.contigs.len(), sample.genes.len()));
-        // The contig string moves into the refind table. Names stay on the
-        // sample for the membership audit. Gene strings move into the pools,
-        // which keep one copy of each distinct sequence.
-        contigs.push(
-            sample
-                .contigs
-                .iter_mut()
-                .map(|contig| std::mem::take(&mut contig.sequence))
-                .collect::<Vec<_>>(),
-        );
-        for gene in sample.genes.drain(..) {
+/// Parse and intern in sorted-sample order, a few files at a time, so the
+/// per-gene `String`s of all inputs never exist at once. Pool ids, call order
+/// and every later step are exactly what `build` on the fully parsed list
+/// gives: samples are visited in the same name order and each sample's genes
+/// in the same order. When anything would make `build` fail before
+/// interning (bad parameters, no input, two inputs with one sample name),
+/// every file is parsed first and `build` runs as before, so the same error
+/// wins.
+pub fn build_from_paths(paths: &[std::path::PathBuf], params: &Params) -> Result<Pangenome> {
+    use crate::gff::{parse_gff_file, sample_name};
+    let names: Vec<String> = paths.iter().map(|path| sample_name(path)).collect();
+    let mut order: Vec<usize> = (0..paths.len()).collect();
+    order.sort_by(|&a, &b| names[a].cmp(&names[b]));
+    let duplicate = order.windows(2).any(|pair| names[pair[0]] == names[pair[1]]);
+    if paths.is_empty() || duplicate || params.validate().is_err() {
+        let samples = paths
+            .par_iter()
+            .map(|path| parse_gff_file(path))
+            .collect::<Result<Vec<_>>>()?;
+        log::stage("parse_gff");
+        return build(samples, params);
+    }
+    let chunk = (rayon::current_num_threads() * 2).max(2);
+    let mut interned = Interned::with_capacity(paths.len());
+    for group in order.chunks(chunk) {
+        let parsed: Vec<Result<PreparedSample>> = group
+            .par_iter()
+            .map(|&index| parse_gff_file(&paths[index]).map(prepare_sample))
+            .collect();
+        for sample in parsed {
+            interned.add(sample?, params);
+        }
+    }
+    log::stage("parse_gff+intern(streamed)");
+    build_interned(interned, params)
+}
+
+/// One parsed sample with its contigs packed and every gene's pool hashes
+/// computed, all of which is per-sample work that can run in parallel.
+struct PreparedSample {
+    name: String,
+    contig_names: Vec<String>,
+    contigs: Vec<PackedSeq>,
+    genes: Vec<(ParsedGene, u64, u64)>,
+}
+
+fn prepare_sample(sample: ParsedSample) -> PreparedSample {
+    let mut contig_names = Vec::with_capacity(sample.contigs.len());
+    let mut contigs = Vec::with_capacity(sample.contigs.len());
+    for contig in sample.contigs {
+        contig_names.push(contig.name);
+        contigs.push(PackedSeq::new(contig.sequence));
+    }
+    let genes = sample
+        .genes
+        .into_iter()
+        .map(|gene| {
+            let dna_hash = content_hash(gene.dna.as_bytes());
+            let protein_hash = content_hash(&gene.protein);
+            (gene, dna_hash, protein_hash)
+        })
+        .collect();
+    PreparedSample {
+        name: sample.name,
+        contig_names,
+        contigs,
+        genes,
+    }
+}
+
+struct Interned {
+    sample_names: Vec<String>,
+    contig_names: Vec<Vec<String>>,
+    pools: Pools,
+    calls: Vec<Call>,
+    annotation_ids: Vec<String>,
+    contigs: Vec<Vec<PackedSeq>>,
+    logged_counts: Vec<(usize, usize)>,
+    labels: HashMap<String, Label>,
+}
+
+/// One shared `Label` per distinct annotation string (same text).
+fn intern_label(labels: &mut HashMap<String, Label>, text: String) -> Label {
+    if let Some(label) = labels.get(text.as_str()) {
+        return label.clone();
+    }
+    let label: Label = Label::from(text.as_str());
+    labels.insert(text, label.clone());
+    label
+}
+
+impl Interned {
+    fn with_capacity(samples: usize) -> Self {
+        Self {
+            sample_names: Vec::with_capacity(samples),
+            contig_names: Vec::with_capacity(samples),
+            pools: Pools::default(),
+            calls: Vec::new(),
+            annotation_ids: Vec::new(),
+            contigs: Vec::with_capacity(samples),
+            logged_counts: Vec::with_capacity(samples),
+            labels: HashMap::default(),
+        }
+    }
+
+    /// The original per-sample interning loop, unchanged in order.
+    fn add(&mut self, sample: PreparedSample, params: &Params) {
+        let sample_index = self.sample_names.len();
+        self.logged_counts.push((sample.contigs.len(), sample.genes.len()));
+        self.sample_names.push(sample.name);
+        self.contig_names.push(sample.contig_names);
+        self.contigs.push(sample.contigs);
+        for (gene, dna_hash, protein_hash) in sample.genes {
             if gene.dna.len() < params.min_cds_bp {
                 continue;
             }
             let source = if params.audit_members {
-                let id = annotation_ids.len() as u32;
-                annotation_ids.push(gene.annotation_id);
+                let id = self.annotation_ids.len() as u32;
+                self.annotation_ids.push(gene.annotation_id);
                 Some(id)
             } else {
                 None
             };
-            calls.push(Call {
+            self.calls.push(Call {
                 sample: sample_index as u32,
                 contig: gene.contig as u32,
                 start: gene.start,
                 end: gene.end,
                 strand: gene.strand,
-                dna: pools.intern_dna(gene.dna),
-                protein: pools.intern_protein(gene.protein),
+                dna: self.pools.intern_dna_hashed(gene.dna, dna_hash),
+                protein: self.pools.intern_protein_hashed(gene.protein, protein_hash),
                 cluster: 0,
                 context: 0,
                 locus: None,
                 source,
                 refound: false,
                 fusion_piece: false,
-                symbol: gene.symbol,
-                product: gene.product,
+                symbol: intern_label(&mut self.labels, gene.symbol),
+                product: intern_label(&mut self.labels, gene.product),
             });
         }
     }
+}
+
+fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
+    let Interned {
+        sample_names,
+        contig_names,
+        mut pools,
+        mut calls,
+        annotation_ids,
+        contigs,
+        logged_counts,
+        labels: _,
+    } = interned;
+    log::stage("intern_calls");
     if calls.is_empty() {
         return Err(Error::new("no coding sequences passed the minimum length"));
     }
     if log::enabled() {
-        for (sample, &(contig_count, gene_count)) in samples.iter().zip(&logged_counts) {
+        for (name, &(contig_count, gene_count)) in sample_names.iter().zip(&logged_counts) {
             log::record(&format!(
                 "sample\t{}\tcontigs\t{}\tgenes\t{}",
-                sample.name, contig_count, gene_count
+                name, contig_count, gene_count
             ));
         }
     }
@@ -117,6 +235,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
         params.family_identity,
         params.length_ratio,
     );
+    log::stage("cluster_families");
     for call in calls.iter_mut() {
         call.cluster = families[call.protein as usize];
     }
@@ -129,7 +248,9 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     progress!("rustroo: {family_count} families after homology");
 
     progress!("rustroo: splitting fusions");
+    log::stage("compress_after_homology");
     let fusions = split_fusions(&mut calls, &mut pools);
+    log::stage("split_fusions");
     progress!("rustroo: split {fusions} fusion annotations");
     compress_clusters(&mut calls);
     progress!(
@@ -137,15 +258,18 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
         dense_family_count(&calls)
     );
     freeze_contexts(&mut calls, &pools);
+    log::stage("freeze_contexts");
     let contig_lengths: Vec<Vec<usize>> = contigs
         .iter()
-        .map(|sample| sample.iter().map(String::len).collect())
+        .map(|sample| sample.iter().map(PackedSeq::len).collect())
         .collect();
     for round in 1..=4 {
         progress!("rustroo: synteny round {round}");
         let before = dense_family_count(&calls);
         let split = split_paralogs(&mut calls, &pools);
+        log::stage(&format!("split_paralogs_r{round}"));
         let merged = merge_fragments(&mut calls, &pools, &contig_lengths);
+        log::stage(&format!("merge_fragments_r{round}"));
         compress_clusters(&mut calls);
         let after = dense_family_count(&calls);
         progress!(
@@ -167,10 +291,12 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     if params.refind {
         progress!("rustroo: searching intergenic gaps");
         let found = refind(&mut calls, &mut pools, &contigs);
+        log::stage("refind");
         progress!("rustroo: refound {found} genes in intergenic gaps");
         if found > 0 {
             let split = split_paralogs(&mut calls, &pools);
             compress_clusters(&mut calls);
+            log::stage("split_paralogs_after_refind");
             progress!(
                 "rustroo: {split} paralog splits after refinding, {} groups",
                 dense_family_count(&calls)
@@ -183,7 +309,9 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     // Contig-end tails and wholly invalid families are annotation, not genes.
     // This runs after repair so a fragment that synteny adopted is not judged
     // on its own, and a refound ORF can still supply the intact allele.
+    log::stage("drop_contigs");
     screen_unsupported_families(&mut calls, &pools, sample_names.len());
+    log::stage("screen_unsupported");
     if calls.is_empty() {
         return Err(Error::new(
             "no supported gene family remained after removing invalid and contig-end families",
@@ -192,12 +320,15 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     compress_clusters(&mut calls);
 
     let bounded = families_bounded_by_neighbors(&mut calls, &pools);
-    let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+    log::stage("families_bounded");
+    let mut groups: HashMap<u32, Vec<usize>> = HashMap::default();
     for (index, call) in calls.iter().enumerate() {
         groups.entry(call.cluster).or_default().push(index);
     }
     let reps = cluster_reps(&groups, &calls, &pools);
+    log::stage("cluster_reps");
     let locus_ids = membership_loci(&calls, &pools);
+    log::stage("membership_loci");
     let mut genes = Vec::with_capacity(groups.len());
     let mut ids: Vec<u32> = groups.keys().copied().collect();
     ids.sort_by(|&a, &b| groups[&b].len().cmp(&groups[&a].len()).then(a.cmp(&b)));
@@ -232,8 +363,9 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             partial
         })
         .collect();
-    let mut used_names = HashSet::new();
-    let mut name_of_cluster = HashMap::new();
+    log::stage("compute_partial_genes(reference)");
+    let mut used_names = HashSet::default();
+    let mut name_of_cluster = HashMap::default();
     let mut anonymous = 0u32;
     for (&cluster, partial) in ids.iter().zip(partials) {
         let Some(partial) = partial else { continue };
@@ -263,7 +395,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             .cmp(&a.samples_present)
             .then(a.id.cmp(&b.id))
     });
-    let mut loci: HashMap<String, Vec<Locus>> = HashMap::new();
+    let mut loci: HashMap<String, Vec<Locus>> = HashMap::default();
     for call in &calls {
         let Some(name) = name_of_cluster.get(&call.cluster) else {
             continue;
@@ -278,8 +410,10 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     }
     // A folded gene is gone, but its calls are still members of the survivor.
     // Presence was copied onto that gene and its reference sequence was not.
-    let mut folded_into = HashMap::new();
+    let mut folded_into = HashMap::default();
+    log::stage("names_sort_loci");
     let removed = apply_quality(&mut genes, params.quality, &loci, &mut folded_into);
+    log::stage("apply_quality");
     let cluster_of_gene: HashMap<String, u32> = name_of_cluster
         .iter()
         .map(|(&cluster, id)| (id.clone(), cluster))
@@ -290,6 +424,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
         &cluster_facts(&calls, &pools),
         sample_names.len(),
     );
+    log::stage("cluster_facts_assign_support");
     if params.quality != Quality::Standard {
         progress!(
             "rustroo: quality {label} removed {removed} genes",
@@ -337,16 +472,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
             });
         }
         Some(MembershipAudit {
-            contig_names: samples
-                .iter()
-                .map(|sample| {
-                    sample
-                        .contigs
-                        .iter()
-                        .map(|contig| contig.name.clone())
-                        .collect()
-                })
-                .collect(),
+            contig_names,
             members,
             sequences: pools.dna,
         })
@@ -375,7 +501,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
                 gene.intact_alleles,
             ));
         }
-        let mut tally: HashMap<&str, usize> = HashMap::new();
+        let mut tally: HashMap<&str, usize> = HashMap::default();
         for gene in &genes {
             *tally.entry(gene.selection).or_default() += 1;
         }
@@ -384,7 +510,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
         for (label, count) in labels {
             log::record(&format!("summary\tselection\t{label}\t{count}"));
         }
-        let mut support_tally: HashMap<&str, usize> = HashMap::new();
+        let mut support_tally: HashMap<&str, usize> = HashMap::default();
         for gene in &genes {
             *support_tally.entry(gene.support).or_default() += 1;
         }
@@ -549,13 +675,13 @@ fn redundant_fragments(
         .collect();
     // Five residues is specific enough to connect a fragment with its long
     // copy. A tetrapeptide shared by dozens of unrelated genes is not.
-    let mut postings: HashMap<[u8; 5], Vec<usize>> = HashMap::new();
+    let mut postings: HashMap<[u8; 5], Vec<usize>> = HashMap::default();
     let mut kmer_counts = vec![0u32; genes.len()];
     for (index, protein) in proteins.iter().enumerate() {
         if protein.len() < 5 {
             continue;
         }
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         for window in protein.windows(5) {
             let key = [window[0], window[1], window[2], window[3], window[4]];
             if seen.insert(key) {
@@ -591,15 +717,15 @@ fn redundant_fragments(
             .cmp(&proteins[right].len())
             .then(left.cmp(&right))
     });
-    let mut redundant = HashSet::new();
+    let mut redundant = HashSet::default();
     for short in order {
         let needed = kmer_counts[short];
         if needed == 0 || redundant.contains(&short) {
             continue;
         }
-        let mut scores: HashMap<usize, u32> = HashMap::new();
+        let mut scores: HashMap<usize, u32> = HashMap::default();
         let protein = &proteins[short];
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         for window in protein.windows(5) {
             let key = [window[0], window[1], window[2], window[3], window[4]];
             if !seen.insert(key) {
@@ -907,8 +1033,8 @@ fn compute_partial_gene(
     let choice = choose_reference(&with_join, reps, cluster, sample_count)?;
     let mut presence = vec![false; sample_count];
     let mut lengths = vec![0u32; sample_count];
-    let mut intervals: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::new();
-    let mut exact = HashSet::new();
+    let mut intervals: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::default();
+    let mut exact = HashSet::default();
     for &index in indexes {
         let call = &calls[index];
         presence[call.sample as usize] = true;
@@ -963,13 +1089,13 @@ fn alleles_of(
     // Two abutting pieces of one locus are a broken gene, not a shorter
     // finished stop. Counting either piece would let the break define the
     // reference and throw away the intact copy.
-    let mut parts_of_locus: HashMap<u32, u32> = HashMap::new();
+    let mut parts_of_locus: HashMap<u32, u32> = HashMap::default();
     for &index in indexes {
         *parts_of_locus.entry(locus_ids[index]).or_default() += 1;
     }
-    let mut samples_for_dna: HashMap<u32, HashSet<u32>> = HashMap::new();
-    let mut finished_for_dna: HashMap<u32, HashSet<u32>> = HashMap::new();
-    let mut closed: HashMap<u32, bool> = HashMap::new();
+    let mut samples_for_dna: HashMap<u32, HashSet<u32>> = HashMap::default();
+    let mut finished_for_dna: HashMap<u32, HashSet<u32>> = HashMap::default();
+    let mut closed: HashMap<u32, bool> = HashMap::default();
     for &index in indexes {
         let call = &calls[index];
         samples_for_dna
@@ -1026,7 +1152,7 @@ fn joined_allele(
     pools: &Pools,
     locus_ids: &[u32],
 ) -> Option<String> {
-    let mut by_locus: HashMap<(u32, u32, u32), Vec<usize>> = HashMap::new();
+    let mut by_locus: HashMap<(u32, u32, u32), Vec<usize>> = HashMap::default();
     for &index in indexes {
         let call = &calls[index];
         by_locus
@@ -1034,7 +1160,7 @@ fn joined_allele(
             .or_default()
             .push(index);
     }
-    let mut joins: HashMap<String, u32> = HashMap::new();
+    let mut joins: HashMap<String, u32> = HashMap::default();
     for group in by_locus.values() {
         if group.len() < 2 {
             continue;
@@ -1082,7 +1208,7 @@ fn cluster_reps(
     calls: &[Call],
     pools: &Pools,
 ) -> HashMap<u32, Vec<u8>> {
-    let mut reps = HashMap::new();
+    let mut reps = HashMap::default();
     for (&cluster, indexes) in groups {
         let protein = indexes
             .iter()
@@ -1096,37 +1222,39 @@ fn cluster_reps(
 }
 
 fn preferred_symbol(indexes: &[usize], calls: &[Call]) -> String {
-    let mut votes: HashMap<String, u32> = HashMap::new();
-    let mut seen = HashSet::new();
+    // Borrowed keys; the vote and the (count, then smaller text) winner are
+    // the same as with owned `String` keys.
+    let mut votes: HashMap<&str, u32> = HashMap::default();
+    let mut seen: HashSet<(u32, &str)> = HashSet::default();
     for &index in indexes {
         let call = &calls[index];
-        if !seen.insert((call.sample, call.symbol.clone())) {
+        if !seen.insert((call.sample, &call.symbol)) {
             continue;
         }
         if usable_symbol(&call.symbol) {
-            *votes.entry(call.symbol.clone()).or_default() += 1;
+            *votes.entry(&call.symbol).or_default() += 1;
         }
     }
     votes
         .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-        .map(|(symbol, _)| symbol)
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
+        .map(|(symbol, _)| symbol.to_string())
         .unwrap_or_default()
 }
 
 fn preferred_product(indexes: &[usize], calls: &[Call]) -> String {
-    let mut votes: HashMap<String, u32> = HashMap::new();
+    let mut votes: HashMap<&str, u32> = HashMap::default();
     for &index in indexes {
         let product = calls[index].product.trim();
         if product.is_empty() {
             continue;
         }
-        *votes.entry(product.to_string()).or_default() += 1;
+        *votes.entry(product).or_default() += 1;
     }
     votes
         .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-        .map(|(product, _)| product)
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
+        .map(|(product, _)| product.to_string())
         .unwrap_or_else(|| "hypothetical protein".to_string())
 }
 
@@ -1287,9 +1415,9 @@ mod tests {
     fn apply(
         genes: &mut Vec<Gene>,
         quality: Quality,
-        loci: &std::collections::HashMap<String, Vec<Locus>>,
+        loci: &HashMap<String, Vec<Locus>>,
     ) -> usize {
-        let mut folded = std::collections::HashMap::new();
+        let mut folded = HashMap::default();
         super::apply_quality(genes, quality, loci, &mut folded)
     }
 
@@ -1567,7 +1695,7 @@ mod tests {
             labelled("short_no", true, UNCONFIRMED_SHORT),
             labelled("broken", false, LENGTH_SUFFICIENT),
         ];
-        let loci = std::collections::HashMap::new();
+        let loci = HashMap::default();
         assert_eq!(apply(&mut genes.clone(), Quality::Standard, &loci), 0);
         assert_eq!(apply(&mut genes, Quality::High, &loci), 2);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
@@ -1641,7 +1769,7 @@ mod tests {
         let mut genes = vec![
             long, piece, alone, near, copy, twin, paralog, close, deep, band,
         ];
-        let loci = std::collections::HashMap::new();
+        let loci = HashMap::default();
         assert_eq!(apply(&mut genes.clone(), Quality::High, &loci), 0);
         assert_eq!(apply(&mut genes, Quality::Strict, &loci), 7);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
@@ -1693,7 +1821,7 @@ mod tests {
         split.presence = vec![false, false, false, true];
         split.samples_present = 1;
         let mut genes = vec![long, piece, paralog, host, split];
-        let loci = std::collections::HashMap::new();
+        let loci = HashMap::default();
         assert_eq!(apply(&mut genes, Quality::Strict, &loci), 1);
         let ids: Vec<_> = genes.iter().map(|gene| gene.id.as_str()).collect();
         assert_eq!(ids, vec!["long", "paralog", "host", "split"]);
@@ -1723,7 +1851,7 @@ mod tests {
             copy.samples_present = 1;
             genes.push(copy);
         }
-        let loci = std::collections::HashMap::new();
+        let loci = HashMap::default();
         assert_eq!(apply(&mut genes, Quality::Strict, &loci), 70);
         assert_eq!(genes.len(), 1);
         assert_eq!(genes[0].id, "long");
@@ -1784,7 +1912,7 @@ mod tests {
         short.samples_present = 2;
         short.samples_with_exact_reference = 2;
         let mut genes = vec![long, short];
-        let loci = std::collections::HashMap::new();
+        let loci = HashMap::default();
         assert_eq!(apply(&mut genes, Quality::Strict, &loci), 1);
         assert_eq!(genes[0].id, "long");
         assert_eq!(genes[0].reference_dna, back_translate(&long_aa));
@@ -1876,7 +2004,7 @@ mod tests {
     fn strict_drops_a_nested_piece_a_neighboring_copy_and_folds_an_exclusive_allele() {
         use crate::genetic_code::back_translate;
         use crate::synteny::LENGTH_SUFFICIENT;
-        use std::collections::HashMap;
+        use HashMap;
         let long_aa = random_protein(80, 11);
         let mut nested_aa = long_aa[10..40].to_vec();
         for site in [0, 1, 28, 29] {
@@ -1903,7 +2031,7 @@ mod tests {
         beside.reference_dna = back_translate(&beside_aa);
         beside.presence = vec![true, false];
         beside.samples_present = 1;
-        let mut loci: HashMap<String, Vec<super::Locus>> = HashMap::new();
+        let mut loci: HashMap<String, Vec<super::Locus>> = HashMap::default();
         loci.insert(
             "long".to_string(),
             vec![
@@ -2245,8 +2373,8 @@ mod tests {
             source: Some(0),
             refound: false,
             fusion_piece: false,
-            symbol: String::new(),
-            product: String::new(),
+            symbol: Label::default(),
+            product: Label::default(),
         }
     }
 
