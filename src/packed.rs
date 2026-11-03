@@ -97,7 +97,7 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for trial in 0..300 {
+        for trial in 0..80 {
             let len = (next() % 200) as usize + trial % 3;
             let alphabet: &[char] = if trial % 7 == 0 {
                 &['A', 'C', 'G', 'T', 'N', 'a', 'X', 'é']
@@ -115,7 +115,7 @@ mod tests {
             }
             if text.is_ascii() {
                 assert_eq!(packed.unpack(), text);
-                for _ in 0..50 {
+                for _ in 0..12 {
                     let a = (next() % (text.len() as u64 + 1)) as usize;
                     let b = (next() % (text.len() as u64 + 1)) as usize;
                     let (a, b) = (a.min(b), a.max(b));

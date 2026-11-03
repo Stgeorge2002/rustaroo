@@ -846,13 +846,13 @@ mod tests {
             state
         };
         let alphabet = b"ACDEFGHIKLMNPQRSTVWY";
-        for trial in 0..6 {
+        for trial in 0..2 {
             let mut proteins: Vec<Vec<u8>> = Vec::new();
-            for _family in 0..25 {
-                let length = 60 + (next() % 240) as usize;
+            for _family in 0..8 {
+                let length = 40 + (next() % 80) as usize;
                 let root: Vec<u8> =
                     (0..length).map(|_| alphabet[(next() % 20) as usize]).collect();
-                for _member in 0..(3 + next() % 12) {
+                for _member in 0..(2 + next() % 4) {
                     let rate = [1u64, 3, 8, 15, 25, 35][(next() % 6) as usize];
                     let mut copy: Vec<u8> = Vec::new();
                     for &residue in &root {

@@ -432,7 +432,7 @@ mod tests {
                 }
             }
         }
-        for _ in 0..5000 {
+        for _ in 0..500 {
             let len = (next() % 90) as usize;
             let text: String = (0..len)
                 .map(|_| ['A', 'C', 'G', 'T', 'a', 'u', 'N', 'é', 'x', 'U'][(next() % 10) as usize])

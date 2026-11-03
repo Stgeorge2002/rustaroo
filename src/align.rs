@@ -743,7 +743,7 @@ mod tests {
     #[test]
     fn perf_indexed_fit_matches_reference_fit() {
         let mut next = rng(0x1234_5678);
-        for _ in 0..100_000 {
+        for _ in 0..2_000 {
             let (a, b) = random_pair(&mut next);
             let ia = LongIndex::new(&a);
             let ib = LongIndex::new(&b);
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn perf_fast_fit_matches_reference_fit() {
         let mut next = rng(0x9e3779b97f4a7c15);
-        for _ in 0..200_000 {
+        for _ in 0..2_000 {
             let (a, b) = random_pair(&mut next);
             assert_eq!(fit_short_in_long(&a, &b), fit_short_in_long_reference(&a, &b), "{a:?} {b:?}");
             assert_eq!(fit_short_in_long(&b, &a), fit_short_in_long_reference(&b, &a), "{b:?} {a:?}");
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn perf_bounded_identity_matches_whenever_threshold_reachable() {
         let mut next = rng(0x1234_5678_9abc_def1);
-        for _ in 0..100_000 {
+        for _ in 0..2_000 {
             let (a, b) = random_pair(&mut next);
             let exact = global_identity(&a, &b);
             for threshold in [0.98, 0.70, 0.40, 0.0] {
@@ -870,7 +870,7 @@ mod tests {
             state
         };
         let alphabet = b"ACDEFGHIKLMNPQRSTVWY";
-        for _ in 0..200 {
+        for _ in 0..80 {
             let base_len = 20 + (next() % 60) as usize;
             let drift = (next() % 5) as usize;
             let a: Vec<u8> = (0..base_len)

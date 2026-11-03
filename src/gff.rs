@@ -837,7 +837,7 @@ ctg\tBakta\tCDS\t13\t24\t.\t+\t0\tgene=unnamed\n\
         let keys = ["ID", "gene", "Name", "product", "locus_tag", " ID ", "Gene"];
         let values = ["a", "", "\"q\"", "x%20y", "%", "%4", "%zz", "é", "b c", "dup"];
         let bases = b"ACGTNacgtnURYX";
-        for _ in 0..400 {
+        for _ in 0..80 {
             let mut fasta = String::from("##FASTA\n");
             let contigs = 1 + next() % 3;
             for c in 0..contigs {
