@@ -40,6 +40,13 @@ pub struct Params {
     /// `strict` drops weak and duplicate references. `standard` keeps every
     /// repaired family. The command-line default is `strict`.
     pub quality: Quality,
+    /// Fail on any input the lenient reader would repair or skip
+    /// (see `InputFallbacks`), instead of only counting it.
+    pub strict_input: bool,
+    /// Split a family member allele off when its protein identity to the
+    /// family representative is below this and the synteny evidence says it
+    /// is a different locus. `0` disables the split.
+    pub paralog_identity: f64,
 }
 
 impl Default for Params {
@@ -53,6 +60,8 @@ impl Default for Params {
             threads: 0,
             audit_members: false,
             quality: Quality::Strict,
+            strict_input: false,
+            paralog_identity: 0.70,
         }
     }
 }
@@ -69,6 +78,9 @@ impl Params {
         }
         if !(0.0 < self.length_ratio && self.length_ratio <= 1.0) {
             return Err(Error::new("length ratio must be between 0 and 1"));
+        }
+        if !(0.0..=1.0).contains(&self.paralog_identity) {
+            return Err(Error::new("paralog identity must be between 0 and 1"));
         }
         if self.min_cds_bp < 6 {
             return Err(Error::new(
@@ -107,6 +119,91 @@ pub struct ParsedSample {
     pub name: String,
     pub contigs: Vec<Contig>,
     pub genes: Vec<ParsedGene>,
+    /// Lenient-parsing decisions taken while reading this sample.
+    pub fallbacks: InputFallbacks,
+}
+
+/// Every place the GFF3/FASTA reader silently repairs or skips input.
+///
+/// The default (lenient) behaviour is unchanged; these counts only make it
+/// visible in `rustroo.log` and on stderr. `--strict-input` turns any non-zero
+/// count into an error instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputFallbacks {
+    /// Non-comment feature lines with fewer than 9 tab-separated columns (skipped).
+    pub short_lines: u64,
+    /// CDS whose seqid has no FASTA record (skipped).
+    pub unknown_contig: u64,
+    /// CDS whose start/end is not an integer, is 0, or has end < start (skipped).
+    pub bad_coordinates: u64,
+    /// CDS whose strand is not `+` or `-` (`.`, `?`, ...; read as `+`).
+    pub unknown_strand: u64,
+    /// CDS whose phase is not 0, 1 or 2 (unparsable read as 0, larger clamped to 2).
+    pub bad_phase: u64,
+    /// CDS parts ending past the end of their contig (clipped to the contig end).
+    pub end_past_contig: u64,
+    /// CDS dropped because a part starts past the end of its contig.
+    pub part_outside_contig: u64,
+    /// CDS whose length is not a multiple of 3 (trailing bases trimmed).
+    pub trimmed_length: u64,
+    /// CDS dropped because fewer than 6 bp remained.
+    pub too_short: u64,
+    /// CDS dropped because the translation was empty.
+    pub empty_protein: u64,
+    /// FASTA bases other than A, C, G, T, N (any case; `u` reads as T) read as N.
+    pub non_acgt_bases: u64,
+    /// Repeated FASTA record names (features resolve to the last record).
+    pub duplicate_contigs: u64,
+    /// The first offending input, for error messages.
+    pub first: Option<String>,
+}
+
+impl InputFallbacks {
+    /// `(log key, count)` for every kind, in a fixed order.
+    pub fn counts(&self) -> [(&'static str, u64); 12] {
+        [
+            ("short_lines_skipped", self.short_lines),
+            ("cds_unknown_contig_skipped", self.unknown_contig),
+            ("cds_bad_coordinates_skipped", self.bad_coordinates),
+            ("cds_unknown_strand_read_as_plus", self.unknown_strand),
+            ("cds_bad_phase_defaulted", self.bad_phase),
+            ("cds_end_clipped_to_contig", self.end_past_contig),
+            ("cds_outside_contig_dropped", self.part_outside_contig),
+            ("cds_length_trimmed_to_codons", self.trimmed_length),
+            ("cds_too_short_dropped", self.too_short),
+            ("cds_empty_protein_dropped", self.empty_protein),
+            ("fasta_non_acgt_read_as_n", self.non_acgt_bases),
+            ("fasta_duplicate_contig_names", self.duplicate_contigs),
+        ]
+    }
+
+    pub fn total(&self) -> u64 {
+        self.counts().iter().map(|(_, count)| count).sum()
+    }
+
+    pub fn add(&mut self, other: &InputFallbacks) {
+        self.short_lines += other.short_lines;
+        self.unknown_contig += other.unknown_contig;
+        self.bad_coordinates += other.bad_coordinates;
+        self.unknown_strand += other.unknown_strand;
+        self.bad_phase += other.bad_phase;
+        self.end_past_contig += other.end_past_contig;
+        self.part_outside_contig += other.part_outside_contig;
+        self.trimmed_length += other.trimmed_length;
+        self.too_short += other.too_short;
+        self.empty_protein += other.empty_protein;
+        self.non_acgt_bases += other.non_acgt_bases;
+        self.duplicate_contigs += other.duplicate_contigs;
+        if self.first.is_none() {
+            self.first = other.first.clone();
+        }
+    }
+
+    pub(crate) fn note(&mut self, what: impl FnOnce() -> String) {
+        if self.first.is_none() {
+            self.first = Some(what());
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +240,9 @@ pub struct Gene {
     /// was found in a gap. The label is a column on every gene. No quality
     /// mode drops a gene because of it.
     pub support: &'static str,
+    /// Lowest protein identity of any member allele to the reference
+    /// (over the shorter sequence; fragments are fitted, not globally aligned).
+    pub min_allele_identity: f64,
 }
 
 #[derive(Debug, Clone)]

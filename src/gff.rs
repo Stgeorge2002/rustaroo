@@ -15,7 +15,7 @@ use flate2::read::GzDecoder;
 
 use crate::error::{Error, Result};
 use crate::genetic_code::{reverse_complement, translate, uppercase_dna};
-use crate::types::{Contig, ParsedGene, ParsedSample};
+use crate::types::{Contig, InputFallbacks, ParsedGene, ParsedSample};
 
 pub fn parse_gff_file(path: &Path) -> Result<ParsedSample> {
     let text = read_maybe_gzip(path)?;
@@ -54,20 +54,25 @@ pub fn parse_gff(name: &str, text: &str, sibling_fasta: Option<&str>) -> Result<
     let fasta_text = embedded.or(sibling_fasta).ok_or_else(|| {
         Error::new("no contig FASTA. Expected a ##FASTA section or a sibling .fa/.fna/.fasta file")
     })?;
-    let contigs = parse_fasta_fast(fasta_text);
+    let mut fallbacks = InputFallbacks::default();
+    let contigs = parse_fasta_fast(fasta_text, &mut fallbacks);
     if contigs.is_empty() {
         return Err(Error::new("FASTA section contained no sequences"));
     }
     let mut by_name: HashMap<&str, usize> = HashMap::with_capacity_and_hasher(contigs.len(), Default::default());
     for (index, contig) in contigs.iter().enumerate() {
-        by_name.insert(contig.name.as_str(), index);
+        if by_name.insert(contig.name.as_str(), index).is_some() {
+            fallbacks.duplicate_contigs += 1;
+            fallbacks.note(|| format!("FASTA record '{}' appears more than once", contig.name));
+        }
     }
 
     let mut parts: Vec<CdsPart> = Vec::new();
-    for line in features.lines() {
+    for (line_index, line) in features.lines().enumerate() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        let line_number = line_index + 1;
         // The first nine tab fields, exactly as `split('\t').collect()` then
         // indexing 0..=8 would see them; anything past column 9 is ignored.
         let mut columns = [""; 9];
@@ -79,23 +84,50 @@ pub fn parse_gff(name: &str, text: &str, sibling_fasta: Option<&str>) -> Result<
                 break;
             }
         }
-        if count < 9 || columns[2] != "CDS" {
+        if count < 9 {
+            // FIX(fallbacks): a malformed feature line used to vanish silently.
+            // A blank-looking line (only whitespace) is not a feature.
+            if !line.trim().is_empty() {
+                fallbacks.short_lines += 1;
+                fallbacks.note(|| format!("line {line_number}: {count} tab-separated columns, expected 9"));
+            }
+            continue;
+        }
+        if columns[2] != "CDS" {
             continue;
         }
         let Some(&contig_index) = by_name.get(columns[0]) else {
+            fallbacks.unknown_contig += 1;
+            fallbacks.note(|| format!("line {line_number}: CDS on '{}', which has no FASTA record", columns[0]));
             continue;
         };
-        let Ok(start) = columns[3].parse::<u32>() else {
-            continue;
-        };
-        let Ok(end) = columns[4].parse::<u32>() else {
+        let (Ok(start), Ok(end)) = (columns[3].parse::<u32>(), columns[4].parse::<u32>()) else {
+            fallbacks.bad_coordinates += 1;
+            fallbacks.note(|| format!("line {line_number}: CDS coordinates '{}'..'{}' are not integers", columns[3], columns[4]));
             continue;
         };
         if start == 0 || end < start {
+            fallbacks.bad_coordinates += 1;
+            fallbacks.note(|| format!("line {line_number}: CDS coordinates {start}..{end} are not a 1-based interval"));
             continue;
         }
-        let strand = if columns[6] == "-" { -1 } else { 1 };
-        let phase = columns[7].parse::<usize>().unwrap_or(0).min(2);
+        let strand = match columns[6] {
+            "-" => -1,
+            "+" => 1,
+            other => {
+                fallbacks.unknown_strand += 1;
+                fallbacks.note(|| format!("line {line_number}: CDS strand '{other}' read as '+'"));
+                1
+            }
+        };
+        let phase = match columns[7].parse::<usize>() {
+            Ok(phase @ 0..=2) => phase,
+            parsed => {
+                fallbacks.bad_phase += 1;
+                fallbacks.note(|| format!("line {line_number}: CDS phase '{}' is not 0, 1 or 2", columns[7]));
+                parsed.unwrap_or(0).min(2)
+            }
+        };
         let attrs = needed_attributes(columns[8]);
         let decoded = |value: Option<&str>| value.map(decode_value);
         parts.push(CdsPart {
@@ -113,11 +145,14 @@ pub fn parse_gff(name: &str, text: &str, sibling_fasta: Option<&str>) -> Result<
         });
     }
 
-    let genes = assemble_genes_with(&contigs, parts, gene_from_parts_fast)?;
+    let genes = assemble_genes_with(&contigs, parts, |contigs, parts| {
+        gene_from_parts_fast(contigs, parts, &mut fallbacks)
+    })?;
     Ok(ParsedSample {
         name: name.to_string(),
         contigs,
         genes,
+        fallbacks,
     })
 }
 
@@ -183,6 +218,7 @@ pub(crate) fn parse_gff_reference(name: &str, text: &str, sibling_fasta: Option<
         name: name.to_string(),
         contigs,
         genes,
+        fallbacks: InputFallbacks::default(),
     })
 }
 
@@ -204,7 +240,7 @@ fn assemble_genes(contigs: &[Contig], parts: Vec<CdsPart>) -> Result<Vec<ParsedG
 fn assemble_genes_with(
     contigs: &[Contig],
     mut parts: Vec<CdsPart>,
-    gene_from_parts: fn(&[Contig], &[CdsPart]) -> Option<ParsedGene>,
+    mut gene_from_parts: impl FnMut(&[Contig], &[CdsPart]) -> Option<ParsedGene>,
 ) -> Result<Vec<ParsedGene>> {
     parts.sort_by(|a, b| {
         a.contig
@@ -306,7 +342,11 @@ fn gene_from_parts(contigs: &[Contig], parts: &[CdsPart]) -> Option<ParsedGene> 
 /// Same bytes as `gene_from_parts`, built in one buffer: a minus-strand piece
 /// is reverse-complemented straight from the contig slice, and the phase
 /// offset is skipped instead of re-allocating the piece.
-fn gene_from_parts_fast(contigs: &[Contig], parts: &[CdsPart]) -> Option<ParsedGene> {
+fn gene_from_parts_fast(
+    contigs: &[Contig],
+    parts: &[CdsPart],
+    fallbacks: &mut InputFallbacks,
+) -> Option<ParsedGene> {
     let strand = parts[0].strand;
     let mut ordered: Vec<&CdsPart> = parts.iter().collect();
     if strand < 0 {
@@ -314,13 +354,26 @@ fn gene_from_parts_fast(contigs: &[Contig], parts: &[CdsPart]) -> Option<ParsedG
     } else {
         ordered.sort_by(|a, b| a.start.cmp(&b.start));
     }
+    let label = || {
+        if parts[0].id.is_empty() {
+            format!("CDS at {}..{}", parts[0].start, parts[0].end)
+        } else {
+            format!("CDS '{}'", parts[0].id)
+        }
+    };
     let mut dna: Vec<u8> = Vec::new();
     for (piece_index, part) in ordered.iter().enumerate() {
         let contig = &contigs[part.contig].sequence;
         let start = part.start.saturating_sub(1) as usize;
         let end = (part.end as usize).min(contig.len());
         if start >= end || end > contig.len() {
+            fallbacks.part_outside_contig += 1;
+            fallbacks.note(|| format!("{} starts past the end of contig '{}'", label(), contigs[part.contig].name));
             return None;
+        }
+        if part.end as usize > contig.len() {
+            fallbacks.end_past_contig += 1;
+            fallbacks.note(|| format!("{} ends past the end of contig '{}' and was clipped", label(), contigs[part.contig].name));
         }
         // `str` slicing keeps the original's char-boundary behaviour.
         let piece = contig[start..end].as_bytes();
@@ -336,13 +389,19 @@ fn gene_from_parts_fast(contigs: &[Contig], parts: &[CdsPart]) -> Option<ParsedG
         }
     }
     if dna.len() % 3 != 0 {
+        fallbacks.trimmed_length += 1;
+        fallbacks.note(|| format!("{} is {} bp, not a whole number of codons", label(), dna.len()));
         dna.truncate(dna.len() - dna.len() % 3);
     }
     if dna.len() < 6 {
+        fallbacks.too_short += 1;
+        fallbacks.note(|| format!("{} is shorter than 6 bp", label()));
         return None;
     }
     let protein = crate::genetic_code::translate_bytes(&dna);
     if protein.is_empty() {
+        fallbacks.empty_protein += 1;
+        fallbacks.note(|| format!("{} translates to an empty protein", label()));
         return None;
     }
     // Contig bytes are ASCII after `uppercase_dna`, and so is every
@@ -423,7 +482,7 @@ fn decode_value(value: &str) -> String {
 
 /// `parse_fasta` with the case/U->N mapping applied while copying each line,
 /// instead of concatenating and then re-collecting through `char`s.
-fn parse_fasta_fast(text: &str) -> Vec<Contig> {
+fn parse_fasta_fast(text: &str, fallbacks: &mut InputFallbacks) -> Vec<Contig> {
     let mut contigs = Vec::new();
     let mut name = String::new();
     let mut sequence: Vec<u8> = Vec::new();
@@ -452,7 +511,18 @@ fn parse_fasta_fast(text: &str) -> Vec<Contig> {
                 .unwrap_or("contig")
                 .to_string();
         } else if !name.is_empty() {
+            let before = sequence.len();
             sequence.extend(line.bytes().map(crate::genetic_code::uppercase_dna_byte));
+            // FIX(fallbacks): count bases that only became N by the mapping.
+            let replaced = line
+                .bytes()
+                .zip(&sequence[before..])
+                .filter(|&(raw, &mapped)| mapped == b'N' && raw != b'N' && raw != b'n')
+                .count() as u64;
+            if replaced > 0 {
+                fallbacks.non_acgt_bases += replaced;
+                fallbacks.note(|| format!("FASTA record '{name}' has non-ACGTN characters, read as N"));
+            }
         }
     }
     flush(&mut name, &mut sequence, &mut contigs);
@@ -651,9 +721,64 @@ ctg\tBakta\tCDS\t13\t24\t.\t+\t0\tgene=unnamed\n\
         );
     }
 
+    #[test]
+    fn fix_every_lenient_fallback_is_counted() {
+        // Each line triggers exactly one fallback kind.
+        let cds = "ATGAAACCCGGGTTTTAA"; // 18 bp
+        let fasta = format!(">ctg\n{cds}{cds}XX{cds}\n>dup\nATG\n>dup\nATGAAATAA\n");
+        let lines = [
+            "ctg\tB\tCDS\t1\t18",                          // short line
+            "nope\tB\tCDS\t1\t18\t.\t+\t0\tID=unknown",      // unknown contig
+            "ctg\tB\tCDS\tx\t18\t.\t+\t0\tID=coord",         // bad coordinates
+            "ctg\tB\tCDS\t18\t1\t.\t+\t0\tID=backwards",     // bad coordinates
+            "ctg\tB\tCDS\t1\t18\t.\t?\t0\tID=strand",        // unknown strand
+            "ctg\tB\tCDS\t19\t36\t.\t+\t.\tID=phase",        // bad phase
+            "ctg\tB\tCDS\t39\t60\t.\t+\t0\tID=past",         // end past contig (56 bp)
+            "ctg\tB\tCDS\t70\t90\t.\t+\t0\tID=outside",      // outside contig
+            "ctg\tB\tCDS\t1\t20\t.\t+\t0\tID=trim",          // 20 bp, trimmed
+            "ctg\tB\tCDS\t1\t5\t.\t+\t0\tID=tiny",           // too short
+            "ctg\tB\tgene\t1\t18\t.\t+\t0\tID=not_a_cds",    // ignored, not counted
+        ];
+        let mut text = String::from("##gff-version 3\n");
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        text.push_str("##FASTA\n");
+        text.push_str(&fasta);
+        let parsed = parse_gff("s", &text, None).unwrap();
+        let f = &parsed.fallbacks;
+        assert_eq!(f.short_lines, 1);
+        assert_eq!(f.unknown_contig, 1);
+        assert_eq!(f.bad_coordinates, 2);
+        assert_eq!(f.unknown_strand, 1);
+        assert_eq!(f.bad_phase, 1);
+        assert_eq!(f.end_past_contig, 1);
+        assert_eq!(f.part_outside_contig, 1);
+        // "past" is clipped to 18 bp (no trim); "trim" is 20 bp -> 18;
+        // "tiny" is 5 bp -> trimmed to 3, then too short.
+        assert_eq!(f.trimmed_length, 2);
+        assert_eq!(f.too_short, 1);
+        assert_eq!(f.non_acgt_bases, 2);
+        assert_eq!(f.duplicate_contigs, 1);
+        assert_eq!(f.total(), 14);
+        assert!(f.first.as_deref().unwrap().contains("non-ACGTN"), "{:?}", f.first);
+        // Lenient output itself is unchanged by the counting.
+        same("s", &text, None);
+        let clean = format!("ctg\tB\tCDS\t1\t18\t.\t+\t0\tID=ok\n##FASTA\n>ctg\n{cds}\n");
+        assert_eq!(parse_gff("s", &clean, None).unwrap().fallbacks.total(), 0);
+    }
+
+    // The reference parser does not count fallbacks; compare everything else.
     fn same(name: &str, text: &str, sibling: Option<&str>) {
-        let fast = format!("{:?}", parse_gff(name, text, sibling));
-        let reference = format!("{:?}", parse_gff_reference(name, text, sibling));
+        let strip = |result: Result<ParsedSample>| {
+            result.map(|mut sample| {
+                sample.fallbacks = InputFallbacks::default();
+                sample
+            })
+        };
+        let fast = format!("{:?}", strip(parse_gff(name, text, sibling)));
+        let reference = format!("{:?}", strip(parse_gff_reference(name, text, sibling)));
         assert_eq!(fast, reference, "input:\n{text}");
     }
 

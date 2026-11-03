@@ -95,12 +95,12 @@ fn write_report(path: &Path, pangenome: &Pangenome) -> Result<()> {
     let mut out = buffered(path)?;
     writeln!(
         out,
-        "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tsupport\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles"
+        "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tsupport\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles\tmin_allele_identity"
     )?;
     for gene in &pangenome.genes {
         writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
             gene.id,
             sanitize_field(&gene.product),
             gene.reference_dna.len(),
@@ -115,6 +115,7 @@ fn write_report(path: &Path, pangenome: &Pangenome) -> Result<()> {
             gene.samples_with_exact_reference,
             gene.distinct_alleles,
             gene.intact_alleles,
+            gene.min_allele_identity,
         )?;
     }
     Ok(())
@@ -258,6 +259,7 @@ mod tests {
                 modal_end_samples: 1,
                 extension_samples: 0,
                 support: "core",
+                min_allele_identity: 1.0,
             }],
             membership_audit: Some(MembershipAudit {
                 contig_names: vec![vec!["contig".to_string()]],
@@ -283,8 +285,8 @@ mod tests {
         let directory = TemporaryOutput::new();
         write_pangenome(&example(), &directory.0).unwrap();
         assert_eq!(fs::read_to_string(directory.0.join("reference_report.tsv")).unwrap(),
-            "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tsupport\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles\n\
-gene\t\t9\tyes\tintact\t1\tunconfirmed_short\tcore\t9\t1\t0\t1\t1\t1\n");
+            "gene\tproduct\treference_bp\tintact\tselection\tsamples_present\tlength_evidence\tsupport\tmodal_end_bp\tmodal_end_samples\textension_samples\tsamples_with_exact_reference\tdistinct_alleles\tintact_alleles\tmin_allele_identity\n\
+gene\t\t9\tyes\tintact\t1\tunconfirmed_short\tcore\t9\t1\t0\t1\t1\t1\t1.0000\n");
         assert_eq!(
             fs::read_to_string(directory.0.join("members.tsv")).unwrap(),
             "gene\tsample\tcontig\tannotation_id\tstart\tend\tstrand\tlocus\torigin\tallele\n\

@@ -63,6 +63,20 @@ struct Cli {
     /// `high` drops only the first two. `standard` keeps every repaired family.
     #[arg(long, value_enum, default_value = "strict")]
     quality: Quality,
+
+    /// Stop with an error on any GFF3/FASTA input the reader would otherwise
+    /// repair or skip (short lines, unknown contigs, bad coordinates, strand
+    /// other than +/-, bad phase, clipped or trimmed CDS, non-ACGTN bases,
+    /// duplicate contig names). Without it these are counted in rustroo.log.
+    #[arg(long)]
+    strict_input: bool,
+
+    /// Split a member allele into its own family when its protein identity to
+    /// the family representative is below this value and its gene neighbours
+    /// differ from the family's (or it shares a genome with the family).
+    /// 0 disables. The default equals --family-identity.
+    #[arg(long, default_value_t = 0.70)]
+    paralog_identity: f64,
 }
 
 #[derive(Subcommand)]
@@ -247,6 +261,8 @@ fn run() -> Result<()> {
         threads: cli.threads,
         audit_members: cli.audit_members,
         quality: cli.quality,
+        strict_input: cli.strict_input,
+        paralog_identity: cli.paralog_identity,
     };
     let paths = collect_inputs(&cli.input)?;
     log::open(&output_dir.join("rustroo.log"))?;
@@ -264,6 +280,8 @@ fn run() -> Result<()> {
     log::record(&format!("param\tthreads\t{}", params.threads));
     log::record(&format!("param\taudit_members\t{}", params.audit_members));
     log::record(&format!("param\tquality\t{}", quality_name(params.quality)));
+    log::record(&format!("param\tstrict_input\t{}", params.strict_input));
+    log::record(&format!("param\tparalog_identity\t{}", params.paralog_identity));
     for path in &paths {
         log::record(&format!("input\t{}", path.display()));
     }

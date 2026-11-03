@@ -30,6 +30,7 @@ pub use error::{Error, Result};
 pub use gff::{is_gff, parse_gff_file, sample_name};
 pub use output::write_pangenome;
 pub use types::{
-    Gene, GeneMember, MembershipAudit, Pangenome, Params, ParsedGene, ParsedSample, Quality,
+    Gene, GeneMember, InputFallbacks, MembershipAudit, Pangenome, Params, ParsedGene,
+    ParsedSample, Quality,
 };
 pub use validation::{validate, TreeMode, ValidationOptions, ValidationSummary};

@@ -314,6 +314,37 @@ split families; it does not spend further rounds on relabeling-induced splits.
 The four-round budget for merge-driven repair remains a safety limit, with an
 explicit notice if accepted merges are still occurring at that limit.
 
+### Orientation, fusions, distant members and input repairs
+
+Gene neighbourhoods are read in each locus's own reading direction (5' side
+first), and refinding votes use unordered flank pairs, so reverse-complementing
+any assembly contig gives the same pangenome. Cluster numbering, representative
+choice and refind tie-breaks use sequence content, not coordinates.
+
+A fused annotation is only cut when both pieces can be read from the genome:
+the prefix and the suffix tile the original span exactly, the suffix keeps the
+real stop, and no stop codon is added. A fused call whose bases cannot be
+verified is left whole and counted in the log. `lengths.tsv` therefore sums
+true genomic intervals.
+
+`--paralog-identity` (default 0.70, the same as `--family-identity`; 0
+disables) moves a group of member alleles into its own family when its
+protein identity to the family representative is below the threshold and it
+either shares a genome with the rest of the family or sits between different
+neighbouring families. A divergent group in the family's usual neighbourhood
+stays and is logged as a kept allele group. `reference_report.tsv` gives
+`min_allele_identity`, the lowest identity of any member protein to the
+reference, so mixed families stay visible. On 500 *S. pneumoniae* genomes,
+0.80 split 17 families and 0.90 split 44.
+
+The GFF3/FASTA reader counts every repair it makes: short lines, CDS on unknown
+contigs or with bad coordinates, strands other than `+`/`-` (read as `+`), bad
+phase (read as 0), ends clipped to the contig, lengths trimmed to whole codons,
+too-short or empty proteins, non-ACGTN bases read as N and duplicate contig
+names. The counts are written to `rustroo.log` (`input_fallback` rows) and
+summarised on stderr. `--strict-input` stops with an error at the first sample
+that needs any of these repairs.
+
 ## Families that are not genes
 
 After repair and refinding, two screens run. Neither deletes a rare gene that sits between two neighbors.
@@ -338,7 +369,7 @@ Inputs are GFF3 files (or a directory of them), with contig sequence in a `##FAS
 | `genes.fa` | One reference CDS per gene (header is the gene id only) |
 | `presence.tsv` | Gene × sample presence (0/1) |
 | `lengths.tsv` | Allele length in each sample that has the gene |
-| `reference_report.tsv` | Why each reference was chosen, its `length_evidence` label, and the finished-end census |
+| `reference_report.tsv` | Why each reference was chosen, its `length_evidence` label, the finished-end census and `min_allele_identity` |
 | `rustroo.log` | Full run record, separate from the terminal: parameters, inputs, stage lines, removed families, and every reference decision |
 | `members.tsv` | Optional original CDS membership, coordinates, origin, locus and allele ID |
 | `member_alleles.fa` | Optional deduplicated coding sequences referenced by memberships |

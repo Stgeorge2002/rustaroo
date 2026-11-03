@@ -1643,6 +1643,7 @@ mod tests {
                 modal_end_samples: 2,
                 extension_samples: 0,
                 support: "core",
+                min_allele_identity: 1.0,
             }],
             membership_audit: Some(MembershipAudit {
                 contig_names: vec![

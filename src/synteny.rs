@@ -28,7 +28,11 @@ pub(crate) const ALLELE_EDGE_BP: usize = 90;
 const ALLELE_MIN_AA: usize = 30;
 
 /// Split fusion CDS into the two genes they contain. Returns the number split.
-pub fn split_fusions(calls: &mut Vec<Call>, pools: &mut Pools) -> usize {
+pub fn split_fusions(
+    calls: &mut Vec<Call>,
+    pools: &mut Pools,
+    contigs: &[Vec<PackedSeq>],
+) -> usize {
     let (reps, counts) = rayon::join(|| representatives(calls, pools), || sample_counts(calls));
     let mut cluster_ids: Vec<u32> = reps.keys().copied().collect();
     // Sorted so the `best` tie-breaks below (strict `>` on a support score)
@@ -71,42 +75,51 @@ pub fn split_fusions(calls: &mut Vec<Call>, pools: &mut Pools) -> usize {
     }
     let mut twins = Vec::new();
     let mut split = 0usize;
+    let mut not_contiguous = 0usize;
     for call in calls.iter_mut() {
         let Some((_, left_id, right_id, end)) = plan_of.get(&call.cluster)
         else {
             continue;
         };
-        let dna = pools.dna[call.dna as usize].clone();
-        call.fusion_piece = true;
         let protein_len = pools.protein[call.protein as usize].len();
         let cut = (*end).min(protein_len);
-        if let Some(suffix) = slice_coding(&dna, cut, protein_len) {
-            let suffix_bp = suffix.len() as u32;
-            let mut twin = call.clone();
-            twin.cluster = *right_id;
-            twin.symbol = Label::default();
-            twin.product = Label::default();
-            twin.protein = pools.intern_protein(translate(&suffix));
-            twin.dna = pools.intern_dna(suffix);
-            if twin.strand >= 0 {
-                twin.start = twin.end.saturating_sub(suffix_bp).max(twin.start);
-            } else {
-                twin.end = twin.start.saturating_add(suffix_bp).min(twin.end);
-            }
-            twins.push(twin);
+        if cut >= protein_len {
+            // Nothing is left for the right-hand gene: the whole call is the
+            // left gene, unchanged.
+            call.cluster = *left_id;
+            continue;
         }
-        if let Some(prefix) = slice_coding(&dna, 0, cut) {
-            let prefix_bp = prefix.len() as u32;
-            call.protein = pools.intern_protein(translate(&prefix));
-            call.dna = pools.intern_dna(prefix);
-            if call.strand >= 0 {
-                call.end = call.start.saturating_add(prefix_bp).saturating_sub(1);
-            } else {
-                call.start = call.end.saturating_sub(prefix_bp).saturating_add(1);
-            }
-        }
+        let dna = pools.dna[call.dna as usize].clone();
+        // FIX(fusion): the pieces are the genome's own bases. No stop codon is
+        // invented for the prefix, the suffix keeps the real terminal codon,
+        // and both intervals are derived from the CDS's 5' end so they tile
+        // the original span exactly (no overlap, no off-by-one).
+        let Some(pieces) = fusion_pieces(call, &dna, cut, contigs) else {
+            // A CDS whose bases are not one contiguous genome interval (joined
+            // parts, phase offset, trimmed tail) cannot be cut into exact
+            // intervals. It is left whole rather than given made-up coordinates.
+            not_contiguous += 1;
+            continue;
+        };
+        call.fusion_piece = true;
+        let mut twin = call.clone();
+        twin.cluster = *right_id;
+        twin.symbol = Label::default();
+        twin.product = Label::default();
+        twin.protein = pools.intern_protein(translate(&pieces.suffix));
+        twin.dna = pools.intern_dna(pieces.suffix);
+        (twin.start, twin.end) = pieces.suffix_span;
+        twins.push(twin);
+        call.protein = pools.intern_protein(translate(&pieces.prefix));
+        call.dna = pools.intern_dna(pieces.prefix);
+        (call.start, call.end) = pieces.prefix_span;
         call.cluster = *left_id;
         split += 1;
+    }
+    if not_contiguous > 0 {
+        progress!(
+            "rustroo: left {not_contiguous} fused annotations whole: their CDS is not one contiguous genome interval"
+        );
     }
     calls.extend(twins);
     split
@@ -745,16 +758,25 @@ impl AlleleIndex {
                 let next = &calls[loci[position + 1].first];
                 next.sample != call.sample || next.contig != call.contig
             };
+            // `context` is already (upstream, downstream); the contig-edge
+            // tests need the coordinate-left and coordinate-right sides.
+            let (left_flank, right_flank) = if call.strand >= 0 {
+                (context.0, context.1)
+            } else {
+                (context.1, context.0)
+            };
             let start_edge =
-                first_on_contig && context.0.is_none() && call.start as usize <= ALLELE_EDGE_BP;
+                first_on_contig
+                    && left_flank.is_none()
+                    && (call.start as usize).saturating_sub(1) <= ALLELE_EDGE_BP;
             let end_edge = last_on_contig
-                && context.1.is_none()
+                && right_flank.is_none()
                 && locus.end as usize <= length
                 && length - locus.end as usize <= ALLELE_EDGE_BP;
             let (flanks, upstream_edge, downstream_edge) = if call.strand >= 0 {
                 (context, start_edge, end_edge)
             } else {
-                ((context.1, context.0), end_edge, start_edge)
+                (context, end_edge, start_edge)
             };
             occurrences
                 .entry(cluster)
@@ -1464,8 +1486,10 @@ pub fn refind(calls: &mut Vec<Call>, pools: &mut Pools, contigs: &[Vec<PackedSeq
     let mut between: HashMap<(u32, u32), HashMap<u32, u32>> = HashMap::default();
     for (locus, context) in loci.iter().zip(contexts) {
         if let (Some(left), Some(right)) = context {
+            // FIX(orientation): the gap scan below does not know the strand of
+            // the missing gene, so the flank pair is unordered.
             between
-                .entry((left, right))
+                .entry(flank_key(left, right))
                 .or_default()
                 .entry(calls[locus.first].cluster)
                 .and_modify(|count| *count += 1)
@@ -1583,9 +1607,20 @@ fn refind_in_sample(
     target_of: &HashMap<(u32, u32), u32>,
     reps: &HashMap<u32, Vec<u8>>,
     contigs: &[Vec<PackedSeq>],
-    mut present: HashSet<u32>,
+    present: HashSet<u32>,
 ) -> Vec<FoundGene> {
-    let mut found = Vec::new();
+    // FIX(orientation): every gap is scored first, then each missing gene is
+    // placed in its single best gap. The old first-gap-along-the-contig rule
+    // picked a different gap when a contig was reverse-complemented. The
+    // choice is by identity, then contig, then distance from the nearer contig
+    // end, then the ORF bases: all unchanged by flipping a contig.
+    struct Candidate {
+        identity: f64,
+        contig: u32,
+        edge_distance: usize,
+        gene: FoundGene,
+    }
+    let mut best: HashMap<u32, Candidate> = HashMap::default();
     let mut index = 0;
     while index < sample_calls.len() {
         let contig = sample_calls[index].contig;
@@ -1599,7 +1634,7 @@ fn refind_in_sample(
             if !(60..=12_000).contains(&gap) {
                 continue;
             }
-            let Some(&target) = target_of.get(&(pair[0].cluster, pair[1].cluster)) else {
+            let Some(&target) = target_of.get(&flank_key(pair[0].cluster, pair[1].cluster)) else {
                 continue;
             };
             if present.contains(&target) {
@@ -1621,25 +1656,55 @@ fn refind_in_sample(
                 continue;
             }
             let gap_seq = sequence.slice(from, to);
-            let Some(orf) = best_orf(&gap_seq, target_protein) else {
+            let Some((identity, orf)) = best_orf(&gap_seq, target_protein) else {
                 continue;
             };
             let protein = translate(&orf.dna);
-            found.push(FoundGene {
-                sample,
+            let start = pair[0].end + orf.offset + 1;
+            let end_bp = pair[0].end + orf.offset + orf.dna.len() as u32;
+            let edge_distance = (start as usize - 1).min(sequence.len() - end_bp as usize);
+            let candidate = Candidate {
+                identity,
                 contig,
-                start: pair[0].end + orf.offset + 1,
-                end: pair[0].end + orf.offset + orf.dna.len() as u32,
-                strand: orf.strand,
-                dna: orf.dna,
-                protein,
-                cluster: target,
-            });
-            present.insert(target);
+                edge_distance,
+                gene: FoundGene {
+                    sample,
+                    contig,
+                    start,
+                    end: end_bp,
+                    strand: orf.strand,
+                    dna: orf.dna,
+                    protein,
+                    cluster: target,
+                },
+            };
+            let better = match best.get(&target) {
+                None => true,
+                Some(current) => candidate
+                    .identity
+                    .total_cmp(&current.identity)
+                    .then(current.contig.cmp(&candidate.contig))
+                    .then(current.edge_distance.cmp(&candidate.edge_distance))
+                    .then(current.gene.dna.cmp(&candidate.gene.dna))
+                    .is_gt(),
+            };
+            if better {
+                best.insert(target, candidate);
+            }
         }
         index = end;
     }
+    let mut found: Vec<FoundGene> = best.into_values().map(|candidate| candidate.gene).collect();
+    // One gene per target: ordering by target keeps pool interning order
+    // independent of contig orientation.
+    found.sort_by_key(|gene| gene.cluster);
     found
+}
+
+/// Unordered flank pair: a gene between A and B is between B and A on the
+/// reverse-complemented contig.
+fn flank_key(a: u32, b: u32) -> (u32, u32) {
+    (a.min(b), a.max(b))
 }
 
 struct FoundOrf {
@@ -1648,7 +1713,7 @@ struct FoundOrf {
     strand: i8,
 }
 
-fn best_orf(gap: &str, target: &[u8]) -> Option<FoundOrf> {
+fn best_orf(gap: &str, target: &[u8]) -> Option<(f64, FoundOrf)> {
     let reverse = crate::genetic_code::reverse_complement(gap);
     // Bounds only. The DNA string is built for an ORF that clears 0.80
     // identity, and equal scores keep the earlier strand, frame, and codon.
@@ -1727,38 +1792,84 @@ fn best_orf(gap: &str, target: &[u8]) -> Option<FoundOrf> {
     } else {
         spans.iter().map(score).collect()
     };
+    // FIX(orientation): an identity tie goes to the smaller ORF sequence and
+    // then to the ORF nearer a gap end, not to whichever strand was scanned
+    // first, so a reverse-complemented gap gives the same ORF.
+    let gap_len = gap.len() as u32;
+    let edge = |orf: &FoundOrf| orf.offset.min(gap_len.saturating_sub(orf.offset + orf.dna.len() as u32));
     let mut best: Option<(f64, FoundOrf)> = None;
     for found in scored.into_iter().flatten() {
-        if best
-            .as_ref()
-            .map(|(identity, _)| found.0 > *identity)
-            .unwrap_or(true)
-        {
+        let better = match &best {
+            None => true,
+            Some((identity, current)) => found
+                .0
+                .total_cmp(identity)
+                .then(current.dna.cmp(&found.1.dna))
+                .then(edge(current).cmp(&edge(&found.1)))
+                .is_gt(),
+        };
+        if better {
             best = Some(found);
         }
     }
-    best.map(|(_, orf)| orf)
+    best
 }
 
-fn slice_coding(dna: &str, aa_start: usize, aa_end: usize) -> Option<String> {
-    if aa_end <= aa_start {
+/// The two genome-exact pieces of a fused CDS cut after `cut_aa` codons.
+pub(crate) struct FusionPieces {
+    pub prefix: String,
+    pub prefix_span: (u32, u32),
+    pub suffix: String,
+    pub suffix_span: (u32, u32),
+}
+
+/// Cut `dna` (the call's 5'->3' coding sequence) after `cut_aa` codons.
+///
+/// Both pieces are plain substrings of the CDS: the prefix ends where the
+/// fused reading frame continued (no stop is appended), the suffix runs to the
+/// CDS's own last base and so keeps its real stop codon. Coordinates are
+/// counted from the 5' end (`start` on +, `end` on -), so the two intervals
+/// tile `start..=end` with no gap and no overlap. `None` unless the CDS is
+/// exactly the genome interval it is annotated on, base for base.
+pub(crate) fn fusion_pieces(
+    call: &Call,
+    dna: &str,
+    cut_aa: usize,
+    contigs: &[Vec<PackedSeq>],
+) -> Option<FusionPieces> {
+    let cut_bp = cut_aa.checked_mul(3)?;
+    if cut_bp == 0 || cut_bp >= dna.len() || call.end < call.start {
         return None;
     }
-    let bytes = dna.as_bytes();
-    let start = aa_start * 3;
-    let mut end = aa_end * 3;
-    if start >= bytes.len() {
+    let span = (call.end - call.start) as usize + 1;
+    if span != dna.len() {
         return None;
     }
-    end = end.min(bytes.len() - bytes.len() % 3);
-    if end <= start {
+    let sequence = contig_sequence(contigs, call.sample, call.contig)?;
+    if call.start == 0 || call.end as usize > sequence.len() {
         return None;
     }
-    let mut sequence = String::from_utf8_lossy(&bytes[start..end]).into_owned();
-    if sequence.len() >= 3 && !is_stop(&sequence.as_bytes()[sequence.len() - 3..]) {
-        sequence.push_str("TAA");
+    let genome = sequence.slice(call.start as usize - 1, call.end as usize);
+    let genome = if call.strand < 0 {
+        crate::genetic_code::reverse_complement(&genome)
+    } else {
+        genome
+    };
+    if genome != dna {
+        return None;
     }
-    Some(sequence)
+    let cut = cut_bp as u32;
+    let (prefix_span, suffix_span) = if call.strand >= 0 {
+        ((call.start, call.start + cut - 1), (call.start + cut, call.end))
+    } else {
+        ((call.end - cut + 1, call.end), (call.start, call.end - cut))
+    };
+    Some(FusionPieces {
+        prefix: dna[..cut_bp].to_string(),
+        prefix_span,
+        suffix: dna[cut_bp..].to_string(),
+        suffix_span,
+    })
 }
 
 /// 4-mer sets for every representative protein, keyed by cluster id and
@@ -1816,7 +1927,10 @@ fn representative_ids(calls: &[Call], pools: &Pools) -> HashMap<u32, u32> {
     let mut best = HashMap::default();
     for call in calls {
         let slot = best.entry(call.cluster).or_insert(call.protein);
-        if pools.protein[call.protein as usize].len() > pools.protein[*slot as usize].len() {
+        // FIX(orientation): equal lengths go to the smaller sequence, not to
+        // whichever copy came first in coordinate order.
+        let (candidate, current) = (&pools.protein[call.protein as usize], &pools.protein[*slot as usize]);
+        if candidate.len() > current.len() || (candidate.len() == current.len() && candidate < current) {
             *slot = call.protein;
         }
     }
@@ -2119,6 +2233,8 @@ fn same_neighborhood(contexts: &[(Option<u32>, Option<u32>)]) -> bool {
     known > 0 && best * 2 > known
 }
 
+/// `(upstream, downstream)` neighbor families of every locus, in the
+/// locus's own reading direction (5' side first).
 fn locus_contexts(
     calls: &[Call],
     loci: &[Locus],
@@ -2160,7 +2276,15 @@ fn locus_contexts(
             } else {
                 None
             };
-            contexts[cursor] = (prev, next);
+            // FIX(orientation): flanks are read in the gene's own direction,
+            // (upstream, downstream). A contig assembled in the opposite
+            // orientation flips both coordinate order and strand, so the
+            // same locus gets the same context either way.
+            contexts[cursor] = if calls[loci[cursor].first].strand < 0 {
+                (next, prev)
+            } else {
+                (prev, next)
+            };
         }
         index = end;
     }
@@ -2196,18 +2320,268 @@ fn sort_calls(calls: &mut [Call]) {
     });
 }
 
-pub fn compress_clusters(calls: &mut [Call]) {
+/// Renumber clusters densely from 0.
+///
+/// FIX(orientation): ids used to follow first appearance in coordinate order,
+/// so reverse-complementing one contig of the first sample renumbered
+/// families, and every later tie broken "by the smaller id" (and the order
+/// names are handed out in) changed with it. Families are now ordered by
+/// where they first occur by sample and contig, then by the smallest member
+/// protein by content, then by size; position along a contig is only the
+/// last resort for families that are otherwise indistinguishable.
+pub fn compress_clusters(calls: &mut [Call], pools: &Pools) {
     sort_calls(calls);
-    let mut map = HashMap::default();
-    let mut next = 0u32;
-    for call in calls.iter_mut() {
-        let id = *map.entry(call.cluster).or_insert_with(|| {
-            let id = next;
-            next += 1;
-            id
-        });
-        call.cluster = id;
+    let rank = protein_ranks(pools);
+    // cluster -> (sample, contig, protein rank, -calls, first index)
+    let mut keys: HashMap<u32, (u32, u32, u32, i64, usize)> = HashMap::default();
+    for (index, call) in calls.iter().enumerate() {
+        let protein = rank[call.protein as usize];
+        let entry = keys
+            .entry(call.cluster)
+            .or_insert((call.sample, call.contig, protein, 0, index));
+        if (call.sample, call.contig) == (entry.0, entry.1) && protein < entry.2 {
+            entry.2 = protein;
+        }
+        entry.3 -= 1;
     }
+    let mut ordered: Vec<(u32, (u32, u32, u32, i64, usize))> = keys.into_iter().collect();
+    ordered.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    let map: HashMap<u32, u32> = ordered
+        .iter()
+        .enumerate()
+        .map(|(id, &(cluster, _))| (cluster, id as u32))
+        .collect();
+    for call in calls.iter_mut() {
+        call.cluster = map[&call.cluster];
+    }
+}
+
+/// Rank of every pooled protein by content (length, then bytes), so a
+/// tie-break can use the sequence rather than the order it was first seen.
+fn protein_ranks(pools: &Pools) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..pools.protein.len() as u32).collect();
+    order.par_sort_unstable_by(|&a, &b| {
+        let (pa, pb) = (&pools.protein[a as usize], &pools.protein[b as usize]);
+        pa.len().cmp(&pb.len()).then_with(|| pa.cmp(pb)).then(a.cmp(&b))
+    });
+    let mut rank = vec![0u32; order.len()];
+    for (position, &protein) in order.iter().enumerate() {
+        rank[protein as usize] = position as u32;
+    }
+    rank
+}
+
+/// Protein identity of two alleles over the shorter one: a banded global
+/// alignment when their lengths are comparable, the short-in-long fit when
+/// one is a fragment of the other. `0` when no alignment is found.
+pub fn allele_identity(a: &[u8], b: &[u8]) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if short.is_empty() {
+        return 0.0;
+    }
+    if (long.len() - short.len()) * 5 <= long.len() {
+        if let Some(identity) = global_identity(a, b) {
+            return identity;
+        }
+    }
+    fit_short_in_long(short, long)
+        .map(|fit| fit.identity)
+        .unwrap_or(0.0)
+}
+
+/// What `split_divergent_members` did.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct DivergentSplit {
+    /// Families that lost at least one divergent group.
+    pub families: usize,
+    /// New families created from divergent groups.
+    pub new_families: usize,
+    /// Physical loci moved into the new families.
+    pub loci: usize,
+    /// Divergent groups left in place because they sit in the family's own
+    /// neighbourhood and never share a genome with it (divergent alleles of
+    /// one locus, not paralogs).
+    pub kept_alleles: usize,
+    /// Divergent groups left in place because they have no neighbour at all.
+    pub kept_unplaced: usize,
+}
+
+/// FIX(paralogs): split distant paralogs that homology and adoption put in
+/// one family even when no genome carries two copies.
+///
+/// `split_paralogs` only runs for families with a multi-copy genome, so two
+/// paralogs that never co-occur stayed one gene however different they are.
+/// Here every locus whose longest protein is below `threshold` identity to the
+/// family representative (the longest member protein, as everywhere else) is
+/// a divergent candidate. Candidates are grouped greedily, longest first, at
+/// the same threshold against each group's own representative (the CD-HIT
+/// rule used by homology). A group becomes its own family when synteny agrees
+/// it is another locus:
+///   * it shares a genome with the rest of the family (two copies), or
+///   * none of its gene neighbours is a neighbour of the rest of the family.
+/// A divergent group in the family's own neighbourhood that never co-occurs
+/// with it is an allele of the same locus and stays. A group with no
+/// neighbour at all has no synteny evidence and stays.
+///
+/// `threshold` defaults to the family identity (0.70): homology already
+/// promises that much identity to the representative, so a member below it
+/// was only ever joined through adoption or refinding.
+pub fn split_divergent_members(calls: &mut [Call], pools: &Pools, threshold: f64) -> DivergentSplit {
+    if threshold <= 0.0 || calls.is_empty() {
+        return DivergentSplit::default();
+    }
+    sort_calls(calls);
+    let loci = physical_loci(calls, pools);
+    let contexts = locus_contexts(calls, &loci, |call| call.cluster);
+    let reps = representative_ids(calls, pools);
+    let mut by_cluster: HashMap<u32, Vec<usize>> = HashMap::default();
+    for (index, locus) in loci.iter().enumerate() {
+        by_cluster.entry(calls[locus.first].cluster).or_default().push(index);
+    }
+    // The longest protein of each locus (a broken locus is judged by its
+    // longest piece), smaller sequence on a length tie.
+    let locus_proteins: Vec<u32> = loci
+        .iter()
+        .map(|locus| {
+            (locus.first..=locus.last)
+                .map(|index| calls[index].protein)
+                .max_by(|&a, &b| {
+                    let (pa, pb) = (&pools.protein[a as usize], &pools.protein[b as usize]);
+                    pa.len().cmp(&pb.len()).then_with(|| pb.cmp(pa))
+                })
+                .expect("a locus has at least one call")
+        })
+        .collect();
+    let mut clusters: Vec<u32> = by_cluster.keys().copied().collect();
+    clusters.sort_unstable();
+    struct Plan {
+        groups: Vec<Vec<usize>>,
+        kept_alleles: usize,
+        kept_unplaced: usize,
+    }
+    let plans: Vec<Plan> = clusters
+        .par_iter()
+        .map(|cluster| {
+            let members = &by_cluster[cluster];
+            let rep = &pools.protein[reps[cluster] as usize];
+            let mut identity_of: HashMap<u32, f64> = HashMap::default();
+            let mut divergent: Vec<usize> = Vec::new();
+            for &index in members {
+                let protein = locus_proteins[index];
+                let identity = *identity_of
+                    .entry(protein)
+                    .or_insert_with(|| allele_identity(&pools.protein[protein as usize], rep));
+                if identity < threshold {
+                    divergent.push(index);
+                }
+            }
+            let mut plan = Plan {
+                groups: Vec::new(),
+                kept_alleles: 0,
+                kept_unplaced: 0,
+            };
+            if divergent.is_empty() {
+                return plan;
+            }
+            // Greedy longest-first grouping of the divergent proteins.
+            let mut proteins: Vec<u32> = divergent.iter().map(|&index| locus_proteins[index]).collect();
+            proteins.sort_unstable_by(|&a, &b| {
+                let (pa, pb) = (&pools.protein[a as usize], &pools.protein[b as usize]);
+                pb.len().cmp(&pa.len()).then_with(|| pa.cmp(pb))
+            });
+            proteins.dedup();
+            let mut group_reps: Vec<u32> = Vec::new();
+            let mut group_of: HashMap<u32, usize> = HashMap::default();
+            for &protein in &proteins {
+                let sequence = &pools.protein[protein as usize];
+                let joined = group_reps.iter().position(|&head| {
+                    allele_identity(sequence, &pools.protein[head as usize]) >= threshold
+                });
+                let group = joined.unwrap_or_else(|| {
+                    group_reps.push(protein);
+                    group_reps.len() - 1
+                });
+                group_of.insert(protein, group);
+            }
+            let mut grouped: Vec<Vec<usize>> = vec![Vec::new(); group_reps.len()];
+            for &index in &divergent {
+                grouped[group_of[&locus_proteins[index]]].push(index);
+            }
+            let moved: HashSet<usize> = divergent.iter().copied().collect();
+            let rest: Vec<usize> = members.iter().copied().filter(|index| !moved.contains(index)).collect();
+            let flanks_of = |indexes: &[usize]| -> HashSet<u32> {
+                indexes
+                    .iter()
+                    .flat_map(|&index| [contexts[index].0, contexts[index].1])
+                    .flatten()
+                    .collect()
+            };
+            let samples_of = |indexes: &[usize]| -> HashSet<u32> {
+                indexes.iter().map(|&index| calls[loci[index].first].sample).collect()
+            };
+            let rest_flanks = flanks_of(&rest);
+            let rest_samples = samples_of(&rest);
+            for group in grouped {
+                let flanks = flanks_of(&group);
+                let shares_genome = !samples_of(&group).is_disjoint(&rest_samples);
+                let other_neighbourhood = !flanks.is_empty() && flanks.is_disjoint(&rest_flanks);
+                if rest.is_empty() {
+                    // Every locus is divergent from the representative's own
+                    // protein only if the representative is itself one of
+                    // them; nothing to split from.
+                    continue;
+                }
+                if shares_genome || other_neighbourhood {
+                    plan.groups.push(group);
+                } else if flanks.is_empty() {
+                    plan.kept_unplaced += 1;
+                } else {
+                    plan.kept_alleles += 1;
+                }
+            }
+            plan
+        })
+        .collect();
+    let mut next_id = calls.iter().map(|call| call.cluster).max().unwrap_or(0) + 1;
+    let mut result = DivergentSplit::default();
+    for (cluster, plan) in clusters.iter().zip(plans) {
+        result.kept_alleles += plan.kept_alleles;
+        result.kept_unplaced += plan.kept_unplaced;
+        if plan.groups.is_empty() {
+            continue;
+        }
+        result.families += 1;
+        for group in plan.groups {
+            let id = next_id;
+            next_id += 1;
+            result.new_families += 1;
+            result.loci += group.len();
+            let mut samples = HashSet::default();
+            for &index in &group {
+                samples.insert(calls[loci[index].first].sample);
+                for call in loci[index].first..=loci[index].last {
+                    calls[call].cluster = id;
+                }
+            }
+            if log::enabled() {
+                let protein = locus_proteins[group[0]];
+                let identity = allele_identity(
+                    &pools.protein[protein as usize],
+                    &pools.protein[reps[cluster] as usize],
+                );
+                log::record(&format!(
+                    "divergent_split\tfamily\t{cluster}\tsymbol\t{}\tloci\t{}\tsamples\t{}\tidentity_to_representative\t{identity:.3}",
+                    log_field(&calls[loci[group[0]].first].symbol),
+                    group.len(),
+                    samples.len(),
+                ));
+            }
+        }
+    }
+    result
 }
 
 /// Drop families that are not usable genes.
@@ -2946,11 +3320,15 @@ mod tests {
         );
         let (pools, mut calls, lengths) =
             allele_fixture(&full[30..], &full, AlleleSide::MissingPrefix, false);
+        // FIX(orientation): edges count the bases outside the call on both
+        // sides, so "91 bases is not near the edge" is `start = 92` here, the
+        // mirror of `lengths += 13` above (it used to be `start = 91`, i.e.
+        // 90 bases, which only the left side treated as interior).
         calls
             .iter_mut()
             .find(|call| call.cluster == 0)
             .unwrap()
-            .start = 91;
+            .start = 92;
         assert!(allele_target(&mut calls, &pools, &lengths).target.is_none());
         let (mut pools, mut calls, lengths) =
             allele_fixture(&full[30..], &full, AlleleSide::MissingPrefix, false);
@@ -3721,7 +4099,7 @@ mod tests {
         assert_eq!(core_contexts(&stable).len(), 1);
         for _ in 0..4 {
             assert_eq!(split_paralogs(&mut calls, &pools), 0);
-            compress_clusters(&mut calls);
+            compress_clusters(&mut calls, &pools);
         }
         let groups: HashSet<_> = calls
             .iter()
@@ -3796,7 +4174,7 @@ mod tests {
             "anchors are not ortholog assignments"
         );
         assert!(calls.iter().all(|call| call.context == 10));
-        compress_clusters(&mut calls);
+        compress_clusters(&mut calls, &pools);
         assert!(calls.iter().all(|call| call.context == 10));
     }
 
@@ -4028,7 +4406,7 @@ mod tests {
         freeze_contexts(&mut calls, &pools);
         assert_eq!(split_paralogs(&mut calls, &pools), 1);
         assert!(merge(&mut calls, &pools));
-        compress_clusters(&mut calls);
+        compress_clusters(&mut calls, &pools);
         let at_a = calls
             .iter()
             .find(|call| call.sample == 1 && call.start == 101)
@@ -4169,5 +4547,226 @@ mod tests {
         assert_eq!(find(&mut parent, 0), 200);
         assert_eq!(parent[&0], 200);
         assert_eq!(find(&mut parent, 1), 200);
+    }
+
+    // ---- FIX tests: orientation, fusion pieces, divergent members ----
+
+    fn reversed(calls: &[Call], length: u32) -> Vec<Call> {
+        calls
+            .iter()
+            .map(|call| {
+                let mut flipped = call.clone();
+                flipped.start = length - call.end + 1;
+                flipped.end = length - call.start + 1;
+                flipped.strand = -call.strand;
+                flipped
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fix_contexts_are_the_same_on_a_reversed_contig() {
+        let mut pools = Pools::default();
+        let mut calls = vec![
+            call(0, 10, 1, &intact_protein(60, 1), &mut pools),
+            call(0, 20, 400, &intact_protein(70, 2), &mut pools),
+            call(0, 11, 900, &intact_protein(80, 3), &mut pools),
+        ];
+        calls[1].strand = -1;
+        let length = 2000;
+        let mut flipped = reversed(&calls, length);
+        sort_calls(&mut calls);
+        sort_calls(&mut flipped);
+        let context_of = |calls: &[Call], pools: &Pools| {
+            let loci = physical_loci(calls, pools);
+            let contexts = locus_contexts(calls, &loci, |call| call.cluster);
+            loci.iter()
+                .zip(contexts)
+                .map(|(locus, context)| (calls[locus.first].cluster, context))
+                .collect::<HashMap<u32, (Option<u32>, Option<u32>)>>()
+        };
+        let forward = context_of(&calls, &pools);
+        let backward = context_of(&flipped, &pools);
+        assert_eq!(forward, backward);
+        // The minus-strand middle gene reads 11 upstream and 10 downstream.
+        assert_eq!(forward[&20], (Some(11), Some(10)));
+        assert_eq!(forward[&10], (None, Some(20)));
+    }
+
+    #[test]
+    fn fix_refind_flank_pairs_are_unordered() {
+        assert_eq!(flank_key(3, 7), flank_key(7, 3));
+        assert_eq!(flank_key(5, 5), (5, 5));
+    }
+
+    #[test]
+    fn fix_cluster_numbering_ignores_contig_orientation() {
+        let mut pools = Pools::default();
+        let x = intact_protein(60, 11);
+        let y = intact_protein(60, 12);
+        let mut forward = vec![
+            call(0, 5, 1, &x, &mut pools),
+            call(0, 9, 500, &y, &mut pools),
+            call(1, 9, 1, &y, &mut pools),
+        ];
+        let mut backward = forward.clone();
+        let first_sample = reversed(&backward[..2], 1000);
+        backward.splice(0..2, first_sample);
+        compress_clusters(&mut forward, &pools);
+        compress_clusters(&mut backward, &pools);
+        let id_of = |calls: &[Call], protein: &[u8]| {
+            calls
+                .iter()
+                .find(|call| pools.protein[call.protein as usize] == protein)
+                .unwrap()
+                .cluster
+        };
+        assert_eq!(id_of(&forward, &x), id_of(&backward, &x));
+        assert_eq!(id_of(&forward, &y), id_of(&backward, &y));
+    }
+
+    #[test]
+    fn fix_fusion_pieces_are_genome_bases_on_both_strands() {
+        let mut coding = crate::genetic_code::back_translate(&intact_protein(60, 77));
+        // A real TGA stop, so a rewritten TAA would be caught.
+        coding.replace_range(coding.len() - 3.., "TGA");
+        let filler = "GATTACA".repeat(20);
+        let cut = 25usize;
+        for strand in [1i8, -1] {
+            let placed = if strand > 0 {
+                coding.clone()
+            } else {
+                crate::genetic_code::reverse_complement(&coding)
+            };
+            let contig = format!("{filler}{placed}{filler}");
+            let contigs = vec![vec![PackedSeq::new(contig.clone())]];
+            let mut pools = Pools::default();
+            let mut fused = call(0, 0, filler.len() as u32 + 1, &intact_protein(60, 77), &mut pools);
+            fused.strand = strand;
+            fused.dna = pools.intern_dna(coding.clone());
+            let pieces = fusion_pieces(&fused, &coding, cut, &contigs).expect("exact CDS splits");
+            assert_eq!(pieces.prefix, coding[..cut * 3]);
+            assert_eq!(pieces.suffix, coding[cut * 3..]);
+            assert!(pieces.suffix.ends_with("TGA"), "the real stop is kept");
+            assert_eq!(pieces.prefix.len() + pieces.suffix.len(), coding.len(), "nothing is invented");
+            let genome = |(start, end): (u32, u32)| {
+                let bases = &contig[start as usize - 1..end as usize];
+                if strand > 0 {
+                    bases.to_string()
+                } else {
+                    crate::genetic_code::reverse_complement(bases)
+                }
+            };
+            assert_eq!(genome(pieces.prefix_span), pieces.prefix);
+            assert_eq!(genome(pieces.suffix_span), pieces.suffix);
+            let (first, second) = if strand > 0 {
+                (pieces.prefix_span, pieces.suffix_span)
+            } else {
+                (pieces.suffix_span, pieces.prefix_span)
+            };
+            assert_eq!(first.0, fused.start);
+            assert_eq!(first.1 + 1, second.0, "pieces abut with no overlap");
+            assert_eq!(second.1, fused.end);
+            // Bases that are not the genome's, or a span that is not the CDS,
+            // are left whole.
+            let mut wrong = coding.clone();
+            wrong.replace_range(0..3, "ATA");
+            assert!(fusion_pieces(&fused, &wrong, cut, &contigs).is_none());
+            let mut longer = fused.clone();
+            longer.end += 3;
+            assert!(fusion_pieces(&longer, &coding, cut, &contigs).is_none());
+            assert!(fusion_pieces(&fused, &coding, 0, &contigs).is_none());
+        }
+    }
+
+    #[test]
+    fn fix_allele_identity_is_one_for_equal_and_low_for_unrelated() {
+        let a = intact_protein(200, 5);
+        assert_eq!(allele_identity(&a, &a), 1.0);
+        assert!(allele_identity(&a, &intact_protein(195, 6)) < 0.3);
+        let mut close = a.clone();
+        for index in (10..200).step_by(10) {
+            close[index] = if close[index] == b'W' { b'Y' } else { b'W' };
+        }
+        let identity = allele_identity(&a, &close);
+        assert!(identity > 0.85 && identity < 1.0, "{identity}");
+        // A fragment is scored over its own length.
+        assert!(allele_identity(&a[50..120], &a) > 0.99);
+    }
+
+    /// Family 0: P between flanks 10 and 11 in samples 0-3, a divergent Q
+    /// between other flanks (12, 13) in samples 4-5, and a divergent Q2 in the
+    /// family's own neighbourhood in sample 6.
+    fn divergent_fixture() -> (Pools, Vec<Call>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut pools = Pools::default();
+        let p = intact_protein(200, 21);
+        let q = intact_protein(190, 22);
+        let q2 = intact_protein(195, 23);
+        let mut calls = Vec::new();
+        let mut triplet = |sample: u32, left: u32, middle: &[u8], right: u32, calls: &mut Vec<Call>| {
+            calls.push(call(sample, left, 1, &intact_protein(80, u64::from(left)), &mut pools));
+            calls.push(call(sample, 0, 400, middle, &mut pools));
+            calls.push(call(sample, right, 1200, &intact_protein(90, u64::from(right)), &mut pools));
+        };
+        for sample in 0..4 {
+            triplet(sample, 10, &p, 11, &mut calls);
+        }
+        for sample in 4..6 {
+            triplet(sample, 12, &q, 13, &mut calls);
+        }
+        triplet(6, 10, &q2, 11, &mut calls);
+        (pools, calls, p, q, q2)
+    }
+
+    #[test]
+    fn fix_divergent_members_in_another_neighbourhood_are_split() {
+        let (pools, mut calls, p, q, q2) = divergent_fixture();
+        let result = split_divergent_members(&mut calls, &pools, 0.70);
+        assert_eq!(result.new_families, 1);
+        assert_eq!(result.families, 1);
+        assert_eq!(result.loci, 2);
+        assert_eq!(result.kept_alleles, 1, "Q2 sits between the family's own flanks");
+        let cluster_of = |protein: &[u8]| -> HashSet<u32> {
+            calls
+                .iter()
+                .filter(|call| pools.protein[call.protein as usize] == protein)
+                .map(|call| call.cluster)
+                .collect()
+        };
+        let (p_ids, q_ids, q2_ids) = (cluster_of(&p), cluster_of(&q), cluster_of(&q2));
+        assert_eq!(q_ids.len(), 1, "both Q copies form one new family");
+        assert!(p_ids.is_disjoint(&q_ids));
+        assert_eq!(p_ids, q2_ids);
+        // Disabled, nothing moves.
+        let (pools, mut calls, ..) = divergent_fixture();
+        let before: Vec<u32> = calls.iter().map(|call| call.cluster).collect();
+        assert_eq!(split_divergent_members(&mut calls, &pools, 0.0), DivergentSplit::default());
+        assert_eq!(before, calls.iter().map(|call| call.cluster).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fix_divergent_copy_sharing_a_genome_is_split_even_beside_the_same_flanks() {
+        let (mut pools, mut calls, _, _, q2) = divergent_fixture();
+        // A second, divergent copy in sample 0, far down the same contig.
+        calls.push(call(0, 10, 5000, &intact_protein(80, 10), &mut pools));
+        calls.push(call(0, 0, 5400, &q2, &mut pools));
+        calls.push(call(0, 11, 6200, &intact_protein(90, 11), &mut pools));
+        let result = split_divergent_members(&mut calls, &pools, 0.70);
+        // Q (other neighbourhood) and Q2 (now co-occurring with P) both leave.
+        assert_eq!(result.new_families, 2);
+        assert_eq!(result.kept_alleles, 0);
+    }
+
+    #[test]
+    fn fix_divergent_members_without_neighbours_stay() {
+        let mut pools = Pools::default();
+        let mut calls = vec![
+            call(0, 0, 400, &intact_protein(200, 31), &mut pools),
+            call(1, 0, 400, &intact_protein(200, 31), &mut pools),
+            call(2, 0, 400, &intact_protein(190, 32), &mut pools),
+        ];
+        let result = split_divergent_members(&mut calls, &pools, 0.70);
+        assert_eq!(result.new_families, 0);
+        assert_eq!(result.kept_unplaced, 1);
     }
 }

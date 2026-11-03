@@ -20,11 +20,13 @@ use crate::packed::PackedSeq;
 use crate::reference::{choose_reference, join_fragments, Allele};
 use crate::synteny::{
     cluster_facts, compress_clusters, families_bounded_by_neighbors, freeze_contexts,
-    length_evidence, membership_loci, merge_fragments, refind, screen_unsupported_families,
-    split_fusions, split_paralogs, ClusterFacts, ALLELE_EDGE_BP, UNCONFIRMED_SHORT,
+    allele_identity, length_evidence, membership_loci, merge_fragments, refind,
+    screen_unsupported_families, split_divergent_members, split_fusions, split_paralogs,
+    ClusterFacts, ALLELE_EDGE_BP, UNCONFIRMED_SHORT,
 };
 use crate::types::{
-    Gene, GeneMember, MembershipAudit, Pangenome, Params, ParsedGene, ParsedSample, Quality,
+    Gene, GeneMember, InputFallbacks, MembershipAudit, Pangenome, Params, ParsedGene,
+    ParsedSample, Quality,
 };
 
 pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenome> {
@@ -44,7 +46,7 @@ pub fn build(mut samples: Vec<ParsedSample>, params: &Params) -> Result<Pangenom
     let prepared: Vec<PreparedSample> = samples.into_par_iter().map(prepare_sample).collect();
     let mut interned = Interned::with_capacity(prepared.len());
     for sample in prepared {
-        interned.add(sample, params);
+        interned.add(sample, params)?;
     }
     build_interned(interned, params)
 }
@@ -79,7 +81,7 @@ pub fn build_from_paths(paths: &[std::path::PathBuf], params: &Params) -> Result
             .map(|&index| parse_gff_file(&paths[index]).map(prepare_sample))
             .collect();
         for sample in parsed {
-            interned.add(sample?, params);
+            interned.add(sample?, params)?;
         }
     }
     log::stage("parse_gff+intern(streamed)");
@@ -90,6 +92,7 @@ pub fn build_from_paths(paths: &[std::path::PathBuf], params: &Params) -> Result
 /// computed, all of which is per-sample work that can run in parallel.
 struct PreparedSample {
     name: String,
+    fallbacks: InputFallbacks,
     contig_names: Vec<String>,
     contigs: Vec<PackedSeq>,
     genes: Vec<(ParsedGene, u64, u64)>,
@@ -113,6 +116,7 @@ fn prepare_sample(sample: ParsedSample) -> PreparedSample {
         .collect();
     PreparedSample {
         name: sample.name,
+        fallbacks: sample.fallbacks,
         contig_names,
         contigs,
         genes,
@@ -128,6 +132,7 @@ struct Interned {
     contigs: Vec<Vec<PackedSeq>>,
     logged_counts: Vec<(usize, usize)>,
     labels: HashMap<String, Label>,
+    fallbacks: Vec<InputFallbacks>,
 }
 
 /// One shared `Label` per distinct annotation string (same text).
@@ -151,11 +156,14 @@ impl Interned {
             contigs: Vec::with_capacity(samples),
             logged_counts: Vec::with_capacity(samples),
             labels: HashMap::default(),
+            fallbacks: Vec::with_capacity(samples),
         }
     }
 
     /// The original per-sample interning loop, unchanged in order.
-    fn add(&mut self, sample: PreparedSample, params: &Params) {
+    fn add(&mut self, sample: PreparedSample, params: &Params) -> Result<()> {
+        check_strict_input(&sample.name, &sample.fallbacks, params)?;
+        self.fallbacks.push(sample.fallbacks);
         let sample_index = self.sample_names.len();
         self.logged_counts.push((sample.contigs.len(), sample.genes.len()));
         self.sample_names.push(sample.name);
@@ -190,6 +198,61 @@ impl Interned {
                 product: intern_label(&mut self.labels, gene.product),
             });
         }
+        Ok(())
+    }
+}
+
+/// `--strict-input`: any lenient-reader repair is an error, as in Panaroo.
+fn check_strict_input(name: &str, fallbacks: &InputFallbacks, params: &Params) -> Result<()> {
+    if !params.strict_input || fallbacks.total() == 0 {
+        return Ok(());
+    }
+    let kinds: Vec<String> = fallbacks
+        .counts()
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(kind, count)| format!("{kind}={count}"))
+        .collect();
+    Err(Error::new(format!(
+        "{name}: --strict-input rejected the input ({}); first: {}",
+        kinds.join(", "),
+        fallbacks.first.as_deref().unwrap_or("?")
+    )))
+}
+
+/// Per-sample and total fallback counts, to rustroo.log and stderr.
+fn report_input_fallbacks(sample_names: &[String], fallbacks: &[InputFallbacks]) {
+    let mut total = InputFallbacks::default();
+    for (name, sample) in sample_names.iter().zip(fallbacks) {
+        total.add(sample);
+        if log::enabled() && sample.total() > 0 {
+            for (kind, count) in sample.counts() {
+                if count > 0 {
+                    log::record(&format!("input_fallback\t{name}\t{kind}\t{count}"));
+                }
+            }
+        }
+    }
+    if log::enabled() {
+        for (kind, count) in total.counts() {
+            log::record(&format!("input_fallbacks_total\t{kind}\t{count}"));
+        }
+    }
+    if total.total() == 0 {
+        progress!("rustroo: input fallbacks: none (every CDS and contig was read as written)");
+    } else {
+        let kinds: Vec<String> = total
+            .counts()
+            .iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect();
+        let samples = fallbacks.iter().filter(|sample| sample.total() > 0).count();
+        progress!(
+            "rustroo: input fallbacks in {samples} samples: {}; first: {} (see input_fallback rows in rustroo.log; --strict-input makes these errors)",
+            kinds.join(", "),
+            total.first.as_deref().unwrap_or("?")
+        );
     }
 }
 
@@ -203,6 +266,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
         contigs,
         logged_counts,
         labels: _,
+        fallbacks,
     } = interned;
     log::stage("intern_calls");
     if calls.is_empty() {
@@ -216,6 +280,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
             ));
         }
     }
+    report_input_fallbacks(&sample_names, &fallbacks);
     progress!(
         "rustroo: {} samples, {} coding sequences, {} unique proteins",
         sample_names.len(),
@@ -239,7 +304,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
     for call in calls.iter_mut() {
         call.cluster = families[call.protein as usize];
     }
-    compress_clusters(&mut calls);
+    compress_clusters(&mut calls, &pools);
     let family_count = calls
         .iter()
         .map(|call| call.cluster)
@@ -249,10 +314,10 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
 
     progress!("rustroo: splitting fusions");
     log::stage("compress_after_homology");
-    let fusions = split_fusions(&mut calls, &mut pools);
+    let fusions = split_fusions(&mut calls, &mut pools, &contigs);
     log::stage("split_fusions");
     progress!("rustroo: split {fusions} fusion annotations");
-    compress_clusters(&mut calls);
+    compress_clusters(&mut calls, &pools);
     progress!(
         "rustroo: {} groups after fusion repair",
         dense_family_count(&calls)
@@ -270,7 +335,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
         log::stage(&format!("split_paralogs_r{round}"));
         let merged = merge_fragments(&mut calls, &pools, &contig_lengths);
         log::stage(&format!("merge_fragments_r{round}"));
-        compress_clusters(&mut calls);
+        compress_clusters(&mut calls, &pools);
         let after = dense_family_count(&calls);
         progress!(
             "rustroo: synteny round {round}: {before} -> {} after {split} paralog splits -> {after} after merges",
@@ -288,6 +353,21 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
             );
         }
     }
+    // FIX(paralogs): distant paralogs that no genome carries twice.
+    if params.paralog_identity > 0.0 {
+        let divergent = split_divergent_members(&mut calls, &pools, params.paralog_identity);
+        log::stage("split_divergent_members");
+        compress_clusters(&mut calls, &pools);
+        progress!(
+            "rustroo: divergent-member split (identity < {}): {} new families from {} families ({} loci); kept {} divergent allele groups in their family's neighbourhood and {} without neighbours",
+            params.paralog_identity,
+            divergent.new_families,
+            divergent.families,
+            divergent.loci,
+            divergent.kept_alleles,
+            divergent.kept_unplaced
+        );
+    }
     if params.refind {
         progress!("rustroo: searching intergenic gaps");
         let found = refind(&mut calls, &mut pools, &contigs);
@@ -295,7 +375,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
         progress!("rustroo: refound {found} genes in intergenic gaps");
         if found > 0 {
             let split = split_paralogs(&mut calls, &pools);
-            compress_clusters(&mut calls);
+            compress_clusters(&mut calls, &pools);
             log::stage("split_paralogs_after_refind");
             progress!(
                 "rustroo: {split} paralog splits after refinding, {} groups",
@@ -317,7 +397,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
             "no supported gene family remained after removing invalid and contig-end families",
         ));
     }
-    compress_clusters(&mut calls);
+    compress_clusters(&mut calls, &pools);
 
     let bounded = families_bounded_by_neighbors(&mut calls, &pools);
     log::stage("families_bounded");
@@ -388,6 +468,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
             presence: partial.presence,
             lengths: partial.lengths,
             support: SUPPORT_ACCESSORY,
+            min_allele_identity: partial.min_allele_identity,
         });
     }
     genes.sort_by(|a, b| {
@@ -1003,6 +1084,7 @@ struct PartialGene {
     modal_end_bp: u32,
     modal_end_samples: u32,
     extension_samples: u32,
+    min_allele_identity: f64,
 }
 
 fn compute_partial_gene(
@@ -1055,7 +1137,18 @@ fn compute_partial_gene(
         .filter(|allele| is_intact(&allele.dna))
         .count() as u32;
     let samples_present = presence.iter().filter(|present| **present).count() as u32;
+    // FIX(paralogs): how far the most divergent member protein is from the
+    // reference, so a family that still mixes distant sequences is visible.
+    let reference_protein = translate(&choice.dna);
+    let mut proteins: Vec<u32> = indexes.iter().map(|&index| calls[index].protein).collect();
+    proteins.sort_unstable();
+    proteins.dedup();
+    let min_allele_identity = proteins
+        .iter()
+        .map(|&protein| allele_identity(&pools.protein[protein as usize], &reference_protein))
+        .fold(1.0f64, f64::min);
     Some(PartialGene {
+        min_allele_identity,
         symbol: preferred_symbol(indexes, calls),
         product: preferred_product(indexes, calls),
         reference_dna: choice.dna.clone(),
@@ -1142,7 +1235,11 @@ fn contig_clipped(call: &Call, contig_lengths: &[Vec<usize>]) -> bool {
     else {
         return true;
     };
-    call.start as usize <= ALLELE_EDGE_BP
+    // FIX(orientation): both sides count the bases outside the call
+    // (`start - 1` before it, `length - end` after it). The old `start <= 90`
+    // test was one base stricter on the left than on the right, so a copy
+    // exactly 90 bp from an end was clipped in one orientation only.
+    (call.start as usize).saturating_sub(1) <= ALLELE_EDGE_BP
         || length.saturating_sub(call.end as usize) <= ALLELE_EDGE_BP
 }
 
@@ -1213,7 +1310,8 @@ fn cluster_reps(
         let protein = indexes
             .iter()
             .map(|index| &pools.protein[calls[*index].protein as usize])
-            .max_by_key(|protein| protein.len())
+            // FIX(orientation): longest, then smallest sequence on a length tie.
+            .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| b.cmp(a)))
             .cloned()
             .unwrap_or_default();
         reps.insert(cluster, protein);
@@ -1384,6 +1482,7 @@ mod tests {
                 sequence: "N".repeat(end as usize + 10),
             }],
             genes,
+            fallbacks: Default::default(),
         }
     }
 
@@ -1409,6 +1508,7 @@ mod tests {
             modal_end_samples: 1,
             extension_samples: 0,
             support: SUPPORT_ACCESSORY,
+            min_allele_identity: 1.0,
         }
     }
 
@@ -2454,6 +2554,7 @@ mod tests {
                 })
                 .collect(),
             genes: vec![first, second],
+            fallbacks: Default::default(),
         };
         let mut params = params();
         params.audit_members = true;
@@ -2657,19 +2758,19 @@ mod tests {
         fusion.extend_from_slice(&gene_b[1..]);
         let mut samples = Vec::new();
         for index in 0..3 {
-            samples.push(sample(
+            samples.push(painted(
                 &format!("a{index}"),
                 vec![
                     coding(&diverse(30, 5), 0, 1, "flk"),
                     coding(&gene_a, 0, 400, "aaa"),
                 ],
             ));
-            samples.push(sample(
+            samples.push(painted(
                 &format!("b{index}"),
                 vec![coding(&gene_b, 0, 400, "bbb")],
             ));
         }
-        samples.push(sample(
+        samples.push(painted(
             "fused",
             vec![
                 coding(&diverse(30, 5), 0, 1, "flk"),
@@ -2707,6 +2808,29 @@ mod tests {
             .iter()
             .all(|member| member.annotation_id == "cds_0_400"));
         assert_ne!(fusion_members[0].gene, fusion_members[1].gene);
+        // FIX(fusion): the pieces are the fused CDS's own bases, tile its
+        // span exactly, and no piece ends in a stop the genome does not have.
+        let audit = built.membership_audit.as_ref().unwrap();
+        let fused_dna = back_translate(&fusion);
+        let mut pieces: Vec<_> = fusion_members.clone();
+        pieces.sort_by_key(|member| member.start);
+        assert_eq!(pieces[0].start, 400);
+        assert_eq!(pieces[0].end + 1, pieces[1].start);
+        assert_eq!(pieces[1].end, 400 + fused_dna.len() as u32 - 1);
+        let joined: String = pieces
+            .iter()
+            .map(|member| audit.sequences[member.dna as usize].as_str())
+            .collect();
+        assert_eq!(joined, fused_dna);
+        let prefix = &audit.sequences[pieces[0].dna as usize];
+        assert_eq!(prefix.len(), (pieces[0].end - pieces[0].start + 1) as usize);
+        assert!(!crate::genetic_code::is_stop(&prefix.as_bytes()[prefix.len() - 3..]));
+        let fused_index = built.sample_names.iter().position(|name| name == "fused").unwrap();
+        assert_eq!(
+            aaa.lengths[fused_index] + bbb.lengths[fused_index],
+            fused_dna.len() as u32,
+            "lengths are the genome bases each piece covers"
+        );
     }
 
     #[test]
@@ -2779,6 +2903,162 @@ mod tests {
         assert_eq!(built.genes[found[0].gene].id, "missed");
     }
 
+    /// A one-contig sample whose bases are the genes' own sequences
+    /// (minus-strand genes painted reverse-complemented), N elsewhere.
+    fn painted(name: &str, genes: Vec<ParsedGene>) -> ParsedSample {
+        let end = genes.iter().map(|gene| gene.end).max().unwrap_or(1) as usize + 100;
+        let mut sequence = vec![b'N'; end];
+        for gene in &genes {
+            let start = (gene.start - 1) as usize;
+            let bases = if gene.strand < 0 {
+                crate::genetic_code::reverse_complement(&gene.dna)
+            } else {
+                gene.dna.clone()
+            };
+            sequence[start..start + bases.len()].copy_from_slice(bases.as_bytes());
+        }
+        sample_with(name, sequence, genes)
+    }
+
+    /// The same sample with every contig reverse-complemented.
+    fn reverse_sample(sample: &ParsedSample) -> ParsedSample {
+        let mut flipped = sample.clone();
+        for contig in &mut flipped.contigs {
+            contig.sequence = crate::genetic_code::reverse_complement(&contig.sequence);
+        }
+        for gene in &mut flipped.genes {
+            let length = sample.contigs[gene.contig].sequence.len() as u32;
+            let (start, end) = (gene.start, gene.end);
+            gene.start = length - end + 1;
+            gene.end = length - start + 1;
+            gene.strand = -gene.strand;
+        }
+        flipped
+    }
+
+    #[test]
+    fn fix_reverse_complemented_genomes_give_the_same_pangenome() {
+        let flank_l = diverse(36, 7);
+        let core = diverse(40, 3);
+        let flank_r = diverse(36, 18);
+        let other = diverse(44, 29);
+        let gene_a = diverse(40, 2);
+        let gene_b = diverse(36, 14);
+        let mut fusion = gene_a.clone();
+        fusion.extend_from_slice(&gene_b[1..]);
+        let mut samples = Vec::new();
+        for index in 0..6 {
+            let left = coding(&flank_l, 0, 1, "flkL");
+            let middle = coding(&core, 0, left.end + 80, "core");
+            let right = coding(&flank_r, 0, middle.end + 80, "flkR");
+            let mut tail = coding(&other, 0, right.end + 120, "other");
+            tail.strand = -1;
+            let a = coding(&gene_a, 0, tail.end + 200, "aaa");
+            let b = coding(&gene_b, 0, a.end + 90, "bbb");
+            let genes = if index == 5 {
+                // `core` is not annotated here; refind has to find it.
+                vec![left.clone(), right, tail, a, b]
+            } else {
+                vec![left, middle, right, tail, a, b]
+            };
+            let mut sample = painted(&format!("s{index}"), genes);
+            if index == 5 {
+                let middle = coding(&core, 0, sample.genes[0].end + 80, "core");
+                let start = (middle.start - 1) as usize;
+                sample.contigs[0]
+                    .sequence
+                    .replace_range(start..start + middle.dna.len(), &middle.dna);
+            }
+            samples.push(sample);
+        }
+        let left = coding(&flank_l, 0, 1, "flkL");
+        let fused = coding(&fusion, 0, left.end + 400, "aaa");
+        samples.push(painted("fused", vec![left, fused]));
+        let mut params = params();
+        params.refind = true;
+        let forward = build(samples.clone(), &params).unwrap();
+        let mixed: Vec<ParsedSample> = samples
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| if index % 2 == 0 { reverse_sample(sample) } else { sample.clone() })
+            .collect();
+        let backward = build(mixed, &params).unwrap();
+        let summary = |pangenome: &Pangenome| {
+            pangenome
+                .genes
+                .iter()
+                .map(|gene| {
+                    (
+                        gene.id.clone(),
+                        gene.reference_dna.clone(),
+                        gene.presence.clone(),
+                        gene.lengths.clone(),
+                        gene.selection,
+                        gene.support,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let core_gene = forward.genes.iter().find(|gene| gene.id == "core").unwrap();
+        assert!(core_gene.presence[5], "the unannotated copy was refound");
+        assert_eq!(summary(&forward), summary(&backward));
+    }
+
+    #[test]
+    fn fix_contig_edges_are_symmetric() {
+        let lengths = vec![vec![1000usize]];
+        let mut call = Call {
+            sample: 0,
+            contig: 0,
+            start: 91,
+            end: 500,
+            strand: 1,
+            dna: 0,
+            protein: 0,
+            cluster: 0,
+            context: 0,
+            locus: None,
+            source: None,
+            refound: false,
+            fusion_piece: false,
+            symbol: Label::default(),
+            product: Label::default(),
+        };
+        // 90 bases before the call is as near the edge as 90 bases after it.
+        assert!(contig_clipped(&call, &lengths));
+        call.start = 92;
+        assert!(!contig_clipped(&call, &lengths));
+        call.end = 910;
+        assert!(contig_clipped(&call, &lengths));
+        call.end = 909;
+        assert!(!contig_clipped(&call, &lengths));
+    }
+
+    #[test]
+    fn fix_strict_input_rejects_what_the_lenient_reader_counts() {
+        let protein = diverse(40, 3);
+        let dna = back_translate(&protein);
+        let text = format!(
+            "##gff-version 3\nctg\tX\tCDS\t1\t{}\t.\t.\t0\tID=one\n##FASTA\n>ctg\n{dna}NNNN\n",
+            dna.len()
+        );
+        let parsed = crate::gff::parse_gff("s", &text, None).unwrap();
+        assert_eq!(parsed.fallbacks.unknown_strand, 1);
+        assert_eq!(parsed.fallbacks.total(), 1);
+        let lenient = params();
+        assert!(build(vec![parsed.clone()], &lenient).is_ok());
+        let mut strict = params();
+        strict.strict_input = true;
+        let error = build(vec![parsed], &strict).unwrap_err().to_string();
+        assert!(error.contains("--strict-input"), "{error}");
+        assert!(error.contains("cds_unknown_strand_read_as_plus=1"), "{error}");
+        assert!(error.contains("line 2"), "{error}");
+        // Clean input passes strict mode.
+        let clean = crate::gff::parse_gff("s", &text.replace("\t.\t.\t0", "\t.\t+\t0"), None).unwrap();
+        assert_eq!(clean.fallbacks.total(), 0);
+        assert!(build(vec![clean], &strict).is_ok());
+    }
+
     fn paint(sequence: &mut [u8], gene: &ParsedGene) {
         let start = (gene.start - 1) as usize;
         let dna = gene.dna.as_bytes();
@@ -2793,6 +3073,7 @@ mod tests {
                 sequence: String::from_utf8(sequence).expect("contig is ascii"),
             }],
             genes,
+            fallbacks: Default::default(),
         }
     }
 }
