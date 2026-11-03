@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Gene-level bacterial pangenome: one intact reference sequence per gene, and which samples carry that gene"
 license = "MIT"
+repository = "https://github.com/Stgeorge2002/rustaroo"
+homepage = "https://github.com/Stgeorge2002/rustaroo"
+readme = "README.md"
 
 [[bin]]
 name = "rustroo"
