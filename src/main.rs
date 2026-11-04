@@ -6,8 +6,8 @@ use clap::{Args, Parser, Subcommand};
 
 use rustroo::log;
 use rustroo::{
-    build_from_paths, is_gff, validate, write_pangenome, Error, Params, Quality, Result,
-    TreeMode, ValidationOptions,
+    build_from_paths, is_gff, near_core_splits, validate, write_pangenome, Error, NearCoreOptions,
+    Params, Quality, Result, TreeMode, ValidationOptions,
 };
 
 #[derive(Parser)]
@@ -83,6 +83,39 @@ struct Cli {
 enum Command {
     /// Independently inspect all member alleles, physical loci and diagnostic gene trees
     Validate(ValidateCli),
+    /// Rank possible near-core family splits without changing clustering
+    NearCoreSplits(NearCoreCli),
+}
+
+#[derive(Args)]
+struct NearCoreCli {
+    /// Completed Rustroo output containing --audit-members exports
+    #[arg(short, long)]
+    input: PathBuf,
+    /// Fresh report directory; existing directories are never overwritten
+    #[arg(short, long)]
+    output_dir: PathBuf,
+    /// Worker threads; 0 uses Rayon's default
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    /// Minimum sample fraction defining a core family
+    #[arg(long, default_value_t = 0.99)]
+    core_fraction: f64,
+    /// Minimum sample-presence union for a candidate pair (at most core-fraction)
+    #[arg(long, default_value_t = 0.95)]
+    near_core_fraction: f64,
+    /// Maximum traceback matrix cells per nonidentical protein pair; 0 removes the limit
+    #[arg(long, default_value_t = 5_000_000)]
+    max_alignment_cells: usize,
+    /// Write an isolated presence-only merge simulation; never modify the input run
+    #[arg(long)]
+    test_merges: bool,
+    /// Maximum strongest, unambiguous pairs in the opt-in simulation
+    #[arg(long, default_value_t = 10)]
+    max_merges: usize,
+    /// Optional comparator core count from the identical cohort and core threshold
+    #[arg(long)]
+    comparison_core_count: Option<usize>,
 }
 
 #[derive(Args)]
@@ -229,23 +262,49 @@ fn cpu_seconds_from_stat(text: &str, ticks_per_second: f64) -> Option<f64> {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(Command::Validate(args)) = cli.command {
-        let summary = validate(
-            &args.input,
-            &args.output_dir,
-            &ValidationOptions {
-                threads: args.threads,
-                tree_mode: args.tree_mode,
-                bootstrap_replicates: args.bootstrap_replicates,
-                max_tree_alleles: args.max_tree_alleles,
-                max_alignment_cells: args.max_alignment_cells,
-                min_tree_sites: args.min_tree_sites,
-            },
-        )?;
-        println!("validated_families\t{}", summary.families);
-        println!("unassessed_alignments\t{}", summary.unassessed_alignments);
-        println!("diagnostic_trees\t{}", summary.trees_written);
-        println!("validation\t{}", args.output_dir.display());
+    if let Some(command) = cli.command {
+        match command {
+            Command::Validate(args) => {
+                let summary = validate(
+                    &args.input,
+                    &args.output_dir,
+                    &ValidationOptions {
+                        threads: args.threads,
+                        tree_mode: args.tree_mode,
+                        bootstrap_replicates: args.bootstrap_replicates,
+                        max_tree_alleles: args.max_tree_alleles,
+                        max_alignment_cells: args.max_alignment_cells,
+                        min_tree_sites: args.min_tree_sites,
+                    },
+                )?;
+                println!("validated_families\t{}", summary.families);
+                println!("unassessed_alignments\t{}", summary.unassessed_alignments);
+                println!("diagnostic_trees\t{}", summary.trees_written);
+                println!("validation\t{}", args.output_dir.display());
+            }
+            Command::NearCoreSplits(args) => {
+                let summary = near_core_splits(
+                    &args.input,
+                    &args.output_dir,
+                    &NearCoreOptions {
+                        threads: args.threads,
+                        core_fraction: args.core_fraction,
+                        near_core_fraction: args.near_core_fraction,
+                        max_alignment_cells: args.max_alignment_cells,
+                        test_merges: args.test_merges,
+                        max_merges: args.max_merges,
+                        comparison_core_count: args.comparison_core_count,
+                    },
+                )?;
+                println!("candidate_pairs\t{}", summary.candidate_pairs);
+                println!("strong_pairs\t{}", summary.strong_pairs);
+                println!("core_before\t{}", summary.core_before);
+                if let Some(after) = summary.core_after {
+                    println!("core_after_simulation\t{after}");
+                }
+                println!("near_core_report\t{}", args.output_dir.display());
+            }
+        }
         return Ok(());
     }
     let output_dir = cli
@@ -451,6 +510,33 @@ mod tests {
             "validation"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn near_core_report_is_standalone_and_merge_testing_is_opt_in() {
+        let cli = Cli::try_parse_from([
+            "rustroo", "near-core-splits", "-i", "run", "-o", "report",
+        ])
+        .unwrap();
+        let Some(Command::NearCoreSplits(args)) = cli.command else {
+            panic!("near-core-splits subcommand");
+        };
+        assert!(!args.test_merges);
+        assert_eq!(args.core_fraction, 0.99);
+        assert_eq!(args.near_core_fraction, 0.95);
+        assert_eq!(args.max_merges, 10);
+        assert_eq!(args.comparison_core_count, None);
+        let cli = Cli::try_parse_from([
+            "rustroo", "near-core-splits", "-i", "run", "-o", "report",
+            "--test-merges", "--max-merges", "2", "--comparison-core-count", "4000",
+        ])
+        .unwrap();
+        let Some(Command::NearCoreSplits(args)) = cli.command else {
+            panic!("near-core-splits subcommand");
+        };
+        assert!(args.test_merges);
+        assert_eq!(args.max_merges, 2);
+        assert_eq!(args.comparison_core_count, Some(4000));
     }
 
     #[test]

@@ -22,6 +22,7 @@ const CONTAIN_IDENTITY: f64 = 0.90;
 const CONTAIN_COVERAGE: f64 = 0.85;
 const MAX_COOCCUR: f64 = 0.25;
 const NEIGHBOR_GAP: i32 = 15_000;
+const NEIGHBOR_OVERLAP: i64 = 30;
 const ABUT_GAP: i32 = 3;
 const TERMINAL_IDENTITY: f64 = 0.98;
 pub(crate) const ALLELE_EDGE_BP: usize = 90;
@@ -193,7 +194,7 @@ fn best_fusion_split(
     best.map(|(left_id, right_id, end, _)| (left_id, right_id, end))
 }
 
-struct FusionIndex {
+pub(crate) struct FusionIndex {
     postings: HashMap<[u8; 4], Vec<u32>>,
     /// Clusters whose representative is shorter than 4 residues: the old
     /// `shares_kmer_cached` treated those as always sharing.
@@ -201,7 +202,7 @@ struct FusionIndex {
 }
 
 impl FusionIndex {
-    fn new(reps: &HashMap<u32, Vec<u8>>, cluster_ids: &[u32]) -> Self {
+    pub(crate) fn new(reps: &HashMap<u32, Vec<u8>>, cluster_ids: &[u32]) -> Self {
         let mut postings: HashMap<[u8; 4], Vec<u32>> = HashMap::default();
         let mut tiny = Vec::new();
         for &id in cluster_ids {
@@ -221,7 +222,7 @@ impl FusionIndex {
     }
 
     /// Ascending ids sharing at least one raw 4-window with `sequence`.
-    fn sharing(&self, sequence: &[u8], include_tiny: bool) -> Vec<u32> {
+    pub(crate) fn sharing(&self, sequence: &[u8], include_tiny: bool) -> Vec<u32> {
         let mut out = Vec::new();
         if sequence.len() >= 4 {
             for w in sequence.windows(4) {
@@ -680,6 +681,7 @@ pub fn merge_fragments(calls: &mut [Call], pools: &Pools, contig_lengths: &[Vec<
         progress!("rustroo: proposed {rescues} strand-aware shortened-allele adoptions; unions remain sample-guarded");
     }
     legacy.extend(abutting_pieces(calls, pools, &reps, &members));
+    terminal.extend(alleles.same_locus_adoptions(calls, pools, &members));
     let contained = contained_adoptions(calls, pools, &reps, &members, &kmers);
     let (merged, terminal_merged, blocked) =
         apply_adoptions(calls, pools, members, &legacy, &terminal, &contained);
@@ -727,6 +729,125 @@ struct AlleleIndex {
 }
 
 impl AlleleIndex {
+    fn same_locus_adoptions(
+        &self,
+        calls: &[Call],
+        pools: &Pools,
+        members: &HashMap<u32, HashSet<u32>>,
+    ) -> Vec<(u32, u32)> {
+        let mut counts: HashMap<u32, HashMap<u32, usize>> = HashMap::default();
+        let mut intact = HashMap::default();
+        for call in calls {
+            if !call.refound
+                && *intact.entry(call.dna)
+                    .or_insert_with(|| is_intact(&pools.dna[call.dna as usize]))
+            {
+                *counts.entry(call.cluster).or_default().entry(call.protein).or_default() += 1;
+            }
+        }
+        let representatives: HashMap<u32, Vec<u32>> = counts
+            .into_iter()
+            .map(|(cluster, counts)| {
+                let mut ranked: Vec<_> = counts.into_iter().collect();
+                ranked.sort_by(|a, b| {
+                    b.1.cmp(&a.1).then_with(|| {
+                        pools.protein[a.0 as usize].cmp(&pools.protein[b.0 as usize])
+                    })
+                });
+                ranked.truncate(3);
+                (cluster, ranked.into_iter().map(|(protein, _)| protein).collect())
+            })
+            .collect();
+        let mut ids: Vec<_> = self.occurrences.keys().copied().collect();
+        ids.sort_unstable();
+        ids.par_iter()
+            .filter_map(|&child| {
+                let occurrences = &self.occurrences[&child];
+                let mut candidates = HashSet::default();
+                let mut placed = 0;
+                for occurrence in occurrences {
+                    if let Some(hosts) = self.hosts(occurrence) {
+                        candidates.extend(hosts.iter().copied());
+                        placed += 1;
+                    }
+                }
+                if placed < 2 {
+                    return None;
+                }
+                let mut candidates: Vec<_> = candidates.into_iter().collect();
+                candidates.sort_unstable();
+                let mut target = None;
+                let mut cache = HashMap::default();
+                for parent in candidates {
+                    if parent == child
+                        || !self.occurrences.contains_key(&parent)
+                    {
+                        continue;
+                    }
+                    let (Some(witnesses), Some(reps)) =
+                        (self.replicated.get(&parent), representatives.get(&parent))
+                    else {
+                        continue;
+                    };
+                    let context_matches = occurrences.iter().all(|occurrence| {
+                        match occurrence.flanks {
+                            (Some(a), Some(b)) => witnesses.contains(&(a, b)),
+                            (None, Some(b)) if occurrence.upstream_edge => {
+                                witnesses.iter().any(|&(_, flank)| flank == b)
+                            }
+                            (Some(a), None) if occurrence.downstream_edge => {
+                                witnesses.iter().any(|&(flank, _)| flank == a)
+                            }
+                            // Missing placement is not evidence for a different locus.
+                            (None, None) => true,
+                            _ => false,
+                        }
+                    });
+                    if !context_matches {
+                        log::record(&format!(
+                            "reconcile\trejected_context\tchild\t{child}\tparent\t{parent}"
+                        ));
+                        continue;
+                    }
+                    let sequence_matches = occurrences.iter().all(|occurrence| {
+                        reps.iter().any(|&rep| {
+                            *cache.entry((occurrence.protein, rep)).or_insert_with(|| {
+                                Self::same_locus_sequence(
+                                    &pools.protein[occurrence.protein as usize],
+                                    &pools.protein[rep as usize],
+                                )
+                            })
+                        })
+                    });
+                    if !sequence_matches {
+                        log::record(&format!(
+                            "reconcile\trejected_sequence\tchild\t{child}\tparent\t{parent}"
+                        ));
+                        continue;
+                    }
+                    if target.is_some() {
+                        log::record(&format!(
+                            "reconcile\tambiguous\tchild\t{child}\tadditional_target\t{parent}"
+                        ));
+                        return None;
+                    }
+                    target = Some(parent);
+                }
+                target.filter(|&parent| {
+                    // Count competing hosts before overlap/direction rejection.
+                    members[&child].is_disjoint(&members[&parent])
+                        && (members[&parent].len(), std::cmp::Reverse(parent))
+                            > (members[&child].len(), std::cmp::Reverse(child))
+                }).map(|parent| {
+                    log::record(&format!(
+                        "reconcile\tproposed\tchild\t{child}\tparent\t{parent}\tplaced\t{placed}"
+                    ));
+                    (child, parent)
+                })
+            })
+            .collect()
+    }
+
     fn new(
         calls: &[Call],
         pools: &Pools,
@@ -841,6 +962,20 @@ impl AlleleIndex {
             upstream,
             downstream,
             replicated,
+        }
+    }
+
+    fn same_locus_sequence(a: &[u8], b: &[u8]) -> bool {
+        let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        if short.len() < ALLELE_MIN_AA {
+            return false;
+        }
+        if short.len() * 5 >= long.len() * 4 {
+            global_identity(short, long).is_some_and(|identity| identity >= CONTAIN_IDENTITY)
+        } else {
+            // Small shared domains are not enough; a fragment must reach a terminus.
+            terminal_identity(short, long)
+                .is_some_and(|identity| identity >= TERMINAL_IDENTITY)
         }
     }
 
@@ -1028,6 +1163,9 @@ fn apply_adoptions(
                 ),
             };
             if !allowed {
+                log::record(&format!(
+                    "reconcile\trejected_cooccurrence\tchild\t{child_root}\tparent\t{root}"
+                ));
                 blocked += 1;
                 continue;
             }
@@ -1046,6 +1184,14 @@ fn apply_adoptions(
             .expect("parent locations exist")
             .extend(child_locations);
         merged += 1;
+        let method = match kind {
+            Adoption::Legacy => "fragment",
+            Adoption::Terminal => "same_locus_or_terminal",
+            Adoption::Contained => "contained",
+        };
+        log::record(&format!(
+            "reconcile\tapplied\tchild\t{child_root}\tparent\t{root}\tmethod\t{method}"
+        ));
         terminal_merged += usize::from(kind == Adoption::Terminal);
         contained_merged += usize::from(kind == Adoption::Contained);
     }
@@ -1236,6 +1382,7 @@ fn contained_adoptions(
     for (index, call) in calls.iter().enumerate() {
         locations.entry(call.cluster).or_default().push(index);
     }
+    let intact_hosts = intact_hosts(calls, pools);
     let mut ids: Vec<u32> = kmers.keys().copied().collect();
     ids.sort_unstable();
     let mut pairs: Vec<(u32, u32)> = ids
@@ -1290,7 +1437,7 @@ fn contained_adoptions(
                 return None;
             }
             let long_id = fits[0];
-            if !host_is_intact(calls, pools, long_id, &reps[&long_id]) {
+            if !intact_hosts.contains(&long_id) {
                 return None;
             }
             intervals_inside(
@@ -1307,12 +1454,28 @@ fn contained_adoptions(
     pairs
 }
 
-fn host_is_intact(calls: &[Call], pools: &Pools, cluster: u32, representative: &[u8]) -> bool {
-    calls.iter().any(|call| {
-        call.cluster == cluster
-            && pools.protein[call.protein as usize] == representative
-            && is_intact(&pools.dna[call.dna as usize])
-    })
+/// Families with at least one intact call carrying the family's own
+/// representative protein, in one pass over the calls rather than a full
+/// scan per adoption candidate. `pools.protein` is deduplicated by content,
+/// so a pool id picks out the representative exactly as comparing its bytes
+/// did, and `pools.dna` is shared by every call with the same sequence, so
+/// each distinct allele is tested for an intact ORF once.
+fn intact_hosts(calls: &[Call], pools: &Pools) -> HashSet<u32> {
+    let representatives = representative_ids(calls, pools);
+    let mut dna_intact: HashMap<u32, bool> = HashMap::default();
+    let mut hosts = HashSet::default();
+    for call in calls {
+        if representatives.get(&call.cluster) != Some(&call.protein) {
+            continue;
+        }
+        if *dna_intact
+            .entry(call.dna)
+            .or_insert_with(|| is_intact(&pools.dna[call.dna as usize]))
+        {
+            hosts.insert(call.cluster);
+        }
+    }
+    hosts
 }
 
 fn containment_postings<'a>(
@@ -1479,43 +1642,53 @@ fn separate_finished_genes(pairs: Vec<(u32, u32)>, intact: &HashSet<u32>) -> Vec
     kept
 }
 
-pub fn refind(calls: &mut Vec<Call>, pools: &mut Pools, contigs: &[Vec<PackedSeq>]) -> usize {
+pub fn refind(
+    calls: &mut Vec<Call>,
+    pools: &mut Pools,
+    contigs: &[Vec<PackedSeq>],
+    min_cds_bp: usize,
+) -> usize {
     sort_calls(calls);
     let loci = physical_loci(calls, pools);
     let contexts = locus_contexts(calls, &loci, |call| call.cluster);
-    let mut between: HashMap<(u32, u32), HashMap<u32, u32>> = HashMap::default();
+    let mut support: HashMap<(u32, u32, u32), (usize, u32)> = HashMap::default();
     for (locus, context) in loci.iter().zip(contexts) {
         if let (Some(left), Some(right)) = context {
             // FIX(orientation): the gap scan below does not know the strand of
             // the missing gene, so the flank pair is unordered.
-            between
-                .entry(flank_key(left, right))
-                .or_default()
-                .entry(calls[locus.first].cluster)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
+            let (left, right) = flank_key(left, right);
+            record_context_sample(
+                &mut support,
+                (left, right, calls[locus.first].cluster),
+                calls[locus.first].sample,
+            );
         }
     }
-    let target_of: HashMap<(u32, u32), u32> = between
-        .iter()
-        .filter_map(|(flanks, middles)| {
-            // `max_by_key` breaks a tie by returning the last-seen element,
-            // and `middles` is a `HashMap` with randomized iteration order;
-            // breaking a tied vote count by the (otherwise arbitrary) gene
-            // id keeps the choice fixed by the data instead of by run.
-            let (&gene, _) = middles
-                .iter()
-                .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))?;
-            let count = middles[&gene];
-            if count < 2 {
-                return None;
-            }
-            Some((*flanks, gene))
+    let mut target_support: HashMap<(u32, u32), Vec<(u32, usize)>> = HashMap::default();
+    for ((left, right, middle), (samples, _)) in support {
+        insert_context_target(
+            target_support.entry((left, right)).or_default(),
+            middle,
+            samples,
+        );
+    }
+    let target_of: HashMap<(u32, u32), Vec<u32>> = target_support
+        .into_iter()
+        .map(|(flanks, targets)| {
+            (
+                flanks,
+                targets.into_iter().map(|(family, _)| family).collect(),
+            )
         })
         .collect();
     if target_of.is_empty() {
         return 0;
     }
+    let graph_targets = target_of.values().map(Vec::len).sum::<usize>();
+    progress!(
+        "rustroo: context graph has {} observed flank pairs and {graph_targets} candidate families",
+        target_of.len()
+    );
     let reps = representatives(calls, pools);
     let context_of: HashMap<u32, u32> = calls
         .iter()
@@ -1553,6 +1726,7 @@ pub fn refind(calls: &mut Vec<Call>, pools: &mut Pools, contigs: &[Vec<PackedSeq
                 &reps,
                 contigs,
                 local_present,
+                min_cds_bp,
             )
         })
         .collect();
@@ -1596,18 +1770,17 @@ struct FoundGene {
 }
 
 /// Scan one sample's calls (already contiguous, sorted by contig then
-/// start) for intergenic gaps that match a known flank pair, same logic as
-/// the old single-threaded scan but scoped to one sample and its own local
-/// `present` set, so a gene found via one gap cannot be refound again via a
-/// later gap in the same sample - the only ordering guarantee the original
-/// sequential version relied on.
+/// start) for intergenic gaps that match a supported flank pair. The graph
+/// stores a bounded set of middle-family alternatives; sequence evidence
+/// chooses among them, while tied assignments to one ORF are rejected.
 fn refind_in_sample(
     sample_calls: &[Call],
     sample: u32,
-    target_of: &HashMap<(u32, u32), u32>,
+    target_of: &HashMap<(u32, u32), Vec<u32>>,
     reps: &HashMap<u32, Vec<u8>>,
     contigs: &[Vec<PackedSeq>],
     present: HashSet<u32>,
+    min_cds_bp: usize,
 ) -> Vec<FoundGene> {
     // FIX(orientation): every gap is scored first, then each missing gene is
     // placed in its single best gap. The old first-gap-along-the-contig rule
@@ -1634,13 +1807,7 @@ fn refind_in_sample(
             if !(60..=12_000).contains(&gap) {
                 continue;
             }
-            let Some(&target) = target_of.get(&flank_key(pair[0].cluster, pair[1].cluster)) else {
-                continue;
-            };
-            if present.contains(&target) {
-                continue;
-            }
-            let Some(target_protein) = reps.get(&target) else {
+            let Some(targets) = target_of.get(&flank_key(pair[0].cluster, pair[1].cluster)) else {
                 continue;
             };
             // A missing contig reads as "" in the original, which always
@@ -1656,28 +1823,60 @@ fn refind_in_sample(
                 continue;
             }
             let gap_seq = sequence.slice(from, to);
-            let Some((identity, orf)) = best_orf(&gap_seq, target_protein) else {
+            let mut gap_best: Option<Candidate> = None;
+            let mut ambiguous = false;
+            for &target in targets {
+                if present.contains(&target) {
+                    continue;
+                }
+                let Some(target_protein) = reps.get(&target) else {
+                    continue;
+                };
+                let Some((identity, orf)) = best_orf(&gap_seq, target_protein, min_cds_bp) else {
+                    continue;
+                };
+                let protein = translate(&orf.dna);
+                let start = pair[0].end + orf.offset + 1;
+                let end_bp = pair[0].end + orf.offset + orf.dna.len() as u32;
+                let edge_distance = (start as usize - 1).min(sequence.len() - end_bp as usize);
+                let candidate = Candidate {
+                    identity,
+                    contig,
+                    edge_distance,
+                    gene: FoundGene {
+                        sample,
+                        contig,
+                        start,
+                        end: end_bp,
+                        strand: orf.strand,
+                        dna: orf.dna,
+                        protein,
+                        cluster: target,
+                    },
+                };
+                match &gap_best {
+                    None => gap_best = Some(candidate),
+                    Some(current) => match candidate.identity.total_cmp(&current.identity) {
+                        std::cmp::Ordering::Greater => {
+                            gap_best = Some(candidate);
+                            ambiguous = false;
+                        }
+                        std::cmp::Ordering::Equal
+                            if candidate.gene.cluster != current.gene.cluster =>
+                        {
+                            ambiguous = true;
+                        }
+                        _ => {}
+                    },
+                };
+            }
+            if ambiguous {
+                continue;
+            }
+            let Some(candidate) = gap_best else {
                 continue;
             };
-            let protein = translate(&orf.dna);
-            let start = pair[0].end + orf.offset + 1;
-            let end_bp = pair[0].end + orf.offset + orf.dna.len() as u32;
-            let edge_distance = (start as usize - 1).min(sequence.len() - end_bp as usize);
-            let candidate = Candidate {
-                identity,
-                contig,
-                edge_distance,
-                gene: FoundGene {
-                    sample,
-                    contig,
-                    start,
-                    end: end_bp,
-                    strand: orf.strand,
-                    dna: orf.dna,
-                    protein,
-                    cluster: target,
-                },
-            };
+            let target = candidate.gene.cluster;
             let better = match best.get(&target) {
                 None => true,
                 Some(current) => candidate
@@ -1701,6 +1900,40 @@ fn refind_in_sample(
     found
 }
 
+const MIN_CONTEXT_SAMPLES: usize = 1;
+const MAX_CONTEXT_TARGETS: usize = 8;
+
+fn record_context_sample(
+    support: &mut HashMap<(u32, u32, u32), (usize, u32)>,
+    key: (u32, u32, u32),
+    sample: u32,
+) {
+    // Calls are sorted by sample, so one last-sample value replaces a per-edge
+    // sample set while still counting each genome only once.
+    let entry = support.entry(key).or_insert((1, sample));
+    if entry.1 != sample {
+        entry.0 += 1;
+        entry.1 = sample;
+    }
+}
+
+fn insert_context_target(targets: &mut Vec<(u32, usize)>, family: u32, support: usize) {
+    if support < MIN_CONTEXT_SAMPLES {
+        return;
+    }
+    let position = targets
+        .iter()
+        .position(|(existing, count)| {
+            support > *count || (support == *count && family < *existing)
+        })
+        .unwrap_or(targets.len());
+    if position >= MAX_CONTEXT_TARGETS {
+        return;
+    }
+    targets.insert(position, (family, support));
+    targets.truncate(MAX_CONTEXT_TARGETS);
+}
+
 /// Unordered flank pair: a gene between A and B is between B and A on the
 /// reverse-complemented contig.
 fn flank_key(a: u32, b: u32) -> (u32, u32) {
@@ -1713,39 +1946,46 @@ struct FoundOrf {
     strand: i8,
 }
 
-fn best_orf(gap: &str, target: &[u8]) -> Option<(f64, FoundOrf)> {
+fn best_orf(gap: &str, target: &[u8], min_cds_bp: usize) -> Option<(f64, FoundOrf)> {
     let reverse = crate::genetic_code::reverse_complement(gap);
-    // Bounds only. The DNA string is built for an ORF that clears 0.80
-    // identity, and equal scores keep the earlier strand, frame, and codon.
+    // Short matches cannot stand in for a gene. Rank accepted ORFs by
+    // identity weighted by shorter/longer coverage, not identity alone.
     let mut spans: Vec<(i8, usize, usize, u32)> = Vec::new();
+    // First stop codon at or after each codon of the current frame, swept
+    // once from the back instead of re-scanned from every start codon.
+    // `codons` stands for "no stop after here", which is what the forward
+    // scan reported by running off the end.
+    let mut next_stop: Vec<usize> = Vec::new();
     for (sequence, strand) in [(gap, 1i8), (reverse.as_str(), -1)] {
         for frame in 0..3 {
             if sequence.len() <= frame {
                 continue;
             }
             let frame_seq = &sequence[frame..];
+            let codons = frame_seq.len() / 3;
+            next_stop.clear();
+            next_stop.resize(codons + 1, codons);
+            for index in (0..codons).rev() {
+                let at = index * 3;
+                next_stop[index] = if is_stop(&frame_seq.as_bytes()[at..at + 3]) {
+                    index
+                } else {
+                    next_stop[index + 1]
+                };
+            }
             let mut codon = 0;
-            while codon + 1 < frame_seq.len() / 3 {
+            while codon + 1 < codons {
                 let start = codon * 3;
                 let codon_bytes = &frame_seq.as_bytes()[start..start + 3];
                 if !is_start(codon_bytes) {
                     codon += 1;
                     continue;
                 }
-                let mut stop_at = None;
-                let mut next = codon + 1;
-                while next < frame_seq.len() / 3 {
-                    let at = next * 3;
-                    if is_stop(&frame_seq.as_bytes()[at..at + 3]) {
-                        stop_at = Some(next);
-                        break;
-                    }
-                    next += 1;
-                }
-                let Some(stop_at) = stop_at else {
+                let stop_at = next_stop[codon + 1];
+                if stop_at == codons {
                     codon += 1;
                     continue;
-                };
+                }
                 let end = (stop_at + 1) * 3;
                 let offset = if strand > 0 {
                     (frame + start) as u32
@@ -1763,23 +2003,20 @@ fn best_orf(gap: &str, target: &[u8]) -> Option<(f64, FoundOrf)> {
     let score =
         |&(strand, start, end, offset): &(i8, usize, usize, u32)| -> Option<(f64, FoundOrf)> {
             let sequence = if strand > 0 { gap } else { reverse.as_str() };
+            if end - start < min_cds_bp {
+                return None;
+            }
             let protein = translate_bytes(&sequence.as_bytes()[start..end]);
-            let identity = if protein.len().abs_diff(target.len()) * 5 <= target.len() {
-                global_identity(&protein, target).unwrap_or(0.0)
-            } else if protein.len() <= target.len() {
-                fit_short_in_long(&protein, target)
-                    .map(|fit| fit.identity)
-                    .unwrap_or(0.0)
-            } else {
-                fit_short_in_long(target, &protein)
-                    .map(|fit| fit.identity)
-                    .unwrap_or(0.0)
-            };
+            let ratio = crate::align::length_ratio(&protein, target);
+            if ratio < 0.80 {
+                return None;
+            }
+            let identity = global_identity(&protein, target)?;
             if identity < 0.8 {
                 return None;
             }
             Some((
-                identity,
+                identity * ratio,
                 FoundOrf {
                     dna: sequence[start..end].to_string(),
                     offset,
@@ -2256,7 +2493,7 @@ fn locus_contexts(
                 let gap = i64::from(calls[loci[cursor].first].start)
                     - i64::from(loci[cursor - 1].end)
                     - 1;
-                if (-15..=i64::from(NEIGHBOR_GAP)).contains(&gap) {
+                if (-NEIGHBOR_OVERLAP..=i64::from(NEIGHBOR_GAP)).contains(&gap) {
                     Some(family(&calls[loci[cursor - 1].first]))
                 } else {
                     None
@@ -2268,7 +2505,7 @@ fn locus_contexts(
                 let gap = i64::from(calls[loci[cursor + 1].first].start)
                     - i64::from(loci[cursor].end)
                     - 1;
-                if (-15..=i64::from(NEIGHBOR_GAP)).contains(&gap) {
+                if (-NEIGHBOR_OVERLAP..=i64::from(NEIGHBOR_GAP)).contains(&gap) {
                     Some(family(&calls[loci[cursor + 1].first]))
                 } else {
                     None
@@ -2358,17 +2595,22 @@ pub fn compress_clusters(calls: &mut [Call], pools: &Pools) {
 
 /// Rank of every pooled protein by content (length, then bytes), so a
 /// tie-break can use the sequence rather than the order it was first seen.
-fn protein_ranks(pools: &Pools) -> Vec<u32> {
-    let mut order: Vec<u32> = (0..pools.protein.len() as u32).collect();
-    order.par_sort_unstable_by(|&a, &b| {
-        let (pa, pb) = (&pools.protein[a as usize], &pools.protein[b as usize]);
-        pa.len().cmp(&pb.len()).then_with(|| pa.cmp(pb)).then(a.cmp(&b))
-    });
-    let mut rank = vec![0u32; order.len()];
-    for (position, &protein) in order.iter().enumerate() {
-        rank[protein as usize] = position as u32;
-    }
-    rank
+/// The ranking is a pure function of the pool, and `compress_clusters` runs
+/// after every synteny round, so the pool keeps the result between the
+/// rounds that do not intern anything new.
+fn protein_ranks(pools: &Pools) -> std::sync::Arc<[u32]> {
+    pools.protein_ranks(|proteins: &[Vec<u8>]| {
+        let mut order: Vec<u32> = (0..proteins.len() as u32).collect();
+        order.par_sort_unstable_by(|&a, &b| {
+            let (pa, pb) = (&proteins[a as usize], &proteins[b as usize]);
+            pa.len().cmp(&pb.len()).then_with(|| pa.cmp(pb)).then(a.cmp(&b))
+        });
+        let mut rank = vec![0u32; order.len()];
+        for (position, &protein) in order.iter().enumerate() {
+            rank[protein as usize] = position as u32;
+        }
+        rank
+    })
 }
 
 /// Protein identity of two alleles over the shorter one: a banded global
@@ -3030,6 +3272,190 @@ mod tests {
                 alphabet[(state % 20) as usize]
             })
             .collect()
+    }
+
+    #[test]
+    fn refind_rejects_tiny_and_low_coverage_orfs() {
+        let mut full = protein(100, 42);
+        full[0] = b'M';
+        let tiny = back_translate(&full[..5]);
+        assert!(best_orf(&tiny, &full, 90).is_none());
+        assert!(best_orf(&tiny, &full, 0).is_none());
+        let fragment = back_translate(&full[..40]);
+        assert!(best_orf(&fragment, &full, 90).is_none());
+        let dna = back_translate(&full);
+        assert_eq!(best_orf(&dna, &full, 90).unwrap().1.dna, dna);
+        assert!(best_orf(&dna, &full, dna.len() + 1).is_none());
+    }
+
+    #[test]
+    fn refind_prefers_whole_gene_over_perfect_short_match_and_is_orientation_invariant() {
+        let mut full = protein(100, 42);
+        full[0] = b'M';
+        let tiny = back_translate(&full[..5]);
+        let dna = back_translate(&full);
+        let gap = format!("{tiny}CCC{dna}");
+        let found = best_orf(&gap, &full, 90).unwrap().1;
+        assert_eq!(found.dna, dna);
+        let reverse = crate::genetic_code::reverse_complement(&gap);
+        let flipped = best_orf(&reverse, &full, 90).unwrap().1;
+        assert_eq!(flipped.dna, dna);
+        assert_eq!(found.strand, -flipped.strand);
+    }
+
+    #[test]
+    fn refind_uses_sequence_to_choose_between_supported_context_families() {
+        let mut left = protein(40, 4);
+        let mut right = protein(40, 5);
+        let mut first_middle = protein(100, 6);
+        let mut second_middle = protein(100, 7);
+        for sequence in [&mut left, &mut right, &mut first_middle, &mut second_middle] {
+            sequence[0] = b'M';
+        }
+        let left_dna = back_translate(&left);
+        let middle_dna = back_translate(&second_middle);
+        let right_dna = back_translate(&right);
+        let spacer = "N".repeat(60);
+        let right_start = (left_dna.len() + spacer.len() + middle_dna.len() + spacer.len() + 1) as u32;
+        let contig = format!("{left_dna}{spacer}{middle_dna}{spacer}{right_dna}");
+
+        let mut pools = Pools::default();
+        let calls = vec![
+            call(4, 10, 1, &left, &mut pools),
+            call(4, 11, right_start, &right, &mut pools),
+        ];
+        let targets = HashMap::from_iter([(
+            flank_key(10, 11),
+            vec![20, 21],
+        )]);
+        let reps = HashMap::from_iter([(20, first_middle), (21, second_middle)]);
+        let mut contigs: Vec<Vec<PackedSeq>> = (0..5).map(|_| Vec::new()).collect();
+        contigs[4].push(PackedSeq::new(contig));
+
+        let found = refind_in_sample(
+            &calls,
+            4,
+            &targets,
+            &reps,
+            &contigs,
+            HashSet::default(),
+            90,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].cluster, 21);
+    }
+
+    #[test]
+    fn refind_rejects_an_orf_tied_between_context_families() {
+        let mut left = protein(40, 14);
+        let mut middle = protein(100, 15);
+        let mut right = protein(40, 16);
+        for sequence in [&mut left, &mut middle, &mut right] {
+            sequence[0] = b'M';
+        }
+        let left_dna = back_translate(&left);
+        let middle_dna = back_translate(&middle);
+        let right_dna = back_translate(&right);
+        let spacer = "N".repeat(60);
+        let right_start = (left_dna.len() + spacer.len() + middle_dna.len() + spacer.len() + 1) as u32;
+        let contig = format!("{left_dna}{spacer}{middle_dna}{spacer}{right_dna}");
+
+        let mut pools = Pools::default();
+        let calls = vec![
+            call(0, 10, 1, &left, &mut pools),
+            call(0, 11, right_start, &right, &mut pools),
+        ];
+        let targets = HashMap::from_iter([(
+            flank_key(10, 11),
+            vec![20, 21],
+        )]);
+        let reps = HashMap::from_iter([(20, middle.clone()), (21, middle)]);
+        let contigs = vec![vec![PackedSeq::new(contig)]];
+
+        let found = refind_in_sample(
+            &calls,
+            0,
+            &targets,
+            &reps,
+            &contigs,
+            HashSet::default(),
+            90,
+        );
+        assert!(found.is_empty());
+    }
+
+    fn reconcile_fixture() -> (Pools, Vec<Call>, Vec<Vec<usize>>) {
+        let mut pools = Pools::default();
+        let mut full = protein(100, 42);
+        full[0] = b'M';
+        let mut variant = full.clone();
+        variant[40] = if variant[40] == b'A' { b'G' } else { b'A' };
+        let mut calls = Vec::new();
+        for sample in 0..4 {
+            calls.push(call(sample, 10, 100, b"MKTLLYVWAACD", &mut pools));
+            calls.push(call(sample, u32::from(sample >= 2), 400,
+                if sample < 2 { &full } else { &variant }, &mut pools));
+            calls.push(call(sample, 11, 1000, b"MACDEFGHIKLNP", &mut pools));
+        }
+        (pools, calls, vec![vec![4000]; 4])
+    }
+
+    #[test]
+    fn same_locus_reconciles_equal_length_alleles_and_preserves_cooccurring_copies() {
+        let (mut pools, mut calls, lengths) = reconcile_fixture();
+        assert!(merge_fragments(&mut calls, &pools, &lengths));
+        let middle: HashSet<_> = calls.iter().filter(|call| call.start == 400)
+            .map(|call| call.cluster).collect();
+        assert_eq!(middle.len(), 1);
+        assert!(!merge_fragments(&mut calls, &pools, &lengths));
+
+        let (_, mut calls, _) = reconcile_fixture();
+        let mut duplicate = calls.iter().find(|call| call.sample == 2 && call.start == 400)
+            .unwrap().clone();
+        duplicate.sample = 0;
+        duplicate.start = 2000;
+        duplicate.end = 2302;
+        calls.push(duplicate);
+        assert!(!merge_fragments(&mut calls, &pools, &lengths));
+        // An unrelated same-size protein must not pass a context-only merge.
+        let unrelated = pools.intern_protein(protein(100, 91));
+        assert!(!AlleleIndex::same_locus_sequence(&pools.protein[unrelated as usize],
+            &pools.protein[calls[1].protein as usize]));
+    }
+
+    #[test]
+    fn same_locus_reconciliation_rejects_conflicting_context_and_internal_domains() {
+        let (pools, mut calls, lengths) = reconcile_fixture();
+        for call in &mut calls {
+            if call.sample >= 2 && call.cluster == 11 {
+                call.cluster = 12;
+            }
+        }
+        assert!(!merge_fragments(&mut calls, &pools, &lengths));
+        let full = protein(100, 42);
+        assert!(!AlleleIndex::same_locus_sequence(&full[20..60], &full));
+        assert!(AlleleIndex::same_locus_sequence(&full[..40], &full));
+    }
+
+    #[test]
+    fn shallow_overlaps_retain_neighborhood_anchors() {
+        let (pools, mut calls, _) = reconcile_fixture();
+        for sample in 0..4 {
+            let middle = calls.iter().find(|call| call.sample == sample && call.start == 400)
+                .unwrap().end;
+            let right = calls.iter_mut().find(|call| call.sample == sample && call.cluster == 11)
+                .unwrap();
+            right.start = middle - 19;
+            right.end = right.start + 41;
+        }
+        sort_calls(&mut calls);
+        let loci = physical_loci(&calls, &pools);
+        let contexts = locus_contexts(&calls, &loci, |call| call.cluster);
+        for (locus, context) in loci.iter().zip(contexts) {
+            if calls[locus.first].start == 400 {
+                assert_eq!(context, (Some(10), Some(11)));
+            }
+        }
     }
 
     fn merge(calls: &mut [Call], pools: &Pools) -> bool {
@@ -4597,6 +5023,44 @@ mod tests {
     fn fix_refind_flank_pairs_are_unordered() {
         assert_eq!(flank_key(3, 7), flank_key(7, 3));
         assert_eq!(flank_key(5, 5), (5, 5));
+    }
+
+    #[test]
+    fn context_graph_ranks_distinct_sample_support_and_bounds_candidates() {
+        let mut targets = Vec::new();
+        for (family, support) in [(9, 1), (20, 2), (7, 2), (4, 3), (2, 1)]
+            .into_iter()
+            .chain((10..=20).map(|family| (family, 2)))
+        {
+            insert_context_target(&mut targets, family, support);
+        }
+        assert_eq!(
+            targets,
+            vec![
+                (4, 3),
+                (7, 2),
+                (10, 2),
+                (11, 2),
+                (12, 2),
+                (13, 2),
+                (14, 2),
+                (15, 2)
+            ]
+        );
+        let mut singleton_context = Vec::new();
+        insert_context_target(&mut singleton_context, 30, 1);
+        assert_eq!(singleton_context, vec![(30, 1)]);
+    }
+
+    #[test]
+    fn context_graph_counts_repeated_loci_once_per_sample() {
+        let mut support = HashMap::default();
+        let key = (3, 7, 12);
+        record_context_sample(&mut support, key, 0);
+        record_context_sample(&mut support, key, 0);
+        assert_eq!(support[&key].0, 1);
+        record_context_sample(&mut support, key, 1);
+        assert_eq!(support[&key].0, 2);
     }
 
     #[test]

@@ -20,10 +20,15 @@
 //! the stop between them invents a sequence no genome carries. A join cannot
 //! outvote a finished end.
 
+use std::sync::OnceLock;
+
 use crate::fxhash::HashMap;
 
-use crate::align::{fit_short_in_long, length_ratio, terminal_identity_parts};
+use crate::align::{
+    fit_short_in_long, fit_short_in_long_indexed, length_ratio, terminal_identity_parts, LongIndex,
+};
 use crate::genetic_code::{is_intact, orf_status, strip_terminal_stop, translate};
+use crate::synteny::{composition, composition_bound, Composition, FusionIndex};
 
 const EXTENSION_IDENTITY: f64 = 0.95;
 const EXTENSION_COVERAGE: f64 = 0.90;
@@ -62,20 +67,71 @@ pub struct Choice {
     pub extension_samples: u32,
 }
 
-/// `reps` is every family's representative protein, keyed by cluster id;
-/// `own_cluster` is excluded from the fusion/extension check so a gene is
-/// never compared against itself. Borrowing from `reps` here (rather than
-/// the caller handing in a pre-cloned `Vec<Vec<u8>>` of every other family)
-/// means the common case - a candidate allele that is not notably longer
-/// than the baseline - never touches `reps` at all: `allele_is_clean` only
-/// reaches `matches_other_gene` when it needs to.
+/// Every family's representative protein, keyed by cluster id, plus the
+/// indexes `matches_other_gene` screens a candidate tail against.
+///
+/// Those indexes are built on first use, not in `new`. Most families never
+/// produce an allele long enough to reach the fusion check, and for a run
+/// where none do, building a 4-mer table per family would be pure loss. The
+/// build is deliberately sequential: `choose_reference` runs on a rayon
+/// worker, and a nested parallel build under `OnceLock` could steal the very
+/// task whose completion the initialising thread is waiting on.
+pub struct OtherGenes {
+    reps: HashMap<u32, Vec<u8>>,
+    indexes: OnceLock<GeneIndexes>,
+}
+
+struct GeneIndexes {
+    compositions: HashMap<u32, Composition>,
+    /// 4-mer table of each representative, for the fits where it is the
+    /// longer sequence.
+    long: HashMap<u32, LongIndex>,
+    windows: FusionIndex,
+}
+
+impl OtherGenes {
+    pub fn new(reps: HashMap<u32, Vec<u8>>) -> Self {
+        Self {
+            reps,
+            indexes: OnceLock::new(),
+        }
+    }
+
+    fn indexes(&self) -> &GeneIndexes {
+        self.indexes.get_or_init(|| {
+            let mut ids: Vec<u32> = self.reps.keys().copied().collect();
+            ids.sort_unstable();
+            GeneIndexes {
+                compositions: self
+                    .reps
+                    .iter()
+                    .map(|(&id, protein)| (id, composition(protein)))
+                    .collect(),
+                long: self
+                    .reps
+                    .iter()
+                    .map(|(&id, protein)| (id, LongIndex::new(protein)))
+                    .collect(),
+                windows: FusionIndex::new(&self.reps, &ids),
+            }
+        })
+    }
+}
+
+/// `others` is every family's representative protein; `own_cluster` is
+/// excluded from the fusion/extension check so a gene is never compared
+/// against itself. Borrowing from `others` here (rather than the caller
+/// handing in a pre-cloned `Vec<Vec<u8>>` of every other family) means the
+/// common case - a candidate allele that is not notably longer than the
+/// baseline - never touches it at all: `allele_is_clean` only reaches
+/// `matches_other_gene` when it needs to.
 ///
 /// `n_samples` is the collection size, used only when intact alleles disagree
 /// on length. A family whose intact copies already share one length returns
 /// on the same path as before: no end census and no extra alignment.
 pub fn choose_reference(
     alleles: &[Allele],
-    reps: &HashMap<u32, Vec<u8>>,
+    others: &OtherGenes,
     own_cluster: u32,
     n_samples: usize,
 ) -> Option<Choice> {
@@ -114,7 +170,7 @@ pub fn choose_reference(
     if uniform {
         let baseline_protein = translate(&baseline.dna);
         for allele in &intact {
-            if allele_is_clean(allele, &baseline_protein, reps, own_cluster) {
+            if allele_is_clean(allele, &baseline_protein, others, own_cluster) {
                 kept.push(*allele);
             }
         }
@@ -125,7 +181,7 @@ pub fn choose_reference(
             .iter()
             .filter(|allele| allele.synthetic && is_intact(&allele.dna))
         {
-            if allele_is_clean(allele, &baseline_protein, reps, own_cluster) {
+            if allele_is_clean(allele, &baseline_protein, others, own_cluster) {
                 kept.push(allele);
             }
         }
@@ -136,7 +192,7 @@ pub fn choose_reference(
             .position(|allele| std::ptr::eq(*allele, baseline))
             .expect("baseline is one of the intact alleles");
         for (allele, protein) in intact.iter().copied().zip(&proteins) {
-            if protein_is_clean(protein, &proteins[baseline_at], reps, own_cluster) {
+            if protein_is_clean(protein, &proteins[baseline_at], others, own_cluster) {
                 kept.push(allele);
             }
         }
@@ -148,7 +204,7 @@ pub fn choose_reference(
             .filter(|allele| allele.synthetic && is_intact(&allele.dna))
         {
             let protein = translate(&allele.dna);
-            if protein_is_clean(&protein, &proteins[baseline_at], reps, own_cluster) {
+            if protein_is_clean(&protein, &proteins[baseline_at], others, own_cluster) {
                 kept.push(allele);
                 joined.push((allele, protein));
             }
@@ -267,17 +323,17 @@ pub fn choose_reference(
 fn allele_is_clean(
     allele: &Allele,
     baseline: &[u8],
-    reps: &HashMap<u32, Vec<u8>>,
+    others: &OtherGenes,
     own_cluster: u32,
 ) -> bool {
     let protein = translate(&allele.dna);
-    protein_is_clean(&protein, baseline, reps, own_cluster)
+    protein_is_clean(&protein, baseline, others, own_cluster)
 }
 
 fn protein_is_clean(
     protein: &[u8],
     baseline: &[u8],
-    reps: &HashMap<u32, Vec<u8>>,
+    others: &OtherGenes,
     own_cluster: u32,
 ) -> bool {
     if protein.len() <= baseline.len().saturating_add(SMALL_EXTENSION_AA) {
@@ -294,8 +350,8 @@ fn protein_is_clean(
     }
     let prefix = &protein[..fit.extra_prefix(protein.len())];
     let suffix = &protein[protein.len() - fit.extra_suffix(protein.len())..];
-    !matches_other_gene(prefix, protein, reps, own_cluster)
-        && !matches_other_gene(suffix, protein, reps, own_cluster)
+    !matches_other_gene(prefix, protein, others, own_cluster)
+        && !matches_other_gene(suffix, protein, others, own_cluster)
 }
 
 /// Samples that can vouch for one DNA length. Clipped copies are absent here
@@ -505,38 +561,47 @@ fn refuse_private_extensions<'a>(
 fn matches_other_gene(
     peptide: &[u8],
     whole: &[u8],
-    reps: &HashMap<u32, Vec<u8>>,
+    others: &OtherGenes,
     own_cluster: u32,
 ) -> bool {
     if peptide.len() < FUSION_MIN_AA {
         return false;
     }
-    let peptide_composition = crate::synteny::composition(peptide);
-    reps.iter()
-        .filter(|(id, _)| **id != own_cluster)
-        .any(|(_, other)| {
+    let indexes = others.indexes();
+    // Whichever way round the fit runs, it needs a raw 4-window the peptide
+    // and the representative both carry, so a family the window index does
+    // not list - including one too short to hold a window - could only ever
+    // have failed `matches_tail`. Narrowing to those families replaces the
+    // scan over every family with a scan over the ones that can hit.
+    let candidates = indexes.windows.sharing(peptide, false);
+    if candidates.is_empty() {
+        return false;
+    }
+    let peptide_composition = composition(peptide);
+    let peptide_index = LongIndex::new(peptide);
+    candidates
+        .into_iter()
+        .filter(|id| *id != own_cluster)
+        .any(|id| {
+            let other = &others.reps[&id];
             // Exact skip: fit identity is matches / shorter length, and the
             // matches can never exceed the shared residue composition.
             let shorter = peptide.len().min(other.len());
             if shorter > 0
-                && (crate::synteny::composition_bound(
-                    &peptide_composition,
-                    &crate::synteny::composition(other),
-                ) as f64
+                && (composition_bound(&peptide_composition, &indexes.compositions[&id]) as f64
                     / shorter as f64)
                     < FUSION_IDENTITY
             {
                 return false;
             }
             let matches_tail = if peptide.len() <= other.len() {
-                fit_short_in_long(peptide, other).is_some_and(|fit| {
-                    fit.identity >= FUSION_IDENTITY && fit.coverage >= FUSION_COVERAGE
-                })
+                fit_short_in_long_indexed(peptide, other, &indexes.long[&id])
             } else {
-                fit_short_in_long(other, peptide).is_some_and(|fit| {
-                    fit.identity >= FUSION_IDENTITY && fit.coverage >= FUSION_COVERAGE
-                })
-            };
+                fit_short_in_long_indexed(other, peptide, &peptide_index)
+            }
+            .is_some_and(|fit| {
+                fit.identity >= FUSION_IDENTITY && fit.coverage >= FUSION_COVERAGE
+            });
             if !matches_tail {
                 return false;
             }
@@ -693,28 +758,30 @@ mod tests {
         }
     }
 
-    fn choose(alleles: &[Allele], reps: &HashMap<u32, Vec<u8>>) -> Choice {
+    fn choose(alleles: &[Allele], others: &OtherGenes) -> Choice {
         let samples = alleles
             .iter()
             .map(|allele| allele.count as usize)
             .sum::<usize>()
             .max(1);
-        choose_reference(alleles, reps, 0, samples).unwrap()
+        choose_reference(alleles, others, 0, samples).unwrap()
     }
 
     /// Builds the "other families" map `choose_reference` now takes directly,
     /// keyed away from `own_cluster` (0) so the exclusion filter never hides
     /// a test's own fixture by accident.
-    fn other_reps(others: &[Vec<u8>]) -> HashMap<u32, Vec<u8>> {
-        others
-            .iter()
-            .enumerate()
-            .map(|(index, protein)| (index as u32 + 1, protein.clone()))
-            .collect()
+    fn other_reps(others: &[Vec<u8>]) -> OtherGenes {
+        OtherGenes::new(
+            others
+                .iter()
+                .enumerate()
+                .map(|(index, protein)| (index as u32 + 1, protein.clone()))
+                .collect(),
+        )
     }
 
-    fn no_others() -> HashMap<u32, Vec<u8>> {
-        HashMap::default()
+    fn no_others() -> OtherGenes {
+        OtherGenes::new(HashMap::default())
     }
 
     fn protein(length: usize, phase: usize) -> Vec<u8> {

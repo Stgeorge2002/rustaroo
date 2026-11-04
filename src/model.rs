@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex, MutexGuard};
+
 /// A CDS after it has been given integer ids. DNA and protein live in pools so
 /// a core gene carried by every sample is stored once.
 #[derive(Debug, Clone)]
@@ -35,9 +37,36 @@ pub struct Pools {
     /// only in `dna` / `protein`.
     dna_index: crate::fxhash::HashMap<u64, Vec<u32>>,
     protein_index: crate::fxhash::HashMap<u64, Vec<u32>>,
+    /// Last protein ranking handed out, tagged with the pool length it was
+    /// built at. Interning only ever appends, so a tag that still matches
+    /// means nothing a ranking depends on has changed.
+    protein_rank_cache: Mutex<Option<(usize, Arc<[u32]>)>>,
 }
 
 impl Pools {
+    /// A ranking of the protein pool, built by `build` the first time it is
+    /// asked for at the pool's current length and reused until the pool
+    /// grows. `build` runs outside the lock: two callers racing would
+    /// compute the same ranking, while holding a lock across a parallel sort
+    /// inside a rayon pool invites a work-stealing deadlock.
+    pub fn protein_ranks(&self, build: impl FnOnce(&[Vec<u8>]) -> Vec<u32>) -> Arc<[u32]> {
+        let length = self.protein.len();
+        if let Some((built_at, ranks)) = &*self.rank_cache() {
+            if *built_at == length {
+                return Arc::clone(ranks);
+            }
+        }
+        let ranks: Arc<[u32]> = build(&self.protein).into();
+        *self.rank_cache() = Some((length, Arc::clone(&ranks)));
+        ranks
+    }
+
+    fn rank_cache(&self) -> MutexGuard<'_, Option<(usize, Arc<[u32]>)>> {
+        self.protein_rank_cache
+            .lock()
+            .expect("a thread panicked while replacing the protein ranking")
+    }
+
     pub fn intern_dna(&mut self, sequence: String) -> u32 {
         let hash = content_hash(sequence.as_bytes());
         intern_at(&mut self.dna, &mut self.dna_index, hash, sequence)

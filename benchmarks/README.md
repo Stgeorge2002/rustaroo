@@ -63,6 +63,125 @@ These are five independently drawn subset series from **one 44-genome dataset**,
 not five independent biological cohorts. Subsets overlap, especially at 40
 genomes, and adjacent sizes within a series are dependent.
 
+## Near-core split method
+
+This is a diagnostic experiment on an existing Rustroo `--audit-members` output,
+not a clustering change or a new biological truth set. The standalone
+`near-core-splits` subcommand requires `genes.fa`, `presence.tsv`, `members.tsv`,
+and `member_alleles.fa`. It reuses the independent validator's strict input
+checks, physical-locus grouping and exact protein aligner. The output directory
+must be fresh. Input fingerprints are checked again before completion.
+
+### Candidate universe and measurements
+
+- Core means presence in at least `ceil(core_fraction * samples)` samples,
+  default fraction **0.99**. Candidate pairs contain two individually non-core
+  families whose sample-presence union reaches
+  `ceil(near_core_fraction * samples)`, default fraction **0.95**.
+- Every qualifying pair is reported, whether or not its sequences or
+  neighborhoods agree. Enumeration prunes only impossible presence-count
+  combinations; it is not seeded by shared neighborhoods, comparator groups,
+  or a sequence sketch. This keeps neighborhood-discordant and co-occurring
+  alternatives visible. It does not search for three-way or higher-order splits.
+- Each candidate has individual sample counts, union count/fraction, a full
+  union-presence row, and co-occurring sample counts. Co-occurrence is assessed
+  from **all** exported member origins, not only intact annotated copies.
+  Separate contigs or non-overlapping coordinate intervals establish
+  distinct-locus co-occurrence. Overlapping models are not assumed to be safe
+  duplicates: any shared sample vetoes the conservative simulation.
+- Sequence evidence is an exact global affine-gap alignment of the two
+  reference proteins (match **2**, mismatch **-1**, gap open **-5**, extension
+  **-1**). Identity uses matches divided by paired canonical amino acids;
+  coverage divides those paired canonical residues by **each** full protein
+  length. Unknown residues and internal stops do not count as canonical pairs.
+  No local-hit or shorter-protein-only coverage substitutes for these measures.
+  `--max-alignment-cells` defaults to **5,000,000** per nonidentical pair;
+  **0** removes the limit. Work-limited or otherwise unassessed pairs have
+  explicit statuses and blank sequence metrics and cannot be simulated.
+- Neighborhoods use the nearest exported physical locus on either side, on
+  the same sample/contig, with gaps from **-15 to 15,000 bp**, then orient
+  upstream/downstream by the target strand. This is the existing validator's
+  diagnostic geometry, not the clustering repair's 30-bp overlap tolerance.
+  Both flanks must be known, distinct and different from the target family.
+  Support comes only from unambiguous loci containing an intact annotated
+  allele at least **95%** of its reference protein length; refound-only and
+  fusion-only loci do not establish neighborhood support.
+- For each shared two-flank context, support counts **distinct samples**
+  separately in each family. Agreement divides support by **all samples
+  carrying that family**, not just samples with complete neighborhoods.
+  The reported context maximizes the smaller agreement; ties prefer greater
+  total support and then stable family-ID order. Missing context therefore
+  reduces agreement instead of inflating it. Complete-context sample counts
+  are also reported.
+
+### Conservative merge counterfactual
+
+Only pairs satisfying **all** of the following are strong candidates:
+
+1. Neither original family is core, but their union meets the core threshold.
+2. Sample sets are disjoint, neither family has multiple exported physical
+   loci in any sample, and neither has an uncertain locus bundle or
+   coordinate/allele-length inconsistency.
+3. Both references occur as intact **annotated** member DNA and are at least
+   **30 amino acids** long.
+4. Reference protein identity is at least **98%**, with at least **95%**
+   canonical paired coverage of **both** proteins.
+5. The same two-flank context is supported by at least **3 distinct samples
+   per family** and at least **90% of all carrier samples in each family**.
+6. Each family has exactly one otherwise qualifying partner. All competing
+   proposals are rejected rather than resolved by iteration order.
+
+These fixed conservative sequence/context thresholds are recorded in the
+summary. Core and near-core fractions, alignment work limit, worker count and
+the merge-test cap are explicit command options. Small cohorts without three
+supporting samples on each side cannot pass this rule.
+
+Ranking is deterministic: strong candidates first, then fewer distinct-locus
+co-occurring samples, fewer co-occurring samples overall, greater sample union,
+greater identity times minimum bidirectional coverage, greater minimum
+neighborhood agreement, then family IDs. Every rejection reason is retained.
+
+Without `--test-merges`, the command only writes reports. With that flag it
+simulates at most `--max-merges` strongest pairs, default **10**. There is no
+transitive closure, repeated-round merging or assignment back into the build
+pipeline. Each selected pair keeps its first original family ID in a separate
+simulated matrix, with presence equal to the exact original sample union.
+All other families remain unchanged. The map records both original families.
+References, member sequences, original matrices and clustering parameters are
+never modified; the simulated matrix is **not** a rebuilt audited pangenome.
+
+### Outputs and interpretation
+
+| File | Content |
+|------|---------|
+| `candidates.tsv` | Ranked pairs, all measurements, strong-candidate flag, rejection reasons and merge-test disposition |
+| `candidate_presence.tsv` | Candidate `pair_<rank>` by sample, containing the exact presence union |
+| `cooccurrence.tsv` | Every candidate/shared-sample combination, distinct-locus flag and both coordinate/locus lists |
+| `summary.tsv` | Thresholds, candidate/rejection counts, baseline core count, optional simulated core gain and gap reduction; `complete=true` only on completion |
+| `input_fingerprints.tsv` | Checked noncryptographic fingerprints of the four original input files |
+| `rustroo.log` | Progress and explicit unassessed-comparison notices |
+| `simulated_presence.tsv` | Opt-in presence-only counterfactual |
+| `simulated_family_map.tsv` | Opt-in original-to-simulated family mapping and selected candidate rank |
+
+`--comparison-core-count` optionally supplies the other tool's core count for
+the **identical sample cohort and core definition**. The caller must establish
+that match; a count alone cannot verify it. The summary measures positive core
+shortfalls before/after, caps the fraction of that shortfall closed at 1, and
+reports any surplus separately. A non-positive starting gap has no assessed
+fraction closed. Without a comparator count, gap closure is unassessed rather
+than silently treating another tool as ground truth. Without `--test-merges`,
+all post-merge measurements are unassessed, not unchanged-result claims.
+
+Core gain under this deliberately narrow rule is evidence for a **fixable
+pairwise splitting component**. A residual gap is not proof of genuine biology:
+multiway splits, missing annotations, length-divergent alleles, fragmented
+neighborhoods, small sample support and different tool definitions remain
+unresolved. Reference-level similarity and context do not prove orthology or
+validate every member allele. Rejected co-occurring homologues are retained
+as negative controls, and the number of selected distinct-locus-cooccurring
+pairs is measured explicitly. A later clustering change requires additional
+biological/member-level validation; this experiment does not authorize one.
+
 ## Annotation-level family audit
 
 Reference-only reciprocal best hits cannot explain excess families: they lose

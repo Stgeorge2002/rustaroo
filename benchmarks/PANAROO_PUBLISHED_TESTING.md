@@ -212,6 +212,18 @@ This is a valuable negative control, but "clonal" does not mean every sample
 must have precisely identical gene content. Do not force zero accessory genes
 or optimize Rustroo until it reaches Panaroo's count.
 
+When comparing Rustroo runs after repair changes, retain the original baseline
+and use identical sample sets and thresholds. Compute prevalence from binary
+sample columns, not the historical CSV's `No. isolates` metadata, which can
+include counts exceeding the number of samples. Separate same-locus allele
+splits from multicopy/repeat families and questionable reference-tool merges.
+Audit refound calls for minimum length and target-length coverage, and inspect
+the chosen references as well as aggregate core counts. Current Rustroo rejects
+refound ORFs below `--min-cds-bp` or 80% shorter/longer protein length ratio,
+protects annotated references from shorter refound-only alleles, and performs
+guarded same-locus and post-refind reconciliation with a 12-round safety limit.
+These are changes to inference, not just faster implementations of the baseline.
+
 Reproduction needs the original outbreak accession/sample list, assembly and
 annotation settings, and the same QC inclusion decisions.
 

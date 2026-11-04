@@ -33,4 +33,7 @@ pub use types::{
     Gene, GeneMember, InputFallbacks, MembershipAudit, Pangenome, Params, ParsedGene,
     ParsedSample, Quality,
 };
-pub use validation::{validate, TreeMode, ValidationOptions, ValidationSummary};
+pub use validation::{
+    near_core_splits, validate, NearCoreOptions, NearCoreSummary, TreeMode, ValidationOptions,
+    ValidationSummary,
+};

@@ -151,6 +151,9 @@ fn greedy(
         .collect();
     let mut assignment = vec![0u32; indices.len()];
     let mut reps: Vec<usize> = Vec::new();
+    // `order` is length-descending, so this is non-increasing by construction,
+    // which is what lets `candidates_for` binary-search the length gate.
+    let mut rep_lens: Vec<usize> = Vec::new();
     let mut postings = Postings::new(kmer_size);
     let total = order.len();
     let step = (total / 20).max(1);
@@ -180,12 +183,14 @@ fn greedy(
         // so every protein sees exactly the scores the serial walk computes.
         let chosen_full: Vec<(Option<u32>, Vec<(u32, Option<f64>)>)> = {
             let reps = reps.as_slice();
+            let rep_lens = rep_lens.as_slice();
             let memo = &memo;
             let span = &order[cursor..end];
             let candidate_of = |pos: usize| {
                 candidates_for(
                     &proteins[indices[pos]],
                     reps,
+                    rep_lens,
                     indices,
                     proteins,
                     &postings,
@@ -281,6 +286,7 @@ fn greedy(
                 let rep_slot = reps.len() as u32;
                 assignment[pos] = rep_slot;
                 reps.push(pos);
+                rep_lens.push(proteins[indices[pos]].len());
                 for &kmer in &kmer_lists[pos] {
                     postings.push(kmer, rep_slot);
                 }
@@ -298,14 +304,12 @@ fn greedy(
             }
         }
         // Positions decided in this chunk drop their memo; the rest keep it.
-        for (offset, new_scores) in fresh.into_iter().enumerate() {
+        for (offset, mut new_scores) in fresh.into_iter().enumerate() {
             let pos = order[decided_before + offset];
             if decided_before + offset < cursor {
                 memo.remove(&pos);
             } else if !new_scores.is_empty() {
-                let entry = memo.entry(pos).or_default();
-                entry.extend(new_scores);
-                entry.sort_unstable_by_key(|item| item.0);
+                absorb_scores(memo.entry(pos).or_default(), &mut new_scores);
             }
         }
         if !chunked {
@@ -320,6 +324,29 @@ fn greedy(
     (assignment, reps)
 }
 
+/// Fold freshly scored candidates into one position's memo, which is kept
+/// sorted by representative slot. A slot already in the memo is never
+/// re-scored, so the two sides are disjoint and a merge produces exactly the
+/// list the old extend-then-sort did, in linear time.
+fn absorb_scores(memo: &mut Vec<(u32, Option<f64>)>, fresh: &mut [(u32, Option<f64>)]) {
+    fresh.sort_unstable_by_key(|item| item.0);
+    let kept = memo.len();
+    memo.resize(kept + fresh.len(), (0, None));
+    // Backwards, so nothing is written below the slot still being read.
+    let (mut left, mut right, mut write) = (kept, fresh.len(), memo.len());
+    while right > 0 {
+        let next = if left > 0 && memo[left - 1].0 > fresh[right - 1].0 {
+            left -= 1;
+            memo[left]
+        } else {
+            right -= 1;
+            fresh[right]
+        };
+        write -= 1;
+        memo[write] = next;
+    }
+}
+
 /// The original decision for one protein (full identities, no bounds, no
 /// memo). Only the reference greedy in the tests calls it now.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -327,6 +354,7 @@ fn choose_representative(
     protein: &[u8],
     protein_kmers: &[u64],
     reps: &[usize],
+    rep_lens: &[usize],
     indices: &[usize],
     proteins: &[Vec<u8>],
     postings: &Postings,
@@ -337,6 +365,7 @@ fn choose_representative(
     let candidates = candidates_for(
         protein,
         reps,
+        rep_lens,
         indices,
         proteins,
         postings,
@@ -372,6 +401,7 @@ fn choose_representative_memo(
     protein: &[u8],
     protein_kmers: &[u64],
     reps: &[usize],
+    rep_lens: &[usize],
     indices: &[usize],
     proteins: &[Vec<u8>],
     postings: &Postings,
@@ -380,7 +410,7 @@ fn choose_representative_memo(
     parallel_scores: bool,
     memo: Option<&[(u32, Option<f64>)]>,
 ) -> (Option<u32>, Vec<(u32, Option<f64>)>) {
-    let candidates = candidates_for(protein, reps, indices, proteins, postings, length_ratio_min, protein_kmers);
+    let candidates = candidates_for(protein, reps, rep_lens, indices, proteins, postings, length_ratio_min, protein_kmers);
     let known = |rep_slot: u32| -> Option<Option<f64>> {
         let memo = memo?;
         memo.binary_search_by_key(&rep_slot, |item| item.0).ok().map(|at| memo[at].1)
@@ -418,18 +448,34 @@ fn choose_representative_memo(
     (best.map(|(rep_slot, _)| rep_slot), fresh)
 }
 
+/// The length gate rejects a representative longer than `protein.len()`
+/// divided by `length_ratio_min`. Representatives are founded longest-first,
+/// so those are a prefix of `rep_lens`, and a posting list stores rep slots
+/// ascending, so they are a prefix of every posting list too. Skipping that
+/// prefix only drops representatives the `length_ratio` test below would
+/// have dropped anyway: the candidate list is unchanged, and so is every
+/// surviving representative's hit count.
 fn candidates_for(
     protein: &[u8],
     reps: &[usize],
+    rep_lens: &[usize],
     indices: &[usize],
     proteins: &[Vec<u8>],
     postings: &Postings,
     length_ratio_min: f64,
     protein_kmers: &[u64],
 ) -> Vec<u32> {
+    debug_assert_eq!(reps.len(), rep_lens.len());
     if reps.is_empty() {
         return Vec::new();
     }
+    // `protein.len() / rep_len` is the exact `length_ratio` of a longer
+    // representative and is non-increasing in `rep_len`, so this predicate
+    // is monotone over the length-descending slots and binary-searchable.
+    let first_eligible = rep_lens.partition_point(|&rep_len| {
+        rep_len > protein.len()
+            && (protein.len() as f64 / rep_len as f64) + f64::EPSILON < length_ratio_min
+    }) as u32;
     HITS.with(|cell| {
         let mut hits = cell.borrow_mut();
         hits.begin(reps.len());
@@ -437,10 +483,13 @@ fn candidates_for(
             let Some(list) = postings.get(*kmer) else {
                 continue;
             };
+            // Saturation is a property of the whole posting, not of the
+            // eligible tail, so this still measures the full list.
             if list.len() >= SATURATED_POSTING {
                 continue;
             }
-            for &rep in list {
+            let eligible = list.partition_point(|&rep| rep < first_eligible);
+            for &rep in &list[eligible..] {
                 hits.bump(rep);
             }
         }
@@ -809,12 +858,14 @@ mod tests {
             (0..indices.len()).map(|pos| kmers(&proteins[indices[pos]], kmer_size)).collect();
         let mut assignment = vec![0u32; indices.len()];
         let mut reps: Vec<usize> = Vec::new();
+        let mut rep_lens: Vec<usize> = Vec::new();
         let mut postings = Postings::new(kmer_size);
         for &pos in &order {
             let choice = choose_representative(
                 &proteins[indices[pos]],
                 &kmer_lists[pos],
                 &reps,
+                &rep_lens,
                 indices,
                 proteins,
                 &postings,
@@ -828,6 +879,7 @@ mod tests {
                 let rep_slot = reps.len() as u32;
                 assignment[pos] = rep_slot;
                 reps.push(pos);
+                rep_lens.push(proteins[indices[pos]].len());
                 for &kmer in &kmer_lists[pos] {
                     postings.push(kmer, rep_slot);
                 }

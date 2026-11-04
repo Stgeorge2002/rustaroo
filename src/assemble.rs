@@ -10,14 +10,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
-use crate::align::fit_short_in_long;
+use crate::align::{fit_short_in_long_indexed, LongIndex};
 use crate::cluster::cluster_families;
 use crate::error::{Error, Result};
 use crate::genetic_code::{is_intact, orf_status, translate};
 use crate::log::{self, progress};
 use crate::model::{content_hash, Call, Label, Pools};
 use crate::packed::PackedSeq;
-use crate::reference::{choose_reference, join_fragments, Allele};
+use crate::reference::{choose_reference, join_fragments, Allele, OtherGenes};
 use crate::synteny::{
     cluster_facts, compress_clusters, families_bounded_by_neighbors, freeze_contexts,
     allele_identity, length_evidence, membership_loci, merge_fragments, refind,
@@ -328,31 +328,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
         .iter()
         .map(|sample| sample.iter().map(PackedSeq::len).collect())
         .collect();
-    for round in 1..=4 {
-        progress!("rustroo: synteny round {round}");
-        let before = dense_family_count(&calls);
-        let split = split_paralogs(&mut calls, &pools);
-        log::stage(&format!("split_paralogs_r{round}"));
-        let merged = merge_fragments(&mut calls, &pools, &contig_lengths);
-        log::stage(&format!("merge_fragments_r{round}"));
-        compress_clusters(&mut calls, &pools);
-        let after = dense_family_count(&calls);
-        progress!(
-            "rustroo: synteny round {round}: {before} -> {} after {split} paralog splits -> {after} after merges",
-            before + split
-        );
-        // Stable anchors and retained loci make splitting idempotent until a
-        // real merge changes the evidence; a split-only pass is already settled.
-        if !merged {
-            progress!("rustroo: synteny settled on round {round}");
-            break;
-        }
-        if round == 4 {
-            progress!(
-                "rustroo: synteny reached the 4-round limit while groups were still changing"
-            );
-        }
-    }
+    reconcile_families(&mut calls, &pools, &contig_lengths, "initial");
     // FIX(paralogs): distant paralogs that no genome carries twice.
     if params.paralog_identity > 0.0 {
         let divergent = split_divergent_members(&mut calls, &pools, params.paralog_identity);
@@ -370,17 +346,11 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
     }
     if params.refind {
         progress!("rustroo: searching intergenic gaps");
-        let found = refind(&mut calls, &mut pools, &contigs);
+        let found = refind(&mut calls, &mut pools, &contigs, params.min_cds_bp);
         log::stage("refind");
         progress!("rustroo: refound {found} genes in intergenic gaps");
         if found > 0 {
-            let split = split_paralogs(&mut calls, &pools);
-            compress_clusters(&mut calls, &pools);
-            log::stage("split_paralogs_after_refind");
-            progress!(
-                "rustroo: {split} paralog splits after refinding, {} groups",
-                dense_family_count(&calls)
-            );
+            reconcile_families(&mut calls, &pools, &contig_lengths, "after_refind");
         }
     }
     // Gap search is the last reader of contig bases. Lengths were already copied.
@@ -405,7 +375,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
     for (index, call) in calls.iter().enumerate() {
         groups.entry(call.cluster).or_default().push(index);
     }
-    let reps = cluster_reps(&groups, &calls, &pools);
+    let others = OtherGenes::new(cluster_reps(&groups, &calls, &pools));
     log::stage("cluster_reps");
     let locus_ids = membership_loci(&calls, &pools);
     log::stage("membership_loci");
@@ -416,7 +386,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
     progress!("rustroo: choosing references for {total} groups");
     // Everything about one group's reference - its alleles, the fusion/
     // extension check, presence and length stats - only reads `calls`,
-    // `pools`, and `reps`, none of which are mutated here, so every group is
+    // `pools`, and `others`, none of which are mutated here, so every group is
     // independent of every other and the search can run across threads.
     // Only turning a symbol into a final, de-duplicated gene id has to stay
     // sequential, since a later group's name depends on which names earlier
@@ -430,7 +400,7 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
                 &groups[&cluster],
                 &calls,
                 &pools,
-                &reps,
+                &others,
                 &locus_ids,
                 sample_names.len(),
                 bounded.contains(&cluster),
@@ -609,6 +579,32 @@ fn build_interned(interned: Interned, params: &Params) -> Result<Pangenome> {
     })
 }
 
+fn reconcile_families(
+    calls: &mut [Call],
+    pools: &Pools,
+    contig_lengths: &[Vec<usize>],
+    phase: &str,
+) {
+    const MAX_ROUNDS: usize = 12;
+    for round in 1..=MAX_ROUNDS {
+        let before = dense_family_count(calls);
+        let split = split_paralogs(calls, pools);
+        let merged = merge_fragments(calls, pools, contig_lengths);
+        compress_clusters(calls, pools);
+        log::stage(&format!("reconcile_{phase}_r{round}"));
+        progress!(
+            "rustroo: synteny {phase} round {round}: {before} -> {} after {split} paralog splits -> {} after merges",
+            before + split,
+            dense_family_count(calls)
+        );
+        if !merged {
+            progress!("rustroo: synteny {phase} settled on round {round}");
+            return;
+        }
+    }
+    progress!("rustroo: synteny {phase} reached the {MAX_ROUNDS}-round limit while groups were still changing");
+}
+
 fn quality_label(quality: Quality) -> &'static str {
     match quality {
         Quality::Standard => "standard",
@@ -742,6 +738,11 @@ const COVERED: f64 = 0.90;
 /// A second copy this close is the same gene, including at full length.
 /// A paralogue below this, at nearly the same length, stays.
 const NEAR_COPY_IDENTITY: f64 = 0.90;
+/// How many fragments have their k-mer evidence gathered per parallel batch.
+/// Those counts read nothing the fold writes, so batching only bounds how
+/// many candidate lists are alive at once; the fold below still walks the
+/// length-sorted order one gene at a time.
+const EVIDENCE_BATCH: usize = 512;
 
 /// Indexes of genes that add no presence. The copy present in fewer genomes
 /// is the one removed. Equal support keeps the earlier gene.
@@ -751,8 +752,15 @@ fn redundant_fragments(
     folded_into: &mut HashMap<String, String>,
 ) -> HashSet<usize> {
     let proteins: Vec<Vec<u8>> = genes
-        .iter()
+        .par_iter()
         .map(|gene| translate(&gene.reference_dna))
+        .collect();
+    // One 4-mer table per gene. Every fit below places a fragment in a
+    // longer protein, and each of those rebuilt that protein's table from
+    // scratch - up to 32 times per fragment, for the same handful of parents.
+    let tables: Vec<LongIndex> = proteins
+        .par_iter()
+        .map(|protein| LongIndex::new(protein))
         .collect();
     // Five residues is specific enough to connect a fragment with its long
     // copy. A tetrapeptide shared by dozens of unrelated genes is not.
@@ -798,115 +806,160 @@ fn redundant_fragments(
             .cmp(&proteins[right].len())
             .then(left.cmp(&right))
     });
+    let nested_loci = loci_by_sample(loci);
     let mut redundant = HashSet::default();
-    for short in order {
-        let needed = kmer_counts[short];
-        if needed == 0 || redundant.contains(&short) {
-            continue;
-        }
-        let mut scores: HashMap<usize, u32> = HashMap::default();
-        let protein = &proteins[short];
-        let mut seen = HashSet::default();
-        for window in protein.windows(5) {
-            let key = [window[0], window[1], window[2], window[3], window[4]];
-            if !seen.insert(key) {
-                continue;
-            }
-            let Some(hits) = postings.get(&key) else {
-                continue;
-            };
-            for &long in hits {
-                if long != short && is_covered_by(short, long, &proteins, genes) {
-                    *scores.entry(long).or_default() += 1;
-                }
-            }
-        }
-        // One mismatch wipes five 5-mers, so an 80% piece keeps only a small
-        // share of them. The alignment, not this count, decides the fold.
-        let mut ranked: Vec<(usize, u32)> = scores
-            .into_iter()
-            .filter(|&(_, score)| score * 10 >= needed)
+    for batch in order.chunks(EVIDENCE_BATCH) {
+        let evidence: Vec<Vec<(usize, u32)>> = batch
+            .par_iter()
+            .map(|&short| kmer_evidence(short, &proteins, &postings, kmer_counts[short]))
             .collect();
-        // Longest first, so a pile of equal copies cannot crowd the real parent
-        // out of the alignments.
-        ranked.sort_by(|a, b| {
-            proteins[b.0]
-                .len()
-                .cmp(&proteins[a.0].len())
-                .then(b.1.cmp(&a.1))
-                .then(a.0.cmp(&b.0))
-        });
-        ranked.truncate(32);
-        let mut longer_subset: Option<usize> = None;
-        let mut equal_subset: Option<usize> = None;
-        let mut longer_exclusive: Vec<usize> = Vec::new();
-        let mut equal_exclusive: Vec<usize> = Vec::new();
-        for (long, _) in ranked {
-            if redundant.contains(&long) {
+        for (&short, candidates) in batch.iter().zip(evidence) {
+            if kmer_counts[short] == 0 || redundant.contains(&short) {
                 continue;
             }
-            let Some(fit) = fit_short_in_long(protein, &proteins[long]) else {
-                continue;
-            };
-            let nested = calls_nested(loci, &genes[short].id, &genes[long].id);
-            let longer = proteins[long].len() > protein.len();
-            if presence_covered(&genes[short].presence, &genes[long].presence) {
-                if !covered_duplicate(&fit, proteins[long].len(), nested) {
+            let protein = &proteins[short];
+            let mut ranked: Vec<(usize, u32)> = candidates
+                .into_iter()
+                .filter(|&(long, _)| is_covered_by(short, long, &proteins, genes))
+                .collect();
+            // Longest first, so a pile of equal copies cannot crowd the real
+            // parent out of the alignments.
+            ranked.sort_by(|a, b| {
+                proteins[b.0]
+                    .len()
+                    .cmp(&proteins[a.0].len())
+                    .then(b.1.cmp(&a.1))
+                    .then(a.0.cmp(&b.0))
+            });
+            ranked.truncate(32);
+            let mut longer_subset: Option<usize> = None;
+            let mut equal_subset: Option<usize> = None;
+            let mut longer_exclusive: Vec<usize> = Vec::new();
+            let mut equal_exclusive: Vec<usize> = Vec::new();
+            for (long, _) in ranked {
+                if redundant.contains(&long) {
                     continue;
                 }
-                if longer {
-                    longer_subset.get_or_insert(long);
-                } else {
-                    equal_subset.get_or_insert(long);
+                let Some(fit) = fit_short_in_long_indexed(protein, &proteins[long], &tables[long])
+                else {
+                    continue;
+                };
+                let nested = calls_nested(&nested_loci, &genes[short].id, &genes[long].id);
+                let longer = proteins[long].len() > protein.len();
+                if presence_covered(&genes[short].presence, &genes[long].presence) {
+                    if !covered_duplicate(&fit, proteins[long].len(), nested) {
+                        continue;
+                    }
+                    if longer {
+                        longer_subset.get_or_insert(long);
+                    } else {
+                        equal_subset.get_or_insert(long);
+                    }
+                } else if exclusive_allele(&fit, proteins[long].len()) {
+                    if longer {
+                        longer_exclusive.push(long);
+                    } else {
+                        equal_exclusive.push(long);
+                    }
                 }
-            } else if exclusive_allele(&fit, proteins[long].len()) {
-                if longer {
-                    longer_exclusive.push(long);
-                } else {
-                    equal_exclusive.push(long);
+            }
+            // One longer gene explains the fragment. Several longer copies of
+            // that same gene do too. Two longer genes that are not the same
+            // reference leave the fragment in place. Equal-length copies are
+            // one reference and fold even when several of them match.
+            let parent = if let Some(long) = longer_subset {
+                Some(long)
+            } else if let Some(long) = one_gene(&proteins, &tables, &longer_exclusive) {
+                Some(long)
+            } else if !longer_exclusive.is_empty() {
+                None
+            } else if let Some(long) = equal_subset {
+                Some(long)
+            } else {
+                equal_exclusive
+                    .into_iter()
+                    .min_by_key(|&index| (std::cmp::Reverse(genes[index].samples_present), index))
+            };
+            if let Some(long) = parent {
+                if log::enabled() {
+                    log::record(&format!(
+                        "quality\tstrict\tdrop\t{}\tcovered_by\t{}",
+                        genes[short].id, genes[long].id,
+                    ));
                 }
+                let short_id = genes[short].id.clone();
+                let long_id = genes[long].id.clone();
+                // The survivor keeps its own sequence. The removed gene's calls
+                // still have to be members of that survivor.
+                if absorb_at(genes, long, short) {
+                    folded_into.insert(short_id, long_id);
+                }
+                redundant.insert(short);
             }
-        }
-        // One longer gene explains the fragment. Several longer copies of
-        // that same gene do too. Two longer genes that are not the same
-        // reference leave the fragment in place. Equal-length copies are
-        // one reference and fold even when several of them match.
-        let parent = if let Some(long) = longer_subset {
-            Some(long)
-        } else if let Some(long) = one_gene(&proteins, &longer_exclusive) {
-            Some(long)
-        } else if !longer_exclusive.is_empty() {
-            None
-        } else if let Some(long) = equal_subset {
-            Some(long)
-        } else {
-            equal_exclusive
-                .into_iter()
-                .min_by_key(|&index| (std::cmp::Reverse(genes[index].samples_present), index))
-        };
-        if let Some(long) = parent {
-            if log::enabled() {
-                log::record(&format!(
-                    "quality\tstrict\tdrop\t{}\tcovered_by\t{}",
-                    genes[short].id, genes[long].id,
-                ));
-            }
-            let short_id = genes[short].id.clone();
-            let long_id = genes[long].id.clone();
-            // The survivor keeps its own sequence. The removed gene's calls
-            // still have to be members of that survivor.
-            if absorb_at(genes, long, short) {
-                folded_into.insert(short_id, long_id);
-            }
-            redundant.insert(short);
         }
     }
     redundant
 }
 
+/// Candidate parents of `short`, with how many of its distinct 5-mers each
+/// one carries.
+///
+/// `is_covered_by` is deliberately not applied here: it reads
+/// `samples_present`, which the fold mutates as it goes. Only its
+/// length half, which no fold can change, is used to keep the list short;
+/// the fold re-applies the whole test at the point the one-at-a-time walk
+/// applied it. Counting a parent the fold then rejects cannot change any
+/// other parent's count, so the surviving counts are the same either way.
+fn kmer_evidence(
+    short: usize,
+    proteins: &[Vec<u8>],
+    postings: &HashMap<[u8; 5], Vec<usize>>,
+    needed: u32,
+) -> Vec<(usize, u32)> {
+    if needed == 0 {
+        return Vec::new();
+    }
+    let mut scores: HashMap<usize, u32> = HashMap::default();
+    let mut seen = HashSet::default();
+    for window in proteins[short].windows(5) {
+        let key = [window[0], window[1], window[2], window[3], window[4]];
+        if !seen.insert(key) {
+            continue;
+        }
+        let Some(hits) = postings.get(&key) else {
+            continue;
+        };
+        for &long in hits {
+            if long != short && proteins[long].len() >= proteins[short].len() {
+                *scores.entry(long).or_default() += 1;
+            }
+        }
+    }
+    // One mismatch wipes five 5-mers, so an 80% piece keeps only a small
+    // share of them. The alignment, not this count, decides the fold.
+    scores
+        .into_iter()
+        .filter(|&(_, score)| score * 10 >= needed)
+        .collect()
+}
+
+/// `loci` with each gene's calls ordered by sample, so `calls_nested` can
+/// binary-search one sample's calls instead of re-filtering the whole list
+/// for every call of the shorter gene. Order within a sample does not
+/// matter: the test there is "any call contains this one".
+fn loci_by_sample(loci: &HashMap<String, Vec<Locus>>) -> HashMap<&str, Vec<&Locus>> {
+    loci.iter()
+        .map(|(id, calls)| {
+            let mut ordered: Vec<&Locus> = calls.iter().collect();
+            ordered.sort_by_key(|call| call.sample);
+            (id.as_str(), ordered)
+        })
+        .collect()
+}
+
 /// The longest of `parents` when every parent is that same reference.
 /// Two parents that fail the duplicate test are different genes.
-fn one_gene(proteins: &[Vec<u8>], parents: &[usize]) -> Option<usize> {
+fn one_gene(proteins: &[Vec<u8>], tables: &[LongIndex], parents: &[usize]) -> Option<usize> {
     let best = parents
         .iter()
         .copied()
@@ -920,7 +973,7 @@ fn one_gene(proteins: &[Vec<u8>], parents: &[usize]) -> Option<usize> {
         } else {
             (best, other)
         };
-        fit_short_in_long(&proteins[shorter], &proteins[longer])
+        fit_short_in_long_indexed(&proteins[shorter], &proteins[longer], &tables[longer])
             .is_some_and(|fit| exclusive_allele(&fit, proteins[longer].len()))
     });
     same.then_some(best)
@@ -975,7 +1028,7 @@ fn is_covered_by(short: usize, long: usize, proteins: &[Vec<u8>], genes: &[Gene]
 /// call. `Some(false)` when a short call sits beside the long gene, or the
 /// coordinates are missing from a map that otherwise has them. `None` when
 /// the map is empty, which keeps the sequence-only rule for tests.
-fn calls_nested(loci: &HashMap<String, Vec<Locus>>, short_id: &str, long_id: &str) -> Option<bool> {
+fn calls_nested(loci: &HashMap<&str, Vec<&Locus>>, short_id: &str, long_id: &str) -> Option<bool> {
     if loci.is_empty() {
         return None;
     }
@@ -984,10 +1037,9 @@ fn calls_nested(loci: &HashMap<String, Vec<Locus>>, short_id: &str, long_id: &st
     };
     let mut shared = false;
     for short_call in short {
-        let same_sample: Vec<&Locus> = long
-            .iter()
-            .filter(|call| call.sample == short_call.sample)
-            .collect();
+        let from = long.partition_point(|call| call.sample < short_call.sample);
+        let to = from + long[from..].partition_point(|call| call.sample == short_call.sample);
+        let same_sample = &long[from..to];
         if same_sample.is_empty() {
             continue;
         }
@@ -1092,7 +1144,7 @@ fn compute_partial_gene(
     indexes: &[usize],
     calls: &[Call],
     pools: &Pools,
-    reps: &HashMap<u32, Vec<u8>>,
+    others: &OtherGenes,
     locus_ids: &[u32],
     sample_count: usize,
     between_neighbors: bool,
@@ -1101,6 +1153,34 @@ fn compute_partial_gene(
     let alleles = alleles_of(indexes, calls, pools, contig_lengths, locus_ids);
     let joined = joined_allele(indexes, calls, pools, locus_ids);
     let mut with_join = alleles.clone();
+    let annotated: HashSet<_> = indexes
+        .iter()
+        .filter_map(|&index| (!calls[index].refound).then_some(calls[index].dna))
+        .collect();
+    let longest_annotated = annotated
+        .iter()
+        .map(|&dna| &pools.dna[dna as usize])
+        .filter(|dna| is_intact(dna))
+        .map(String::len)
+        .max()
+        .unwrap_or(0);
+    if longest_annotated > 0 {
+        let annotated_sequences: HashSet<_> = annotated
+            .iter()
+            .map(|&dna| pools.dna[dna as usize].as_str())
+            .collect();
+        with_join.retain(|allele| {
+            let keep = annotated_sequences.contains(allele.dna.as_str())
+                || allele.dna.len() * 100 >= longest_annotated * 95;
+            if !keep {
+                log::record(&format!(
+                    "reference_candidate\texcluded_refound_short\tcluster\t{cluster}\tbp\t{}",
+                    allele.dna.len()
+                ));
+            }
+            keep
+        });
+    }
     if let Some(dna) = joined {
         let longer = alleles.iter().all(|allele| dna.len() > allele.dna.len());
         if longer {
@@ -1112,7 +1192,7 @@ fn compute_partial_gene(
             });
         }
     }
-    let choice = choose_reference(&with_join, reps, cluster, sample_count)?;
+    let choice = choose_reference(&with_join, others, cluster, sample_count)?;
     let mut presence = vec![false; sample_count];
     let mut lengths = vec![0u32; sample_count];
     let mut intervals: HashMap<(u32, u32), Vec<(u32, u32)>> = HashMap::default();
@@ -1202,7 +1282,7 @@ fn alleles_of(
         let whole = parts_of_locus.get(&locus_ids[index]).copied().unwrap_or(0) == 1;
         // One internal whole copy is enough for that sample to vouch for the
         // end. A second copy parked on a contig break does not cancel it.
-        if closed && whole && !contig_clipped(call, contig_lengths) {
+        if closed && whole && !call.refound && !contig_clipped(call, contig_lengths) {
             finished_for_dna
                 .entry(call.dna)
                 .or_default()
@@ -2831,6 +2911,49 @@ mod tests {
             fused_dna.len() as u32,
             "lengths are the genome bases each piece covers"
         );
+    }
+
+    #[test]
+    fn refound_short_alleles_do_not_replace_an_annotated_intact_reference() {
+        let full = diverse(100, 42);
+        let short = full[..80].to_vec();
+        let mut pools = Pools::default();
+        let mut calls = Vec::new();
+        for sample in 0..12 {
+            let protein = if sample < 2 { &full } else { &short };
+            let dna = back_translate(protein);
+            calls.push(Call {
+                sample,
+                contig: 0,
+                start: 100,
+                end: 100 + dna.len() as u32 - 1,
+                strand: 1,
+                dna: pools.intern_dna(dna),
+                protein: pools.intern_protein(protein.clone()),
+                cluster: 0,
+                context: 0,
+                locus: None,
+                source: None,
+                refound: sample >= 2,
+                fusion_piece: false,
+                symbol: Label::from("gene"),
+                product: Label::default(),
+            });
+        }
+        let indexes: Vec<_> = (0..calls.len()).collect();
+        let locus_ids: Vec<_> = (0..calls.len() as u32).collect();
+        let lengths = vec![vec![4000]; 12];
+        let alleles = alleles_of(&indexes, &calls, &pools, &lengths, &locus_ids);
+        let short_allele = alleles.iter().find(|allele| allele.dna == back_translate(&short))
+            .unwrap();
+        assert_eq!(short_allele.count, 10);
+        assert_eq!(short_allele.finished, 0);
+        let others = OtherGenes::new(HashMap::default());
+        let gene = compute_partial_gene(
+            0, &indexes, &calls, &pools, &others, &locus_ids, 12, false, &lengths,
+        ).unwrap();
+        assert_eq!(gene.reference_dna, back_translate(&full));
+        assert_eq!(gene.samples_present, 12);
     }
 
     #[test]

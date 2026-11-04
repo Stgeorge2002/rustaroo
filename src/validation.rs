@@ -13,6 +13,10 @@ use crate::phylogeny::{bootstrap, common_sites, distances, neighbor_joining, var
 use crate::validation_align::{align, Profile, Step};
 use crate::{Error, Result};
 
+mod near_core;
+
+pub use near_core::{near_core_splits, NearCoreOptions, NearCoreSummary};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum TreeMode {
     Uncertain,
